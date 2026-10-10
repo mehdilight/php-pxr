@@ -106,10 +106,21 @@ concurrency, no C interop, no generics, no ownership.
    fails at compile time with a specific code. ✅
 4. `cargo test` passes. ✅
 
-**Known limitations** (carried into later milestones): arrays are references
-(not copy‑on‑write values); `foreach` is value‑only; no `echo` of arrays; no
-nested assignment; no `null`; integer overflow still wraps; strings/arrays leak
-per‑operation (arena).
+**Known limitations** (carried into later milestones): `foreach` is value‑only;
+no `echo` of arrays; no nested assignment; no `null`; integer overflow still
+wraps (PHP promotes to `float`); a variable cannot change type; strings/arrays
+leak per‑operation (arena).
+
+Arrays already have PHP **value semantics** (assignment, arguments, returns and
+`foreach` copy) and canonical integer string keys unify with integer keys.
+
+Later fidelity fixes: shifts follow PHP (`<<`/`>>` with count ≥ 64 → `0`/`-1`,
+negative count → fatal `ArithmeticError`), loose string comparisons are
+numeric-aware (`"10" < "9"` = false, `"1" == "01"` = true, `===` stays byte
+equality, `switch` follows), floats stringify exactly like PHP (`zend_gcvt`
+precision 14: `1e15` → `"1.0E+15"`, `1e-5` → `"1.0E-5"`, `-0.0` → `"-0"`),
+`/` and `%` by zero raise PHP's fatal `DivisionByZeroError`, and double-quoted
+interpolation is rejected at compile time as `E0008`.
 
 ## ⛔ M2 — Strings & standard library
 

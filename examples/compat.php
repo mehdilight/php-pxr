@@ -94,3 +94,49 @@ echo "match=" . $r . "\n";
 echo "sp=" . (7 <=> 3) . "," . (7 <=> 7) . "," . (3 <=> 7) . "\n";
 echo "tern=" . (3 > 2 ? "gt" : "le") . "\n";
 echo "bits=" . (6 & 3) . "," . (6 | 1) . "," . (6 ^ 1) . "," . (1 << 3) . "," . (16 >> 2) . "\n";
+
+// --- PHP-faithful value semantics (arrays, keys, shifts) ------------------
+
+$arrA = [1, 2, 3];
+$arrB = $arrA;
+$arrB[0] = 99;
+echo "copy=" . $arrA[0] . "\n";
+
+$arrE = [4, 5, 6];
+foreach ($arrE as $v) {
+    $arrE[] = 0;
+}
+echo "snap=" . count($arrE) . "\n";
+
+$arrInner = [1];
+$arrOuter = [$arrInner];
+$arrInner[] = 2;
+echo "nest=" . count($arrOuter[0]) . "," . count($arrInner) . "\n";
+
+$arrK = [];
+$arrK["1"] = 10;
+$arrK[1] = 20;
+echo "keys=" . count($arrK) . "," . $arrK["1"] . "\n";
+
+$dm = match (true) { default => "fallback", true => "armed" };
+echo "mdefault=" . $dm . "\n";
+
+echo "bigshift=" . (1 << 64) . "," . (-1 >> 64) . "," . (2 << 4) . "\n";
+
+// PHP compares two numeric strings by value in loose comparisons.
+echo "strlt=" . (("10" < "9") ? "lt" : "ge") . "\n";
+echo "streq=" . (("1" == "01") ? "loose" : "ne") . "," . (("1" === "01") ? "strict" : "strictne") . "\n";
+echo "strsp=" . ("10" <=> "9") . "\n";
+
+$sw = "1";
+switch ($sw) {
+    case "01":
+        echo "switch=loose\n";
+        break;
+    default:
+        echo "switch=no\n";
+}
+
+// PHP float stringification (zend_gcvt, precision 14).
+echo "floats=" . 1e14 . "," . 1e16 . "," . 1e-5 . "," . (0.1 + 0.2) . "," .
+    (1.0 / 3.0) . "," . 3.14159265358979 . "," . -0.0 . "\n";

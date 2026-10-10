@@ -515,12 +515,23 @@ impl Lowerer {
             B::Add | B::Sub | B::Mul | B::Mod => {
                 let a = self.lower_expr(lhs);
                 let b = self.lower_expr(rhs);
+                if op == B::Mod {
+                    // PHP's `%`: integer remainder; a zero divisor is a fatal
+                    // DivisionByZeroError (not UB / SIGFPE).
+                    let dst = self.fresh();
+                    self.emit(Inst::Call {
+                        dst: Some(dst),
+                        callee: "pxr_mod".into(),
+                        args: vec![a, b],
+                        ret: Ty::Int,
+                    });
+                    return dst;
+                }
                 let (a, b, ty) = self.unify_numeric(a, lhs_ty, b, rhs_ty);
                 let iop = match op {
                     B::Add => IBinOp::Add,
                     B::Sub => IBinOp::Sub,
                     B::Mul => IBinOp::Mul,
-                    B::Mod => IBinOp::Mod,
                     _ => unreachable!(),
                 };
                 self.bin(iop, a, &ty, b, &ty, &ty)
@@ -530,15 +541,31 @@ impl Lowerer {
                 let a = self.cast(a, lhs_ty, &Ty::Float);
                 let b = self.lower_expr(rhs);
                 let b = self.cast(b, rhs_ty, &Ty::Float);
-                self.bin(IBinOp::Div, a, &Ty::Float, b, &Ty::Float, &Ty::Float)
+                // PHP's `/` always returns float; a zero divisor is a fatal
+                // DivisionByZeroError rather than IEEE infinity.
+                let dst = self.fresh();
+                self.emit(Inst::Call {
+                    dst: Some(dst),
+                    callee: "pxr_div".into(),
+                    args: vec![a, b],
+                    ret: Ty::Float,
+                });
+                dst
             }
             B::Eq | B::NotEq | B::Identical | B::NotIdentical => {
-                let iop = match op {
-                    B::Eq | B::Identical => IBinOp::Eq,
-                    _ => IBinOp::NotEq,
-                };
+                let strict = matches!(op, B::Identical | B::NotIdentical);
+                let want_eq = matches!(op, B::Eq | B::Identical);
                 let a = self.lower_expr(lhs);
                 let b = self.lower_expr(rhs);
+                // Loose comparison of two strings follows PHP's numeric-string
+                // rule; strict comparison is always byte equality.
+                if !strict && *lhs_ty == Ty::String && *rhs_ty == Ty::String {
+                    let cmp = self.str_cmp_loose(a, b);
+                    let zero = self.emit_const(Literal::Int(0));
+                    let iop = if want_eq { IBinOp::Eq } else { IBinOp::NotEq };
+                    return self.bin(iop, cmp, &Ty::Int, zero, &Ty::Int, &Ty::Bool);
+                }
+                let iop = if want_eq { IBinOp::Eq } else { IBinOp::NotEq };
                 if lhs_ty.is_numeric() && rhs_ty.is_numeric() && lhs_ty != rhs_ty {
                     let (a, b, ty) = self.unify_numeric(a, lhs_ty, b, rhs_ty);
                     return self.bin(iop, a, &ty, b, &ty, &Ty::Bool);
@@ -556,36 +583,51 @@ impl Lowerer {
                 };
                 let a = self.lower_expr(lhs);
                 let b = self.lower_expr(rhs);
-                let (a, b, ty) = if lhs_ty.is_numeric() && rhs_ty.is_numeric() {
-                    self.unify_numeric(a, lhs_ty, b, rhs_ty)
-                } else {
-                    (a, b, Ty::String)
-                };
+                // Ordering two strings uses PHP's numeric-aware comparison.
+                if *lhs_ty == Ty::String && *rhs_ty == Ty::String {
+                    let cmp = self.str_cmp_loose(a, b);
+                    let zero = self.emit_const(Literal::Int(0));
+                    return self.bin(iop, cmp, &Ty::Int, zero, &Ty::Int, &Ty::Bool);
+                }
+                let (a, b, ty) = self.unify_numeric(a, lhs_ty, b, rhs_ty);
                 let _ = result_ty;
                 self.bin(iop, a, &ty, b, &ty, &Ty::Bool)
             }
             B::Spaceship => {
                 let a = self.lower_expr(lhs);
                 let b = self.lower_expr(rhs);
-                let (a, b, ty) = if lhs_ty.is_numeric() && rhs_ty.is_numeric() {
-                    self.unify_numeric(a, lhs_ty, b, rhs_ty)
-                } else {
-                    (a, b, Ty::String)
-                };
+                if *lhs_ty == Ty::String && *rhs_ty == Ty::String {
+                    return self.str_cmp_loose(a, b);
+                }
+                let (a, b, ty) = self.unify_numeric(a, lhs_ty, b, rhs_ty);
                 self.bin(IBinOp::Cmp, a, &ty, b, &ty, &Ty::Int)
             }
-            B::BitAnd | B::BitOr | B::BitXor | B::Shl | B::Shr => {
+            B::BitAnd | B::BitOr | B::BitXor => {
                 let iop = match op {
                     B::BitAnd => IBinOp::BitAnd,
                     B::BitOr => IBinOp::BitOr,
                     B::BitXor => IBinOp::BitXor,
-                    B::Shl => IBinOp::Shl,
-                    B::Shr => IBinOp::Shr,
                     _ => unreachable!(),
                 };
                 let a = self.lower_expr(lhs);
                 let b = self.lower_expr(rhs);
                 self.bin(iop, a, &Ty::Int, b, &Ty::Int, &Ty::Int)
+            }
+            B::Shl | B::Shr => {
+                // PHP semantics live in the runtime: a negative shift count is a
+                // fatal ArithmeticError and a count >= 64 yields 0 (or -1 for
+                // `>>` of a negative value) instead of masking to 6 bits.
+                let a = self.lower_expr(lhs);
+                let b = self.lower_expr(rhs);
+                let callee = if op == B::Shl { "pxr_shl" } else { "pxr_shr" };
+                let dst = self.fresh();
+                self.emit(Inst::Call {
+                    dst: Some(dst),
+                    callee: callee.into(),
+                    args: vec![a, b],
+                    ret: Ty::Int,
+                });
+                dst
             }
             B::NullCoalesce => self.lower_null_coalesce(lhs, lhs_ty, rhs, rhs_ty),
             B::Pow => unreachable!("`**` is rejected during semantic analysis"),
@@ -764,6 +806,8 @@ impl Lowerer {
         let end = self.fresh_label();
         let body_labels: Vec<Label> = arms.iter().map(|_| self.fresh_label()).collect();
 
+        // PHP evaluates `match` arms in order, but a `default` arm matches only when
+        // no conditional arm matched — regardless of its position in the source.
         // Dispatch: test each non-default arm's conditions in order; the first
         // match jumps into that arm's body.
         for (i, arm) in arms.iter().enumerate() {
@@ -854,6 +898,20 @@ impl Lowerer {
             result_ty: rt.clone(),
             a,
             b,
+        });
+        dst
+    }
+
+    /// PHP loose string comparison, which is numeric-aware: two numeric strings
+    /// compare by value (`"10" < "9"`, `"1" == "01"`), others byte-wise.
+    /// Returns the normalised three-way result (-1/0/1) as an `int`.
+    fn str_cmp_loose(&mut self, a: Value, b: Value) -> Value {
+        let dst = self.fresh();
+        self.emit(Inst::Call {
+            dst: Some(dst),
+            callee: "pxr_str_cmp_loose".into(),
+            args: vec![a, b],
+            ret: Ty::Int,
         });
         dst
     }
@@ -1005,6 +1063,25 @@ impl Lowerer {
         dst
     }
 
+    /// PHP arrays are value types: assigning, passing, returning and iterating
+    /// all work on a copy, so a later mutation can never be observed through
+    /// another name. PXR realises this with an eager deep copy (`pxr_array_copy`)
+    /// at every place an array value is stored into a location, passed to a
+    /// function, embedded in another array, or taken as a `foreach` value.
+    fn maybe_copy_array(&mut self, v: Value, ty: &Ty) -> Value {
+        if !ty.is_array() {
+            return v;
+        }
+        let dst = self.fresh();
+        self.emit(Inst::Call {
+            dst: Some(dst),
+            callee: "pxr_array_copy".into(),
+            args: vec![v],
+            ret: ty.clone(),
+        });
+        dst
+    }
+
     /// Pack a value of the given type into an `i64` payload for storage.
     fn encode_bits(&mut self, v: Value, ty: &Ty) -> Value {
         if *ty == Ty::Int {
@@ -1062,6 +1139,9 @@ impl Lowerer {
             if vt != *ety {
                 vv = self.cast(vv, &vt, ety);
             }
+            // Nested arrays are copied so a later mutation of the literal
+            // element cannot be observed through the source variable.
+            let vv = self.maybe_copy_array(vv, ety);
             let bits = self.encode_bits(vv, ety);
             match key {
                 Some(k) => {
@@ -1075,12 +1155,18 @@ impl Lowerer {
     }
 
     fn lower_store(&mut self, target: &TTarget, ty: Ty, v: Value) {
+        // Storing an array value copies it (PHP value semantics). Assignments
+        // through an index target store the element's value, so the copy below
+        // covers both plain variables and array elements.
         match target {
-            TTarget::Var { slot, .. } => self.emit(Inst::SlotSet {
-                slot: *slot,
-                src: v,
-                ty,
-            }),
+            TTarget::Var { slot, .. } => {
+                let v = self.maybe_copy_array(v, &ty);
+                self.emit(Inst::SlotSet {
+                    slot: *slot,
+                    src: v,
+                    ty,
+                })
+            }
             TTarget::Index {
                 base,
                 elem_ty: _,
@@ -1092,12 +1178,14 @@ impl Lowerer {
                 let arr = self.lower_expr(base);
                 let (ktag, kint, kstr) = self.lower_key(key, key_ty);
                 let vtag = self.emit_const(Literal::Int(Self::tag_of(&ty)));
+                let v = self.maybe_copy_array(v, &ty);
                 let bits = self.encode_bits(v, &ty);
                 self.array_set(arr, ktag, kint, kstr, vtag, bits);
             }
             TTarget::Push { base, elem_ty: _ } => {
                 let arr = self.lower_expr(base);
                 let vtag = self.emit_const(Literal::Int(Self::tag_of(&ty)));
+                let v = self.maybe_copy_array(v, &ty);
                 let bits = self.encode_bits(v, &ty);
                 self.array_push(arr, vtag, bits);
             }
@@ -1152,12 +1240,22 @@ impl Lowerer {
                 (d, Ty::String)
             }
             B::Add | B::Sub | B::Mul | B::Mod => {
+                if op == B::Mod {
+                    let dst = self.fresh();
+                    self.emit(Inst::Call {
+                        dst: Some(dst),
+                        callee: "pxr_mod".into(),
+                        args: vec![lv, rv],
+                        ret: Ty::Int,
+                    });
+                    return (dst, Ty::Int);
+                }
                 let (a, b, ty) = self.unify_numeric(lv, lt, rv, rt);
                 let iop = match op {
                     B::Add => IBinOp::Add,
                     B::Sub => IBinOp::Sub,
                     B::Mul => IBinOp::Mul,
-                    _ => IBinOp::Mod,
+                    _ => unreachable!(),
                 };
                 let d = self.bin(iop, a, &ty, b, &ty, &ty);
                 (d, ty)
@@ -1165,8 +1263,14 @@ impl Lowerer {
             B::Div => {
                 let a = self.cast(lv, lt, &Ty::Float);
                 let b = self.cast(rv, rt, &Ty::Float);
-                let d = self.bin(IBinOp::Div, a, &Ty::Float, b, &Ty::Float, &Ty::Float);
-                (d, Ty::Float)
+                let dst = self.fresh();
+                self.emit(Inst::Call {
+                    dst: Some(dst),
+                    callee: "pxr_div".into(),
+                    args: vec![a, b],
+                    ret: Ty::Float,
+                });
+                (dst, Ty::Float)
             }
             B::Eq | B::NotEq | B::Identical | B::NotIdentical => {
                 let iop = if matches!(op, B::Eq | B::Identical) {
@@ -1359,8 +1463,10 @@ impl Lowerer {
     ) {
         let _ = base_ty;
         // The array pointer is computed once in the entry block, so it
-        // dominates every loop block below.
+        // dominates every loop block below. `foreach` iterates a snapshot
+        // (PHP value semantics), so the base is copied here.
         let arr = self.lower_expr(base);
+        let arr = self.maybe_copy_array(arr, base_ty);
         let count = self.array_count(arr);
         let idx = self.alloc_temp_slot(Ty::Int);
         let zero = self.emit_const(Literal::Int(0));
@@ -1392,6 +1498,9 @@ impl Lowerer {
         let iv2 = self.load_slot(idx, Ty::Int);
         let bits = self.array_val_at(arr, iv2);
         let v = self.decode_bits(bits, value_ty);
+        // The loop variable receives a copy of each value (PHP `foreach` by
+        // value), so mutating it cannot touch the iterated array.
+        let v = self.maybe_copy_array(v, value_ty);
         self.emit(Inst::SlotSet {
             slot: value_slot,
             src: v,
@@ -1448,13 +1557,19 @@ impl Lowerer {
         for (i, c) in cases.iter().enumerate() {
             if let Some(t) = &c.test {
                 let tv = self.lower_expr(t);
-                let (a, b, ty) = if subject_ty.is_numeric() && c.test_ty.is_numeric() {
-                    let (x, y, ty) = self.unify_numeric(sval, subject_ty, tv, &c.test_ty);
-                    (x, y, ty)
+                // PHP's `switch` compares loosely; numeric strings compare by
+                // value (`"1" == "01"`).
+                let eq = if *subject_ty == Ty::String && c.test_ty == Ty::String {
+                    let cmp = self.str_cmp_loose(sval, tv);
+                    let zero = self.emit_const(Literal::Int(0));
+                    self.bin(IBinOp::Eq, cmp, &Ty::Int, zero, &Ty::Int, &Ty::Bool)
+                } else if subject_ty.is_numeric() && c.test_ty.is_numeric() {
+                    let (a, b, ty) = self.unify_numeric(sval, subject_ty, tv, &c.test_ty);
+                    self.bin(IBinOp::Eq, a, &ty, b, &ty, &Ty::Bool)
                 } else {
-                    (sval, tv, subject_ty.clone())
+                    let ty = subject_ty.clone();
+                    self.bin(IBinOp::Eq, sval, &ty, tv, &ty, &Ty::Bool)
                 };
-                let eq = self.bin(IBinOp::Eq, a, &ty, b, &ty, &Ty::Bool);
                 let cont_l = self.fresh_label();
                 self.terminator(Inst::Branch {
                     cond: eq,
@@ -1487,9 +1602,11 @@ impl Lowerer {
                 let mut vals = Vec::new();
                 for (i, a) in args.iter().enumerate() {
                     let v = self.lower_expr(a);
-                    // Widen `int` arguments to `float` parameters.
+                    // Widen `int` arguments to `float` parameters, and copy
+                    // arrays (PHP passes arrays by value).
                     let want = params.get(i).cloned().unwrap_or_else(|| arg_tys[i].clone());
-                    vals.push(self.cast(v, &arg_tys[i], &want));
+                    let v = self.cast(v, &arg_tys[i], &want);
+                    vals.push(self.maybe_copy_array(v, &want));
                 }
                 if *ret == Ty::Void {
                     self.emit(Inst::Call {

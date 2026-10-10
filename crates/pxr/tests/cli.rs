@@ -255,6 +255,188 @@ echo $c[0] . " " . $c[1] . " " . $c[2] . "\n";
 }
 
 #[test]
+fn php_faithful_array_value_semantics() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    // Every case here is valid PHP *and* valid PXR; PXR must match PHP:
+    //   - `$b = $a` copies, and mutating `$b` leaves `$a` alone;
+    //   - `foreach` iterates a snapshot, so appending inside the loop is unseen;
+    //   - arrays nested in an array literal are copied;
+    //   - canonical integer string keys unify with integer keys;
+    //   - `match`'s `default` is a fallback regardless of position;
+    //   - shift counts >= 64 yield 0 (or -1 for `>>` of a negative value).
+    let src = r#"<?php
+$a = [1, 2, 3];
+$b = $a;
+$b[0] = 99;
+echo $a[0] . "\n";
+
+$e = [1, 2, 3];
+foreach ($e as $v) {
+    $e[] = 100;
+}
+echo count($e) . "\n";
+
+$inner = [1];
+$outer = [$inner];
+$inner[] = 2;
+echo count($outer[0]) . " " . count($inner) . "\n";
+
+$k = [];
+$k["1"] = 10;
+$k[1] = 20;
+echo count($k) . " " . $k["1"] . " " . $k[1] . "\n";
+
+$m = match (true) { default => "lead", true => "spur" };
+echo $m . "\n";
+
+echo (1 << 64) . " " . (-1 >> 64) . " " . (1 >> 64) . " " . (2 << 2) . "\n";
+"#;
+    let f = temp_php("valuesem", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "1\n6\n1 2\n1 20 20\nspur\n0 -1 0 8\n");
+}
+
+#[test]
+fn array_argument_is_copied() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    // PHP passes arrays by value; the callee's mutation must not be visible to
+    // the caller. `array<int>` is PXR syntax (PHP has no generic array hint).
+    let src = r#"<?php
+function bump(array<int> $x): array<int> {
+    $x[0] = $x[0] + 1;
+    return $x;
+}
+$c = [7, 8];
+$d = bump($c);
+echo $c[0] . " " . $d[0] . "\n";
+"#;
+    let f = temp_php("argcopy", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "7 8\n");
+}
+
+#[test]
+fn negative_shift_is_a_fatal_error() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    // PHP raises an uncaught ArithmeticError (exit status 255); PXR reproduces
+    // the message and exit status.
+    let f = temp_php("negshift", "<?php echo 1 << -1;");
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 255, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("Bit shift by negative number"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn interpolation_is_rejected_at_compile_time() {
+    // PXR cannot yet expand `"$x"`. Rather than silently emitting the literal
+    // (which would diverge from PHP), it is a hard compile error.
+    let f = temp_php("interp", "<?php $x = 1; echo \"hi $x\";");
+    let r = run_ok(&["check", f.to_str().unwrap()]);
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("E0008"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn php_faithful_string_comparison() {
+    if !have_cc() {
+        eprintln!("skipping: no compiler");
+        return;
+    }
+    // PHP compares two numeric strings by value in loose comparisons (`==`,
+    // ordering, `<=>`, and `switch`), but `===` is always byte equality.
+    let src = r#"<?php
+echo (("10" < "9") ? "lt" : "ge") . "\n";
+echo (("1" == "01") ? "loose" : "ne") . " " . (("1" === "01") ? "strict" : "strictne") . "\n";
+echo (("abc" < "abd") ? "lt" : "ge") . "\n";
+echo ("10" <=> "9") . " " . (7 <=> 7) . "\n";
+$s = "1";
+switch ($s) {
+    case "01":
+        echo "loose-case\n";
+        break;
+    default:
+        echo "default\n";
+}
+"#;
+    let f = temp_php("strcmp", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "ge\nloose strictne\nlt\n1 0\nloose-case\n");
+}
+
+#[test]
+fn php_faithful_float_formatting() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    // Values must stringify exactly like PHP (zend_gcvt, precision 14):
+    // "1.0E+15" not "1E+15", "1.0E-5" not "1E-05", integral floats without a
+    // fraction, "-0" for negative zero, and large literals must compile.
+    let src = r#"<?php
+echo 0.1 . "\n";
+echo (0.1 + 0.2) . "\n";
+echo (1.0 / 3.0) . "\n";
+echo 1e14 . "\n";
+echo 1e16 . "\n";
+echo 1e-5 . "\n";
+echo 1e300 . "\n";
+echo 2.0 . "\n";
+echo 100.0 . "\n";
+echo 123456789.123456 . "\n";
+echo -0.0 . "\n";
+"#;
+    let f = temp_php("floats", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "0.1\n0.3\n0.33333333333333\n1.0E+14\n1.0E+16\n1.0E-5\n1.0E+300\n2\n100\n123456789.12346\n-0\n"
+    );
+}
+
+#[test]
+fn division_by_zero_is_fatal() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    // PHP raises an uncaught DivisionByZeroError (exit 255) for `/` and `%`.
+    let f = temp_php("divzero", "<?php echo 1 / 0;");
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 255, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("Division by zero"),
+        "stderr: {}",
+        r.stderr
+    );
+
+    let f2 = temp_php("modzero", "<?php echo 5 % 0;");
+    let r2 = run_ok(&["run", f2.to_str().unwrap()]);
+    assert_eq!(r2.code, 255, "stderr: {}", r2.stderr);
+    assert!(
+        r2.stderr.contains("Division by zero"),
+        "stderr: {}",
+        r2.stderr
+    );
+}
+
+#[test]
 fn control_flow_breadth() {
     if !have_cc() {
         eprintln!("skipping: no C compiler");

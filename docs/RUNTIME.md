@@ -61,7 +61,7 @@ void   pxr_print_bool(int v);        /* 1 -> "1", 0 -> "" */
 /* strings */
 char  *pxr_str_concat(const char *a, const char *b);
 char  *pxr_i64_to_str(long long v);
-char  *pxr_f64_to_str(double v);
+char  *pxr_f64_to_str(double v);   /* PHP zend_gcvt, precision 14 (see below) */
 char  *pxr_bool_to_str(int v);
 long long pxr_strlen(const char *s);
 
@@ -75,11 +75,17 @@ int    pxr_truthy_f64(double v);
 int    pxr_truthy_str(const char *s);
 
 /* string comparison */
-int    pxr_str_eq(const char *a, const char *b);   /* 1 if equal */
+int    pxr_str_eq(const char *a, const char *b);   /* 1 if equal (bytes) */
 int    pxr_str_cmp(const char *a, const char *b);  /* strcmp */
+long long pxr_str_cmp_loose(const char *a, const char *b);
+       /* PHP `==`/ordering/`<=>`: -1/0/1, numeric-aware for numeric strings */
 
 /* math */
 long long pxr_abs_i64(long long v);
+long long pxr_shl(long long a, long long b);   /* PHP shift rules           */
+long long pxr_shr(long long a, long long b);   /* >=64 -> 0/-1; <0 -> fatal */
+double    pxr_div(double a, double b);         /* b==0 -> fatal DivisionByZeroError */
+long long pxr_mod(long long a, long long b);   /* b==0 -> fatal DivisionByZeroError */
 /* float abs uses the LLVM intrinsic target `fabs` from libm */
 
 /* arrays — keys are (tag, int, string); values are (tag, 64-bit payload).
@@ -92,6 +98,7 @@ long long pxr_array_get_bits(void *a, long long ktag, long long ki, const char *
 long long pxr_array_has(void *a, long long ktag, long long ki, const char *ks); /* for `??` */
 long long pxr_array_count(void *a);
 long long pxr_array_val_bits_at(void *a, long long i);   /* foreach */
+void  *pxr_array_copy(void *a);                /* deep copy (value semantics) */
 ```
 
 Array values cross the ABI as a **type tag plus a 64‑bit payload**: `int` is the
@@ -101,6 +108,22 @@ the static element type, so it is the one that packs and unpacks the payload wit
 `Inst::BitCast`; the runtime only carries the bits. Arrays preserve insertion
 order and use linear lookup (a hash index is a roadmap item). `pxr_array_push`
 uses PHP's "next key = largest integer key + 1" rule.
+
+PHP array **value semantics** are enforced at compile time: the backend emits a
+`pxr_array_copy` (a deep copy, recursing into nested arrays) at every store,
+function argument, array-literal element and `foreach` base, so mutation through
+one name is never visible through another. Strings are immutable and shared.
+Canonical decimal‑integer string keys are normalised to integer keys inside
+`pxr_array_set`/`_get_bits`/`_has`, matching PHP (`$a["1"]` ≡ `$a[1]`).
+
+**Float stringification** reproduces PHP's `zend_gcvt` at precision 14:
+14 significant digits, scientific notation only when the decimal point lies
+outside `[-3, 14]`, mantissas always carry a decimal point (`1e15` → `"1.0E+15"`),
+exponents are never zero-padded (`1e-5` → `"1.0E-5"`), integral values print
+without a fraction, and `-0.0` prints `"-0"` (constant emission uses an exact
+`bitcast i64 {bits} to double` so signs and NaN payloads survive). `pxr_div` /
+`pxr_mod` abort with PHP's `DivisionByZeroError` (exit 255) instead of producing
+IEEE infinity or UB.
 
 Generated modules `declare` these symbols and call them directly; `clang` resolves
 them against the cached runtime object. `main` is emitted with the C‑correct

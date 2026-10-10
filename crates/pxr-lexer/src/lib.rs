@@ -794,10 +794,10 @@ impl<'a> Lexer<'a> {
                 }
                 Some(b'$') if quote == b'"' => {
                     self.diags.emit(
-                        Diagnostic::warning(
-                            "double-quoted string interpolation is not implemented yet; the `$` is kept literally",
+                        Diagnostic::error(
+                            "double-quoted string interpolation is not implemented yet; write a concatenation (`\"a\" . $x`) instead",
                         )
-                        .with_code("W0002")
+                        .with_code("E0008")
                         .with_span(Span::new(self.pos, self.pos + 1)),
                     );
                     out.push(b'$');
@@ -933,9 +933,9 @@ mod tests {
     }
 
     #[test]
-    fn interpolation_warns() {
+    fn interpolation_is_rejected() {
         let (_, diags) = lex(r#""hi $name""#);
-        assert!(!diags.has_errors());
-        assert!(diags.items().iter().any(|d| d.code == Some("W0002")));
+        assert!(diags.has_errors());
+        assert!(diags.items().iter().any(|d| d.code == Some("E0008")));
     }
 }

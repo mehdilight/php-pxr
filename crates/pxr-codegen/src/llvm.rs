@@ -37,7 +37,12 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     ("pxr_truthy_str", "i32", &["ptr"]),
     ("pxr_str_eq", "i32", &["ptr", "ptr"]),
     ("pxr_str_cmp", "i32", &["ptr", "ptr"]),
+    ("pxr_str_cmp_loose", "i64", &["ptr", "ptr"]),
     ("pxr_abs_i64", "i64", &["i64"]),
+    ("pxr_shl", "i64", &["i64", "i64"]),
+    ("pxr_shr", "i64", &["i64", "i64"]),
+    ("pxr_div", "double", &["double", "double"]),
+    ("pxr_mod", "i64", &["i64", "i64"]),
     ("fabs", "double", &["double"]),
     // Arrays. Values cross the boundary as a type tag plus a 64-bit payload.
     ("pxr_array_new", "ptr", &[]),
@@ -51,6 +56,7 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     ("pxr_array_has", "i64", &["ptr", "i64", "i64", "ptr"]),
     ("pxr_array_count", "i64", &["ptr"]),
     ("pxr_array_val_bits_at", "i64", &["ptr", "i64"]),
+    ("pxr_array_copy", "ptr", &["ptr"]),
 ];
 
 pub fn llty(ty: &Ty) -> &'static str {
@@ -243,7 +249,9 @@ impl<'a> FnGen<'a> {
                 let (line, ty) = match lit {
                     Literal::Int(i) => (format!("%v{dst} = add i64 0, {i}"), Ty::Int),
                     Literal::Float(x) => (
-                        format!("%v{dst} = fadd double 0.0, {}", pxr_ir::format_float(*x)),
+                        // Exact bit pattern: `fadd 0.0, -0.0` would fold to +0.0
+                        // under IEEE, and NaN payloads/signs must survive.
+                        format!("%v{dst} = bitcast i64 {} to double", x.to_bits()),
                         Ty::Float,
                     ),
                     Literal::Bool(b) => {

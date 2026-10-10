@@ -164,8 +164,10 @@ Additional operators:
   an array element read can be unset; for any other expression `??` degrades to
   its left operand. The right operand is only evaluated when needed.
 * `& | ^ << >> ~` — bitwise operators require `int` operands (PHP would coerce;
-  PXR rejects at compile time). `>>` is an arithmetic (sign‑preserving) shift and
-  the shift amount is masked to `0..63` to avoid undefined behaviour.
+  PXR rejects at compile time). Shifts follow PHP's rules exactly: `>>` is an
+  arithmetic (sign‑preserving) shift, a count of 64 or more yields `0` (or `-1`
+  for `>>` of a negative value), and a negative count is a fatal
+  `ArithmeticError`.
 
 ## Arrays
 
@@ -184,7 +186,8 @@ echo $a[0] . " " . count($a) . " " . $m["y"] . "\n";
 
 Rules and limitations:
 
-* A type annotation is written `array<T>` (a PXR extension; not valid PHP).
+* A type annotation is written `array<T>` (a PXR extension; not valid PHP). A
+  bare `array` type hint (valid PHP) is rejected — write the element type.
 * An empty `[]` has an as‑yet‑unknown element type that is **refined** by the
   first `push`/`set`; reading an element of a still‑empty array is an error
   (`E0243`).
@@ -195,10 +198,11 @@ Rules and limitations:
 * `foreach` currently supports the **value‑only** form `foreach ($a as $v)`. The
   keyed form `foreach ($a as $k => $v)` is rejected (`E0242`); iterate with an
   explicit index and `count()` instead.
-* Iteration uses a live array pointer: PXR arrays are **references**, so a
-  `foreach` observes mutations made to the array inside the loop, and passing an
-  array to a function passes the reference (PHP would copy). See
-  [`COMPATIBILITY.md`](COMPATIBILITY.md).
+* Arrays have PHP **value semantics**: `$b = $a`, passing `$a` to a function,
+  returning an array, and `foreach` all operate on a copy (realised as an eager
+  deep copy), so mutating a copy never affects the original.
+* Canonical decimal‑integer string keys **are** the integer key (`$a["1"]` is
+  `$a[1]`), exactly as in PHP; `"01"`, `"1.5"`, `"+1"` and `" 1"` stay strings.
 
 ## Control flow
 
@@ -215,8 +219,9 @@ Rules and limitations:
   (a `case` without `break` falls into the next body). Comparisons are loose
   (`==`), producing PHP's numeric/string coercions for the supported types.
 * `match (subject) { v1, v2 => r, default => r }` — strict (`===`), evaluated
-  top to bottom. PXR **requires** a `default` arm (`E0256`) because there is no
-  runtime exception to throw when nothing matches.
+  top to bottom; the `default` arm matches only when no other arm matches
+  (regardless of its position, as in PHP). PXR **requires** a `default` arm
+  (`E0256`) because there is no runtime exception to throw when nothing matches.
 
 Conditions in `if`/`while`/`for`/`do` accept any truthy scalar. `switch`/`match`
 subjects are compared with loose/strict equality respectively.
@@ -254,7 +259,7 @@ are `W020x`.
 | `E0006` | Integer literal out of range |
 | `E0007` | Unterminated string literal |
 | `W0001` | Leading‑zero octal treated as decimal |
-| `W0002` | String interpolation not implemented (kept literal) |
+| `E0008` | Double‑quoted string interpolation not implemented |
 | `E0100` | Syntax error (with the unexpected token described) |
 | `E0201` | Duplicate function definition |
 | `E0202` | Parameter needs an explicit type |

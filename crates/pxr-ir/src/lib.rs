@@ -454,7 +454,20 @@ pub fn format_float(f: f64) -> String {
         return if f < 0.0 { "-inf".into() } else { "inf".into() };
     }
     let s = format!("{f:?}");
-    if s.contains('.') || s.contains('e') || s.contains('E') {
+    if s.contains('e') || s.contains('E') {
+        // Rust's shortest repr may omit the decimal point ("1e16"), which LLVM
+        // rejects; the mantissa must be a float literal, so insert ".0" before
+        // the exponent.
+        if !s.contains('.') {
+            let i = s.find(['e', 'E']).expect("exponent present");
+            let mut out = String::with_capacity(s.len() + 2);
+            out.push_str(&s[..i]);
+            out.push_str(".0");
+            out.push_str(&s[i..]);
+            return out;
+        }
+        s
+    } else if s.contains('.') {
         s
     } else {
         format!("{s}.0")

@@ -176,11 +176,11 @@ automatically when no C compiler is available.
 ## Not implemented yet
 
 Tracked honestly in [`docs/ROADMAP.md`](docs/ROADMAP.md). The larger items:
-value‑semantics arrays (PXR arrays are references today), keyed `foreach`,
-`echo` of arrays, nested array assignment, classes/objects, generics,
-`null`/nullable types, ownership & borrowing, string interpolation, exceptions,
-modules/`include`, C interop (`extern`), concurrency, and the `mixed`/dynamic
-escape hatch for gradual migration.
+keyed `foreach`, `echo` of arrays, nested array assignment, `null`/nullable
+types, integer‑overflow → `float` promotion, classes/objects, generics,
+ownership & borrowing, string interpolation, exceptions, modules/`include`,
+C interop (`extern`), concurrency, and the `mixed`/dynamic escape hatch for
+gradual migration.
 
 ## License
 
