@@ -16,23 +16,30 @@ operations the backend emits.
 | `float` | `double` | `double` |
 | `bool` | `int` in the ABI | `i1` (zero‑extended to `i32`/`i64` at calls) |
 | `string` | `const char *` (NUL‑terminated) | `ptr` |
+| `array<T>` | opaque `void *` | `ptr` |
 
 `bool` is `i1` inside generated code and is passed to the runtime as an `i32`
 (0/1).
 
 ## Memory model
 
-Strings are immutable. Operations that produce a string
-(`pxr_str_concat`, `pxr_i64_to_str`, …) allocate from a **bump arena**:
+Strings and arrays are immutable‑to‑the‑runtime. Operations that produce a string
+(`pxr_str_concat`, `pxr_i64_to_str`, …) or a new array (`pxr_array_new`) allocate
+from a **bump arena**:
 
-* `pxr_arena_alloc(n)` — 8‑byte aligned allocation, doubling growth.
+* `pxr_arena_alloc(n)` — 8‑byte aligned allocation from the current page.
 * `pxr_str_alloc(len)` — NUL‑terminated string allocation.
 
+The arena is a linked list of pages (64 KiB each, doubling only for oversized
+requests), so growing it never invalidates pointers handed out earlier. This was
+upgraded from a single realloc'd block in milestone 1, once arrays could hold
+references to strings allocated before them.
+
 There is **no per‑value free** yet. The arena grows for the life of the process
-and is reclaimed by the OS at exit. This is a deliberate milestone‑0 trade‑off:
-it is simple, fast, and cannot dangle. Owned values, reference counting, and
-(eventually) ownership/borrow checking are roadmap items. Until then, long‑running
-programs that build strings in a loop can grow memory; this is documented rather
+and is reclaimed by the OS at exit. This is a deliberate trade‑off: it is simple,
+fast, and cannot dangle. Owned values, reference counting, and (eventually)
+ownership/borrow checking are roadmap items. Until then, long‑running programs
+that build strings or arrays in a loop can grow memory; this is documented rather
 than hidden.
 
 Strings are NUL‑terminated, so an embedded `\0` byte truncates the value.
@@ -74,7 +81,26 @@ int    pxr_str_cmp(const char *a, const char *b);  /* strcmp */
 /* math */
 long long pxr_abs_i64(long long v);
 /* float abs uses the LLVM intrinsic target `fabs` from libm */
+
+/* arrays — keys are (tag, int, string); values are (tag, 64-bit payload).
+   key/value tags: 0=null, 1=int, 2=float, 3=bool, 4=string, 5=array */
+void  *pxr_array_new(void);
+void   pxr_array_set(void *a, long long ktag, long long ki, const char *ks,
+                     long long vtag, long long bits);
+void   pxr_array_push(void *a, long long vtag, long long bits);
+long long pxr_array_get_bits(void *a, long long ktag, long long ki, const char *ks);
+long long pxr_array_has(void *a, long long ktag, long long ki, const char *ks); /* for `??` */
+long long pxr_array_count(void *a);
+long long pxr_array_val_bits_at(void *a, long long i);   /* foreach */
 ```
+
+Array values cross the ABI as a **type tag plus a 64‑bit payload**: `int` is the
+value itself, `bool` is zero‑extended, `float` is its IEEE‑754 bits
+(`bitcast`), and `string`/`array` are `ptrtoint`‑ed pointers. The compiler knows
+the static element type, so it is the one that packs and unpacks the payload with
+`Inst::BitCast`; the runtime only carries the bits. Arrays preserve insertion
+order and use linear lookup (a hash index is a roadmap item). `pxr_array_push`
+uses PHP's "next key = largest integer key + 1" rule.
 
 Generated modules `declare` these symbols and call them directly; `clang` resolves
 them against the cached runtime object. `main` is emitted with the C‑correct

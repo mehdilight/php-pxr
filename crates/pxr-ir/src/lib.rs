@@ -51,6 +51,13 @@ pub enum BinOp {
     LtEq,
     Gt,
     GtEq,
+    /// Three-way comparison `<=>` producing -1 / 0 / 1.
+    Cmp,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 impl BinOp {
@@ -68,6 +75,12 @@ impl BinOp {
             BinOp::LtEq => "le",
             BinOp::Gt => "gt",
             BinOp::GtEq => "ge",
+            BinOp::Cmp => "cmp",
+            BinOp::BitAnd => "and",
+            BinOp::BitOr => "or",
+            BinOp::BitXor => "xor",
+            BinOp::Shl => "shl",
+            BinOp::Shr => "shr",
         }
     }
 
@@ -83,6 +96,8 @@ impl BinOp {
 pub enum UnOp {
     Neg,
     Not,
+    /// `~` — bitwise NOT.
+    BitNot,
 }
 
 /// Explicit type conversions. String conversions require runtime support;
@@ -155,6 +170,14 @@ pub enum Inst {
         to: Ty,
         src: Value,
     },
+    /// Reinterpretation used when packing/unpacking array elements: converts
+    /// between `i64` and the concrete representation (`double`/`ptr`/`i1`).
+    BitCast {
+        dst: Value,
+        from: Ty,
+        to: Ty,
+        src: Value,
+    },
     Call {
         dst: Option<Value>,
         callee: String,
@@ -202,6 +225,7 @@ impl Inst {
                 | Inst::Bin { .. }
                 | Inst::Un { .. }
                 | Inst::Cast { .. }
+                | Inst::BitCast { .. }
                 | Inst::SlotGet { .. }
         )
     }
@@ -213,6 +237,7 @@ impl Inst {
             | Inst::Bin { dst, .. }
             | Inst::Un { dst, .. }
             | Inst::Cast { dst, .. }
+            | Inst::BitCast { dst, .. }
             | Inst::SlotGet { dst, .. } => Some(*dst),
             Inst::Call { dst, .. } => *dst,
             _ => None,
@@ -224,6 +249,7 @@ impl Inst {
             Inst::Bin { a, b, .. } => vec![*a, *b],
             Inst::Un { a, .. } => vec![*a],
             Inst::Cast { src, .. } => vec![*src],
+            Inst::BitCast { src, .. } => vec![*src],
             Inst::Call { args, .. } => args.clone(),
             Inst::SlotSet { src, .. } => vec![*src],
             Inst::Print { src, .. } => vec![*src],
@@ -249,7 +275,12 @@ pub struct Function {
 }
 
 impl Function {
-    pub fn new(name: impl Into<String>, display: impl Into<String>, params: Vec<Ty>, ret: Ty) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        display: impl Into<String>,
+        params: Vec<Ty>,
+        ret: Ty,
+    ) -> Self {
         let next_value = params.len() as Value;
         Function {
             name: name.into(),
@@ -369,6 +400,7 @@ fn fmt_inst(inst: &Inst) -> String {
             let name = match op {
                 UnOp::Neg => "neg",
                 UnOp::Not => "not",
+                UnOp::BitNot => "bnot",
             };
             format!("%v{dst} = {name} {operand_ty} %v{a} -> {result_ty}")
         }
@@ -379,6 +411,7 @@ fn fmt_inst(inst: &Inst) -> String {
             to,
             src,
         } => format!("%v{dst} = cast {} {from} %v{src} -> {to}", op.name()),
+        Inst::BitCast { dst, from, to, src } => format!("%v{dst} = bitcast {from} %v{src} -> {to}"),
         Inst::Call {
             dst,
             callee,

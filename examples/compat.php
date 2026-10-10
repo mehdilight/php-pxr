@@ -38,3 +38,59 @@ $b = true;
 echo "b=" . $b . "\n";
 echo "lt=" . (3 < 5) . "\n";
 echo "eq=" . (3 === 3) . "\n";
+
+// --- milestone 1: arrays and control flow ---------------------------------
+
+$fibs = [1, 1, 2, 3, 5, 8];
+$total = 0;
+foreach ($fibs as $v) {
+    $total += $v;
+}
+$fibs[] = 13;
+echo "total=" . $total . " count=" . count($fibs) . "\n";
+
+$counts = ["a" => 1, "b" => 2];
+$counts["c"] = 3;
+echo "abc=" . ($counts["a"] + $counts["b"] + $counts["c"]) . "\n";
+
+for ($i = 0; $i < 3; $i++) {
+    echo "i=" . $i . " ";
+}
+echo "\n";
+
+$n = 4;
+$fact = 1;
+while ($n > 1) {
+    $fact *= $n;
+    $n--;
+}
+echo "4!=" . $fact . "\n";
+
+$j = 0;
+do {
+    $j++;
+} while ($j < 3);
+echo "j=" . $j . "\n";
+
+switch (2) {
+    case 1:
+        echo "one";
+        break;
+    case 2:
+        echo "two";
+        break;
+    default:
+        echo "many";
+}
+echo "\n";
+
+$r = match (3) {
+    1, 2 => "low",
+    3, 4 => "mid",
+    default => "high",
+};
+echo "match=" . $r . "\n";
+
+echo "sp=" . (7 <=> 3) . "," . (7 <=> 7) . "," . (3 <=> 7) . "\n";
+echo "tern=" . (3 > 2 ? "gt" : "le") . "\n";
+echo "bits=" . (6 & 3) . "," . (6 | 1) . "," . (6 ^ 1) . "," . (1 << 3) . "," . (16 >> 2) . "\n";

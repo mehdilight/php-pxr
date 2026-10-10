@@ -10,13 +10,17 @@ Run any of these with `pxr run <file>`, or from a release build:
 | `fizzbuzz.php` | Branching, `%`, `===`, concatenation | ⚠️ uses `$i: int` (PXR annotation) |
 | `types.php` | All scalar types, widening, builtins | ❌ PXR-only annotations |
 | `compat.php` | The shared PHP∩PXR subset; output is asserted identical to PHP | ✅ |
+| `quicksort.php` | Arrays, `for`/`while`/`foreach`, `continue`, index assignment | ✅ |
 
-`compat.php` is the compatibility proof: it compiles with `pxr` and runs under
-`php`, and both produce the same bytes.
+`compat.php` and `quicksort.php` are compatibility proofs: they compile with
+`pxr` and run under `php`, and both produce the same bytes.
 
 ```sh
 php examples/compat.php
 pxr run examples/compat.php
+
+php examples/quicksort.php
+pxr run examples/quicksort.php
 ```
 
 ## Seeing an error

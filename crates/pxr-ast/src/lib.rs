@@ -21,9 +21,22 @@ pub enum Stmt {
     Expr(Expr, Span),
     /// `$x = value;` optionally with a PXR type annotation `$x: int = value;`
     Assign {
-        name: String,
+        target: LValue,
         ty: Option<TypeRef>,
         value: Expr,
+        span: Span,
+    },
+    /// `$x += value;` and the other compound forms (`-=`, `*=`, `/=`, `%=`, `.=`, ...).
+    AssignOp {
+        target: LValue,
+        op: BinOp,
+        value: Expr,
+        span: Span,
+    },
+    /// `$x++;` / `$x--;` (prefix and postfix are equivalent in statement position).
+    IncDec {
+        target: LValue,
+        delta: i32,
         span: Span,
     },
     FnDecl(Box<FnDecl>),
@@ -40,8 +53,84 @@ pub enum Stmt {
         body: Vec<Stmt>,
         span: Span,
     },
+    /// `for (init; cond; update) body` — each clause may contain several
+    /// comma-separated parts, matching PHP.
+    For {
+        init: Vec<Stmt>,
+        cond: Vec<Expr>,
+        update: Vec<Stmt>,
+        body: Vec<Stmt>,
+        span: Span,
+    },
+    /// `do body while (cond);`
+    DoWhile {
+        body: Vec<Stmt>,
+        cond: Expr,
+        span: Span,
+    },
+    /// `foreach ($subject as $value)` / `foreach ($subject as $key => $value)`.
+    Foreach {
+        subject: Expr,
+        key: Option<String>,
+        key_span: Span,
+        value: String,
+        value_span: Span,
+        body: Vec<Stmt>,
+        span: Span,
+    },
+    /// `switch ($subject) { case ...: ... default: ... }` (with fall-through).
+    Switch {
+        subject: Expr,
+        cases: Vec<SwitchCase>,
+        span: Span,
+    },
+    /// `break;` / `break N;`
+    Break(Option<u32>, Span),
+    /// `continue;` / `continue N;`
+    Continue(Option<u32>, Span),
     Block(Vec<Stmt>, Span),
     Empty,
+}
+
+/// One `case <expr>:` or `default:` arm of a `switch`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwitchCase {
+    /// `None` for `default`.
+    pub test: Option<Expr>,
+    pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+/// A syntactic assignment target.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LValue {
+    Var {
+        name: String,
+        span: Span,
+    },
+    /// `$base[index]`; `index` is `None` for the push form `$base[]`.
+    Index {
+        base: Box<LValue>,
+        index: Option<Box<Expr>>,
+        span: Span,
+    },
+}
+
+impl LValue {
+    pub fn span(&self) -> Span {
+        match self {
+            LValue::Var { span, .. } => *span,
+            LValue::Index { span, .. } => *span,
+        }
+    }
+
+    /// The root variable name of this target (`$a[0][1]` -> `a`).
+    pub fn root_name(&self) -> &str {
+        match self {
+            LValue::Var { name, .. } => name,
+            LValue::Index { base, .. } => base.root_name(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -70,6 +159,9 @@ pub enum TypeRef {
     String,
     Bool,
     Void,
+    /// `array<T>` — a PXR array whose values are all of type `T`. Keys are
+    /// dynamically `int` or `string`, mirroring PHP's ordered maps.
+    Array(Box<TypeRef>),
     Named(String),
     Span(Span),
 }
@@ -87,6 +179,8 @@ impl TypeRef {
 pub enum UnOp {
     Neg,
     Not,
+    /// `~` — bitwise NOT.
+    BitNot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +190,7 @@ pub enum BinOp {
     Mul,
     Div,
     Mod,
+    Pow,
     Concat,
     Eq,
     NotEq,
@@ -105,8 +200,15 @@ pub enum BinOp {
     LtEq,
     Gt,
     GtEq,
+    Spaceship,
     And,
     Or,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    NullCoalesce,
 }
 
 impl BinOp {
@@ -117,6 +219,7 @@ impl BinOp {
             BinOp::Mul => "*",
             BinOp::Div => "/",
             BinOp::Mod => "%",
+            BinOp::Pow => "**",
             BinOp::Concat => ".",
             BinOp::Eq => "==",
             BinOp::NotEq => "!=",
@@ -126,8 +229,15 @@ impl BinOp {
             BinOp::LtEq => "<=",
             BinOp::Gt => ">",
             BinOp::GtEq => ">=",
+            BinOp::Spaceship => "<=>",
             BinOp::And => "&&",
             BinOp::Or => "||",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
+            BinOp::NullCoalesce => "??",
         }
     }
 }
@@ -151,6 +261,30 @@ pub enum Expr {
         rhs: Box<Expr>,
         span: Span,
     },
+    /// `cond ? then : else`; `then` is `None` for the short form `cond ?: else`.
+    Ternary {
+        cond: Box<Expr>,
+        then: Option<Box<Expr>>,
+        else_branch: Box<Expr>,
+        span: Span,
+    },
+    /// `base[index]` with `None` for the push form `base[]`.
+    Index {
+        base: Box<Expr>,
+        index: Option<Box<Expr>>,
+        span: Span,
+    },
+    /// `[k => v, v2, ...]`.
+    ArrayLit {
+        items: Vec<ArrayItem>,
+        span: Span,
+    },
+    /// `match (subject) { conds => result, default => result }`.
+    Match {
+        subject: Box<Expr>,
+        arms: Vec<MatchArm>,
+        span: Span,
+    },
     Call {
         callee: String,
         callee_span: Span,
@@ -158,6 +292,25 @@ pub enum Expr {
         span: Span,
     },
     Paren(Box<Expr>, Span),
+}
+
+/// One element of an array literal.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArrayItem {
+    /// `Some` for `key => value`, `None` for an implicit integer key.
+    pub key: Option<Expr>,
+    pub value: Expr,
+    pub span: Span,
+}
+
+/// One arm of a `match` expression.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MatchArm {
+    /// The match conditions; `is_default` is true for `default`.
+    pub conds: Vec<Expr>,
+    pub is_default: bool,
+    pub result: Expr,
+    pub span: Span,
 }
 
 impl Expr {
@@ -170,7 +323,13 @@ impl Expr {
             | Expr::NullLit(s)
             | Expr::Var(_, s)
             | Expr::Paren(_, s) => *s,
-            Expr::Unary { span, .. } | Expr::Binary { span, .. } | Expr::Call { span, .. } => *span,
+            Expr::Unary { span, .. }
+            | Expr::Binary { span, .. }
+            | Expr::Ternary { span, .. }
+            | Expr::Index { span, .. }
+            | Expr::ArrayLit { span, .. }
+            | Expr::Match { span, .. }
+            | Expr::Call { span, .. } => *span,
         }
     }
 }

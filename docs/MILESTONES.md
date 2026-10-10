@@ -57,7 +57,7 @@ concurrency, no C interop, no generics, no ownership.
 
 ---
 
-## ⛔ M1 — Language breadth I (control flow & data)
+## ✅ M1 — Language breadth I (control flow & data)
 
 * Arrays (indexed and associative) with `[]` literals, indexing, assignment.
 * `for`, `foreach`, `do…while`, `break`, `continue`, `switch`, `match`.
@@ -65,7 +65,51 @@ concurrency, no C interop, no generics, no ownership.
 * Compound assignment `+= -= *= /= .=` and `++`/`--`.
 * Bitwise operators `& | ^ ~ << >>`.
 
-**Acceptance.** A PHP array/quicksort program compiles and matches PHP output.
+**Delivered.**
+
+* `pxr-lexer` — new keywords (`for`, `foreach`, `as`, `do`, `break`, `continue`,
+  `switch`, `case`, `default`, `match`, `array`), operators `| ^ ~ & << >> ?? <=>
+  =>`, and the compound assignments `&= |= ^= <<= >>= ??=`.
+* `pxr-ast` + `pxr-parser` — new statements (`for`, `do…while`, `foreach`,
+  `switch`, `break`/`continue` with levels), `LValue` targets (`$a`, `$a[k]`,
+  `$a[]`), array literals/`array()`, `match`, ternary, and a PHP‑8‑accurate
+  precedence table (`??` below `?:`, `.` above shifts, `<=>` among relationals).
+* `pxr-types` — `Ty::Array(Box<Ty>)`; `array<null>` (an empty literal) is
+  assignable to any array and is refined on first use.
+* `pxr-sema` — array typing and element refinement, index/push targets,
+  `count`, all control‑flow analyses (`break`/`continue` level resolution,
+  `switch`/`match` typing, strict `match` with a required `default`), and the
+  `E024x`/`E025x` checks. Loose `switch`/`===` `match` semantics.
+* `pxr-ir` — `BinOp::{Cmp,BitAnd,BitOr,BitXor,Shl,Shr}`, `UnOp::BitNot`, and
+  `Inst::BitCast` (used to pack/unpack array payloads).
+* `pxr-codegen` — lowers all new statements/expressions; `&&`/`||`/`??`/`?:`
+  become real control flow; loops/`switch` maintain `break`/`continue` label
+  stacks; array operations lower to the `pxr_array_*` runtime calls with the
+  tag+payload ABI. Backend emits the new integer ops plus a 3‑way `<=>`.
+* `runtime/pxr_rt.c` — the ordered‑map array API and a page‑list arena (so
+  growing it never invalidates earlier pointers).
+* Tests: +8 end‑to‑end CLI tests (`arrays_and_foreach`, `control_flow_breadth`,
+  `quicksort_matches_php`, `array_misuse_is_rejected`,
+  `array_element_type_refinement`, `emit_llvm_declares_array_runtime`, plus
+  `compat_example_matches_php` and `quicksort_example_runs`) — 19 CLI tests total.
+* Examples: `examples/quicksort.php`; `examples/compat.php` extended with the
+  milestone‑1 surface and still asserted byte‑identical to PHP.
+
+**Acceptance criteria — met.**
+
+1. `pxr run examples/quicksort.php` sorts the array and prints
+   `1 2 3 4 5 6 7 8 9 10`, identical to `php examples/quicksort.php`. ✅
+2. `pxr run examples/compat.php` remains byte‑identical to PHP, now covering
+   arrays, `for`/`while`/`do…while`/`foreach`, `switch`, `match`, `<=>`, ternary,
+   compound assignment and bitwise operators. ✅
+3. Misusing arrays (echoing one, keyed `foreach`, nested assignment, bad keys)
+   fails at compile time with a specific code. ✅
+4. `cargo test` passes. ✅
+
+**Known limitations** (carried into later milestones): arrays are references
+(not copy‑on‑write values); `foreach` is value‑only; no `echo` of arrays; no
+nested assignment; no `null`; integer overflow still wraps; strings/arrays leak
+per‑operation (arena).
 
 ## ⛔ M2 — Strings & standard library
 

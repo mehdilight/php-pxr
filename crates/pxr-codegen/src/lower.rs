@@ -11,7 +11,7 @@
 //! * `if` / `while` become basic blocks.
 
 use pxr_ir::{BinOp as IBinOp, CastOp, Function, Inst, Label, Literal, Module, Slot, UnOp, Value};
-use pxr_sema::{Builtin, Callee, TExpr, TFunc, TProgram, TStmt};
+use pxr_sema::{Builtin, Callee, TExpr, TFunc, TProgram, TStmt, TTarget};
 use pxr_types::Ty;
 
 pub fn lower_program(prog: &TProgram) -> Module {
@@ -61,6 +61,16 @@ struct Lowerer {
     f: Function,
     prelude: Vec<Inst>,
     terminated: bool,
+    /// Targets for `break` / `continue`, innermost first. A `switch` pushes an
+    /// entry whose `cont` equals its `brk` (PHP treats `continue` inside a
+    /// `switch` as breaking the `switch`).
+    loops: Vec<LoopCtx>,
+}
+
+/// `break` / `continue` destinations for one enclosing loop or `switch`.
+struct LoopCtx {
+    brk: Label,
+    cont: Label,
 }
 
 impl Lowerer {
@@ -69,6 +79,7 @@ impl Lowerer {
             f,
             prelude: Vec::new(),
             terminated: false,
+            loops: Vec::new(),
         }
     }
 
@@ -138,7 +149,7 @@ impl Lowerer {
             Ty::Float => Literal::Float(0.0),
             Ty::Bool => Literal::Bool(false),
             Ty::String => Literal::Str(String::new()),
-            _ => Literal::Int(0),
+            _ => Literal::Str(String::new()),
         };
         self.emit_prelude(Inst::Const { dst, lit });
         dst
@@ -180,17 +191,39 @@ impl Lowerer {
             TStmt::Expr(e) => {
                 let _ = self.lower_expr(e);
             }
-            TStmt::Assign { slot, ty, value } => {
+            TStmt::Assign { target, ty, value } => {
                 let mut v = self.lower_expr(value);
                 let vt = value.ty();
                 if vt != *ty {
                     v = self.cast(v, &vt, ty);
                 }
-                self.emit(Inst::SlotSet {
-                    slot: *slot,
-                    src: v,
-                    ty: ty.clone(),
-                });
+                self.lower_store(target, ty.clone(), v);
+            }
+            TStmt::AssignOp {
+                target,
+                ty,
+                op,
+                value,
+            } => {
+                // `??=` must not evaluate its right-hand side when the target
+                // is already set (and for a plain variable it is always set).
+                if *op == pxr_sema::TBinOp::NullCoalesce {
+                    self.lower_coalesce_assign(target, ty, value);
+                    return;
+                }
+                // Read the current value, apply the operation, store back.
+                let (cur, cur_ty) = self.lower_load(target, ty.clone());
+                let v = self.lower_expr(value);
+                let vt = value.ty();
+                let result = self.lower_bin_expr(*op, &cur_ty, cur, &vt, v);
+                // `result` is well typed for the operator; store it back.
+                self.lower_store(target, result.1, result.0);
+            }
+            TStmt::IncDec { target, ty, delta } => {
+                let (cur, cur_ty) = self.lower_load(target, ty.clone());
+                let dx = self.emit_const(Literal::Int(*delta));
+                let res = self.lower_bin_expr(pxr_sema::TBinOp::Add, &cur_ty, cur, &Ty::Int, dx);
+                self.lower_store(target, res.1, res.0);
             }
             TStmt::If {
                 cond,
@@ -204,6 +237,31 @@ impl Lowerer {
                 cond_ty,
                 body,
             } => self.lower_while(cond, cond_ty, body),
+            TStmt::For {
+                init,
+                cond,
+                update,
+                body,
+            } => self.lower_for(init, cond, update, body),
+            TStmt::DoWhile {
+                body,
+                cond,
+                cond_ty,
+            } => self.lower_do_while(body, cond, cond_ty),
+            TStmt::Foreach {
+                base,
+                base_ty,
+                value_slot,
+                value_ty,
+                body,
+            } => self.lower_foreach(base, base_ty, *value_slot, value_ty, body),
+            TStmt::Switch {
+                subject,
+                subject_ty,
+                cases,
+            } => self.lower_switch(subject, subject_ty, cases),
+            TStmt::Break(level) => self.lower_jump(false, *level),
+            TStmt::Continue(level) => self.lower_jump(true, *level),
             TStmt::Return { value, ret } => {
                 let v = value.as_ref().map(|e| self.lower_expr(e));
                 self.terminator(Inst::Ret {
@@ -268,6 +326,10 @@ impl Lowerer {
         let head = self.fresh_label();
         let body_l = self.fresh_label();
         let end = self.fresh_label();
+        self.loops.push(LoopCtx {
+            brk: end,
+            cont: head,
+        });
 
         self.switch_to(head);
         let c = self.lower_cond(cond, cond_ty);
@@ -284,6 +346,7 @@ impl Lowerer {
         }
 
         self.switch_to(end);
+        self.loops.pop();
     }
 
     fn lower_cond(&mut self, cond: &TExpr, cond_ty: &Ty) -> Value {
@@ -315,18 +378,16 @@ impl Lowerer {
                 expr,
             } => {
                 let a = self.lower_expr(expr);
-                let a = match op {
-                    pxr_sema::TUnOp::Not => self.to_bool(a, operand_ty),
-                    pxr_sema::TUnOp::Neg => a,
+                let (a, op_ty) = match op {
+                    pxr_sema::TUnOp::Not => (self.to_bool(a, operand_ty), Ty::Bool),
+                    pxr_sema::TUnOp::Neg => (a, operand_ty.clone()),
+                    pxr_sema::TUnOp::BitNot => (a, operand_ty.clone()),
                 };
                 let dst = self.fresh();
                 let uop = match op {
                     pxr_sema::TUnOp::Neg => UnOp::Neg,
                     pxr_sema::TUnOp::Not => UnOp::Not,
-                };
-                let op_ty = match op {
-                    pxr_sema::TUnOp::Not => Ty::Bool,
-                    pxr_sema::TUnOp::Neg => operand_ty.clone(),
+                    pxr_sema::TUnOp::BitNot => UnOp::BitNot,
                 };
                 self.emit(Inst::Un {
                     dst,
@@ -345,6 +406,32 @@ impl Lowerer {
                 lhs,
                 rhs,
             } => self.lower_bin(*op, lhs_ty, rhs_ty, ty, lhs, rhs),
+            TExpr::Ternary {
+                cond,
+                cond_ty,
+                then,
+                else_branch,
+                ty,
+            } => self.lower_ternary(cond, cond_ty, then.as_deref(), else_branch, ty),
+            TExpr::Match {
+                subject,
+                subject_ty,
+                arms,
+                ty,
+            } => self.lower_match(subject, subject_ty, arms, ty),
+            TExpr::ArrayLit { elems, ety } => self.lower_array_lit(elems, ety),
+            TExpr::Index {
+                base,
+                index,
+                index_ty,
+                ety,
+                ..
+            } => {
+                let arr = self.lower_expr(base);
+                let (ktag, kint, kstr) = self.lower_key(index, index_ty);
+                let bits = self.array_get(arr, ktag, kint, kstr);
+                self.decode_bits(bits, ety)
+            }
             TExpr::Call {
                 callee,
                 ret,
@@ -477,7 +564,284 @@ impl Lowerer {
                 let _ = result_ty;
                 self.bin(iop, a, &ty, b, &ty, &Ty::Bool)
             }
+            B::Spaceship => {
+                let a = self.lower_expr(lhs);
+                let b = self.lower_expr(rhs);
+                let (a, b, ty) = if lhs_ty.is_numeric() && rhs_ty.is_numeric() {
+                    self.unify_numeric(a, lhs_ty, b, rhs_ty)
+                } else {
+                    (a, b, Ty::String)
+                };
+                self.bin(IBinOp::Cmp, a, &ty, b, &ty, &Ty::Int)
+            }
+            B::BitAnd | B::BitOr | B::BitXor | B::Shl | B::Shr => {
+                let iop = match op {
+                    B::BitAnd => IBinOp::BitAnd,
+                    B::BitOr => IBinOp::BitOr,
+                    B::BitXor => IBinOp::BitXor,
+                    B::Shl => IBinOp::Shl,
+                    B::Shr => IBinOp::Shr,
+                    _ => unreachable!(),
+                };
+                let a = self.lower_expr(lhs);
+                let b = self.lower_expr(rhs);
+                self.bin(iop, a, &Ty::Int, b, &Ty::Int, &Ty::Int)
+            }
+            B::NullCoalesce => self.lower_null_coalesce(lhs, lhs_ty, rhs, rhs_ty),
+            B::Pow => unreachable!("`**` is rejected during semantic analysis"),
         }
+    }
+
+    /// Lower `a ?? b` with proper laziness. In PXR only an array element read
+    /// can be "unset"; every other expression is always set, so `??` degrades
+    /// to its left operand.
+    fn lower_null_coalesce(&mut self, lhs: &TExpr, lhs_ty: &Ty, rhs: &TExpr, rhs_ty: &Ty) -> Value {
+        // Keep a reference around so we can borrow it in `match` arms later.
+        let ty = self.common_of(lhs_ty, rhs_ty);
+        match lhs {
+            TExpr::Index {
+                base,
+                index,
+                index_ty,
+                ety,
+                ..
+            } => {
+                let tmp = self.alloc_temp_slot(ty.clone());
+                let arr = self.lower_expr(base);
+                let aty = base.ty();
+                let arr_slot = self.alloc_temp_slot(aty.clone());
+                self.emit(Inst::SlotSet {
+                    slot: arr_slot,
+                    src: arr,
+                    ty: aty.clone(),
+                });
+                let (ktag, kint, kstr) = self.lower_key(index, index_ty);
+                let arr2 = {
+                    let dst = self.fresh();
+                    self.emit(Inst::SlotGet {
+                        dst,
+                        slot: arr_slot,
+                        ty: aty.clone(),
+                    });
+                    dst
+                };
+                let has = self.array_has(arr2, ktag, kint, kstr);
+                let take_l = self.fresh_label();
+                let rhs_l = self.fresh_label();
+                let end = self.fresh_label();
+                self.terminator(Inst::Branch {
+                    cond: has,
+                    then_label: take_l,
+                    else_label: rhs_l,
+                });
+
+                self.switch_to(take_l);
+                let a3 = {
+                    let dst = self.fresh();
+                    self.emit(Inst::SlotGet {
+                        dst,
+                        slot: arr_slot,
+                        ty: aty,
+                    });
+                    dst
+                };
+                let bits = self.array_get(a3, ktag, kint, kstr);
+                let v1 = self.decode_bits(bits, ety);
+                let v1 = self.cast(v1, ety, &ty);
+                self.emit(Inst::SlotSet {
+                    slot: tmp,
+                    src: v1,
+                    ty: ty.clone(),
+                });
+                self.terminator(Inst::Jump(end));
+
+                self.switch_to(rhs_l);
+                let v2 = self.lower_expr(rhs);
+                let v2 = self.cast(v2, rhs_ty, &ty);
+                self.emit(Inst::SlotSet {
+                    slot: tmp,
+                    src: v2,
+                    ty: ty.clone(),
+                });
+                self.terminator(Inst::Jump(end));
+
+                self.switch_to(end);
+                let dst = self.fresh();
+                self.emit(Inst::SlotGet { dst, slot: tmp, ty });
+                dst
+            }
+            _ => {
+                let v = self.lower_expr(lhs);
+                self.cast(v, lhs_ty, &ty)
+            }
+        }
+    }
+
+    /// The common type of a binary/coalesce/ternary result, mirroring the
+    /// analyzer's `unify_types` (used only when both operands are non-null).
+    fn common_of(&self, a: &Ty, b: &Ty) -> Ty {
+        if a == b {
+            return a.clone();
+        }
+        if a.is_numeric() && b.is_numeric() {
+            return if *a == Ty::Float || *b == Ty::Float {
+                Ty::Float
+            } else {
+                Ty::Int
+            };
+        }
+        // Fall back to the left type; semantic analysis rejected real
+        // mismatches long before we get here.
+        a.clone()
+    }
+
+    fn lower_ternary(
+        &mut self,
+        cond: &TExpr,
+        cond_ty: &Ty,
+        then: Option<&TExpr>,
+        else_branch: &TExpr,
+        ty: &Ty,
+    ) -> Value {
+        let raw = self.lower_expr(cond);
+        let c = self.to_bool(raw, cond_ty);
+        let tmp = self.alloc_temp_slot(ty.clone());
+        let then_l = self.fresh_label();
+        let else_l = self.fresh_label();
+        let end = self.fresh_label();
+        self.terminator(Inst::Branch {
+            cond: c,
+            then_label: then_l,
+            else_label: else_l,
+        });
+
+        self.switch_to(then_l);
+        let tv = match then {
+            Some(t) => self.lower_expr(t),
+            None => raw, // short form `?:` reuses the condition's value
+        };
+        let then_ty: Ty = match then {
+            Some(t) => t.ty(),
+            None => cond_ty.clone(),
+        };
+        let tv = self.cast(tv, &then_ty, ty);
+        self.emit(Inst::SlotSet {
+            slot: tmp,
+            src: tv,
+            ty: ty.clone(),
+        });
+        self.terminator(Inst::Jump(end));
+
+        self.switch_to(else_l);
+        let ev = self.lower_expr(else_branch);
+        let ev = self.cast(ev, &else_branch.ty(), ty);
+        self.emit(Inst::SlotSet {
+            slot: tmp,
+            src: ev,
+            ty: ty.clone(),
+        });
+        self.terminator(Inst::Jump(end));
+
+        self.switch_to(end);
+        let dst = self.fresh();
+        self.emit(Inst::SlotGet {
+            dst,
+            slot: tmp,
+            ty: ty.clone(),
+        });
+        dst
+    }
+
+    fn lower_match(
+        &mut self,
+        subject: &TExpr,
+        subject_ty: &Ty,
+        arms: &[pxr_sema::TArm],
+        ty: &Ty,
+    ) -> Value {
+        let sval = self.lower_expr(subject);
+        let tmp = self.alloc_temp_slot(ty.clone());
+        let end = self.fresh_label();
+        let body_labels: Vec<Label> = arms.iter().map(|_| self.fresh_label()).collect();
+
+        // Dispatch: test each non-default arm's conditions in order; the first
+        // match jumps into that arm's body.
+        for (i, arm) in arms.iter().enumerate() {
+            if arm.is_default {
+                continue;
+            }
+            let arm_l = body_labels[i];
+            let n = arm.conds.len();
+            let next_arm = self.fresh_label();
+            for (j, cond) in arm.conds.iter().enumerate() {
+                let cv = self.lower_expr(cond);
+                let eq = self.bin(IBinOp::Eq, sval, subject_ty, cv, &cond.ty(), &Ty::Bool);
+                if j + 1 < n {
+                    let cont = self.fresh_label();
+                    self.terminator(Inst::Branch {
+                        cond: eq,
+                        then_label: arm_l,
+                        else_label: cont,
+                    });
+                    self.switch_to(cont);
+                } else {
+                    self.terminator(Inst::Branch {
+                        cond: eq,
+                        then_label: arm_l,
+                        else_label: next_arm,
+                    });
+                }
+            }
+            self.switch_to(next_arm);
+        }
+
+        // Everything that fell through every non-default arm lands here; jump
+        // into the default arm (PXR requires one), or straight to the end.
+        let default_body = arms
+            .iter()
+            .position(|a| a.is_default)
+            .map(|i| body_labels[i])
+            .unwrap_or(end);
+
+        if let Some(idx) = arms.iter().position(|a| a.is_default) {
+            let arm = &arms[idx];
+            self.terminator(Inst::Jump(default_body));
+            self.switch_to(body_labels[idx]);
+            let r = self.lower_expr(&arm.result);
+            let r = self.cast(r, &arm.result.ty(), ty);
+            self.emit(Inst::SlotSet {
+                slot: tmp,
+                src: r,
+                ty: ty.clone(),
+            });
+            self.terminator(Inst::Jump(end));
+        } else {
+            self.terminator(Inst::Jump(default_body));
+        }
+
+        for (i, arm) in arms.iter().enumerate() {
+            if arm.is_default {
+                continue;
+            }
+            self.switch_to(body_labels[i]);
+            let r = self.lower_expr(&arm.result);
+            let r = self.cast(r, &arm.result.ty(), ty);
+            self.emit(Inst::SlotSet {
+                slot: tmp,
+                src: r,
+                ty: ty.clone(),
+            });
+            self.terminator(Inst::Jump(end));
+        }
+
+        self.switch_to(end);
+        let dst = self.fresh();
+        self.emit(Inst::SlotGet {
+            dst,
+            slot: tmp,
+            ty: ty.clone(),
+        });
+        dst
     }
 
     fn bin(&mut self, op: IBinOp, a: Value, at: &Ty, b: Value, bt: &Ty, rt: &Ty) -> Value {
@@ -557,15 +921,569 @@ impl Lowerer {
         dst
     }
 
-    fn lower_call(
+    // ---- Arrays --------------------------------------------------------
+
+    /// Runtime tag for a value type, used when storing elements.
+    fn tag_of(ty: &Ty) -> i64 {
+        match ty {
+            Ty::Int => 1,
+            Ty::Float => 2,
+            Ty::Bool => 3,
+            Ty::String => 4,
+            Ty::Array(_) => 5,
+            _ => 0,
+        }
+    }
+
+    fn array_new(&mut self) -> Value {
+        let dst = self.fresh();
+        self.emit(Inst::Call {
+            dst: Some(dst),
+            callee: "pxr_array_new".into(),
+            args: vec![],
+            ret: Ty::array(Ty::Null),
+        });
+        dst
+    }
+
+    fn array_get(&mut self, arr: Value, ktag: Value, kint: Value, kstr: Value) -> Value {
+        let dst = self.fresh();
+        self.emit(Inst::Call {
+            dst: Some(dst),
+            callee: "pxr_array_get_bits".into(),
+            args: vec![arr, ktag, kint, kstr],
+            ret: Ty::Int,
+        });
+        dst
+    }
+
+    fn array_has(&mut self, arr: Value, ktag: Value, kint: Value, kstr: Value) -> Value {
+        let dst = self.fresh();
+        self.emit(Inst::Call {
+            dst: Some(dst),
+            callee: "pxr_array_has".into(),
+            args: vec![arr, ktag, kint, kstr],
+            ret: Ty::Bool,
+        });
+        dst
+    }
+
+    fn array_set(
         &mut self,
-        callee: &Callee,
-        ret: &Ty,
-        args: &[TExpr],
-        arg_tys: &[Ty],
-    ) -> Value {
+        arr: Value,
+        ktag: Value,
+        kint: Value,
+        kstr: Value,
+        vtag: Value,
+        vbits: Value,
+    ) {
+        self.emit(Inst::Call {
+            dst: None,
+            callee: "pxr_array_set".into(),
+            args: vec![arr, ktag, kint, kstr, vtag, vbits],
+            ret: Ty::Void,
+        });
+    }
+
+    fn array_push(&mut self, arr: Value, vtag: Value, vbits: Value) {
+        self.emit(Inst::Call {
+            dst: None,
+            callee: "pxr_array_push".into(),
+            args: vec![arr, vtag, vbits],
+            ret: Ty::Void,
+        });
+    }
+
+    fn array_count(&mut self, arr: Value) -> Value {
+        let dst = self.fresh();
+        self.emit(Inst::Call {
+            dst: Some(dst),
+            callee: "pxr_array_count".into(),
+            args: vec![arr],
+            ret: Ty::Int,
+        });
+        dst
+    }
+
+    /// Pack a value of the given type into an `i64` payload for storage.
+    fn encode_bits(&mut self, v: Value, ty: &Ty) -> Value {
+        if *ty == Ty::Int {
+            return v;
+        }
+        let dst = self.fresh();
+        self.emit(Inst::BitCast {
+            dst,
+            from: ty.clone(),
+            to: Ty::Int,
+            src: v,
+        });
+        dst
+    }
+
+    /// Unpack an `i64` payload read from an array back to a value of `ty`.
+    fn decode_bits(&mut self, v: Value, ty: &Ty) -> Value {
+        if *ty == Ty::Int {
+            return v;
+        }
+        let dst = self.fresh();
+        self.emit(Inst::BitCast {
+            dst,
+            from: Ty::Int,
+            to: ty.clone(),
+            src: v,
+        });
+        dst
+    }
+
+    /// Produce the `(tag, int, str)` triple for an array key.
+    fn lower_key(&mut self, key: &TExpr, kty: &Ty) -> (Value, Value, Value) {
+        let kv = self.lower_expr(key);
+        match kty {
+            Ty::Int => {
+                let ktag = self.emit_const(Literal::Int(1));
+                let kstr = self.emit_const(Literal::Str(String::new()));
+                (ktag, kv, kstr)
+            }
+            Ty::String => {
+                let ktag = self.emit_const(Literal::Int(4));
+                let kint = self.emit_const(Literal::Int(0));
+                (ktag, kint, kv)
+            }
+            _ => unreachable!("array key types are enforced by sema"),
+        }
+    }
+
+    fn lower_array_lit(&mut self, elems: &[(Option<TExpr>, TExpr)], ety: &Ty) -> Value {
+        let arr = self.array_new();
+        let vtag = self.emit_const(Literal::Int(Self::tag_of(ety)));
+        for (key, value) in elems {
+            let mut vv = self.lower_expr(value);
+            let vt = value.ty();
+            if vt != *ety {
+                vv = self.cast(vv, &vt, ety);
+            }
+            let bits = self.encode_bits(vv, ety);
+            match key {
+                Some(k) => {
+                    let (ktag, kint, kstr) = self.lower_key(k, &k.ty());
+                    self.array_set(arr, ktag, kint, kstr, vtag, bits);
+                }
+                None => self.array_push(arr, vtag, bits),
+            }
+        }
+        arr
+    }
+
+    fn lower_store(&mut self, target: &TTarget, ty: Ty, v: Value) {
+        match target {
+            TTarget::Var { slot, .. } => self.emit(Inst::SlotSet {
+                slot: *slot,
+                src: v,
+                ty,
+            }),
+            TTarget::Index {
+                base,
+                elem_ty: _,
+                key,
+                key_ty,
+            } => {
+                // Use the statement's element type, not the target's: they can
+                // differ on the assignment that refines an empty `array<null>`.
+                let arr = self.lower_expr(base);
+                let (ktag, kint, kstr) = self.lower_key(key, key_ty);
+                let vtag = self.emit_const(Literal::Int(Self::tag_of(&ty)));
+                let bits = self.encode_bits(v, &ty);
+                self.array_set(arr, ktag, kint, kstr, vtag, bits);
+            }
+            TTarget::Push { base, elem_ty: _ } => {
+                let arr = self.lower_expr(base);
+                let vtag = self.emit_const(Literal::Int(Self::tag_of(&ty)));
+                let bits = self.encode_bits(v, &ty);
+                self.array_push(arr, vtag, bits);
+            }
+        }
+    }
+
+    /// Read the current value of an assignment target (used by `op=` and
+    /// `++`/`--`).
+    fn lower_load(&mut self, target: &TTarget, ty: Ty) -> (Value, Ty) {
+        match target {
+            TTarget::Var { slot, .. } => {
+                let dst = self.fresh();
+                self.emit(Inst::SlotGet {
+                    dst,
+                    slot: *slot,
+                    ty: ty.clone(),
+                });
+                (dst, ty)
+            }
+            TTarget::Index {
+                base,
+                elem_ty: _,
+                key,
+                key_ty,
+            } => {
+                let arr = self.lower_expr(base);
+                let (ktag, kint, kstr) = self.lower_key(key, key_ty);
+                let bits = self.array_get(arr, ktag, kint, kstr);
+                let v = self.decode_bits(bits, &ty);
+                (v, ty)
+            }
+            TTarget::Push { .. } => (self.emit_const(Literal::Int(0)), ty),
+        }
+    }
+
+    /// Apply a binary operator to two already-lowered values, returning the
+    /// result value together with its LLVM type. Used by `op=` and `++`/`--`.
+    fn lower_bin_expr(
+        &mut self,
+        op: pxr_sema::TBinOp,
+        lt: &Ty,
+        lv: Value,
+        rt: &Ty,
+        rv: Value,
+    ) -> (Value, Ty) {
+        use pxr_sema::TBinOp as B;
+        match op {
+            B::Concat => {
+                let a = self.to_string(lv, lt);
+                let b = self.to_string(rv, rt);
+                let d = self.bin(IBinOp::Concat, a, &Ty::String, b, &Ty::String, &Ty::String);
+                (d, Ty::String)
+            }
+            B::Add | B::Sub | B::Mul | B::Mod => {
+                let (a, b, ty) = self.unify_numeric(lv, lt, rv, rt);
+                let iop = match op {
+                    B::Add => IBinOp::Add,
+                    B::Sub => IBinOp::Sub,
+                    B::Mul => IBinOp::Mul,
+                    _ => IBinOp::Mod,
+                };
+                let d = self.bin(iop, a, &ty, b, &ty, &ty);
+                (d, ty)
+            }
+            B::Div => {
+                let a = self.cast(lv, lt, &Ty::Float);
+                let b = self.cast(rv, rt, &Ty::Float);
+                let d = self.bin(IBinOp::Div, a, &Ty::Float, b, &Ty::Float, &Ty::Float);
+                (d, Ty::Float)
+            }
+            B::Eq | B::NotEq | B::Identical | B::NotIdentical => {
+                let iop = if matches!(op, B::Eq | B::Identical) {
+                    IBinOp::Eq
+                } else {
+                    IBinOp::NotEq
+                };
+                let (a, b, ty) = if lt.is_numeric() && rt.is_numeric() && lt != rt {
+                    self.unify_numeric(lv, lt, rv, rt)
+                } else {
+                    (lv, rv, lt.clone())
+                };
+                let d = self.bin(iop, a, &ty, b, &ty, &Ty::Bool);
+                (d, Ty::Bool)
+            }
+            B::Lt | B::LtEq | B::Gt | B::GtEq => {
+                let iop = match op {
+                    B::Lt => IBinOp::Lt,
+                    B::LtEq => IBinOp::LtEq,
+                    B::Gt => IBinOp::Gt,
+                    _ => IBinOp::GtEq,
+                };
+                let (a, b, ty) = if lt.is_numeric() && rt.is_numeric() {
+                    self.unify_numeric(lv, lt, rv, rt)
+                } else {
+                    (lv, rv, Ty::String)
+                };
+                let d = self.bin(iop, a, &ty, b, &ty, &Ty::Bool);
+                (d, Ty::Bool)
+            }
+            B::Spaceship => {
+                let (a, b, ty) = if lt.is_numeric() && rt.is_numeric() {
+                    self.unify_numeric(lv, lt, rv, rt)
+                } else {
+                    (lv, rv, Ty::String)
+                };
+                let d = self.bin(IBinOp::Cmp, a, &ty, b, &ty, &Ty::Int);
+                (d, Ty::Int)
+            }
+            B::BitAnd | B::BitOr | B::BitXor | B::Shl | B::Shr => {
+                let iop = match op {
+                    B::BitAnd => IBinOp::BitAnd,
+                    B::BitOr => IBinOp::BitOr,
+                    B::BitXor => IBinOp::BitXor,
+                    B::Shl => IBinOp::Shl,
+                    _ => IBinOp::Shr,
+                };
+                let d = self.bin(iop, lv, &Ty::Int, rv, &Ty::Int, &Ty::Int);
+                (d, Ty::Int)
+            }
+            _ => (lv, lt.clone()),
+        }
+    }
+
+    fn lower_coalesce_assign(&mut self, target: &TTarget, ty: &Ty, value: &TExpr) {
+        match target {
+            TTarget::Var { .. } => {
+                // PXR variables are always set; `??=` is a no-op.
+            }
+            TTarget::Index {
+                base,
+                elem_ty: _,
+                key,
+                key_ty,
+            } => {
+                let arr = self.lower_expr(base);
+                let (ktag, kint, kstr) = self.lower_key(key, key_ty);
+                let has = self.array_has(arr, ktag, kint, kstr);
+                let set_l = self.fresh_label();
+                let skip_l = self.fresh_label();
+                self.terminator(Inst::Branch {
+                    cond: has,
+                    then_label: skip_l,
+                    else_label: set_l,
+                });
+                self.switch_to(set_l);
+                let mut v = self.lower_expr(value);
+                let vt = value.ty();
+                if vt != *ty {
+                    v = self.cast(v, &vt, ty);
+                }
+                let vtag = self.emit_const(Literal::Int(Self::tag_of(ty)));
+                let bits = self.encode_bits(v, ty);
+                self.array_set(arr, ktag, kint, kstr, vtag, bits);
+                self.terminator(Inst::Jump(skip_l));
+                self.switch_to(skip_l);
+            }
+            TTarget::Push { .. } => {}
+        }
+    }
+
+    // ---- Loops and switches --------------------------------------------
+
+    fn lower_jump(&mut self, is_continue: bool, level: u32) {
+        // `level` is validated by sema (1 = innermost); guard anyway so an
+        // unexpected value degrades to a no-op instead of a panic.
+        let Some(idx) = self.loops.len().checked_sub(level as usize) else {
+            return;
+        };
+        let target = if is_continue {
+            self.loops[idx].cont
+        } else {
+            self.loops[idx].brk
+        };
+        self.terminator(Inst::Jump(target));
+    }
+
+    fn lower_for(
+        &mut self,
+        init: &[TStmt],
+        cond: &Option<(TExpr, Ty)>,
+        update: &[TStmt],
+        body: &[TStmt],
+    ) {
+        self.lower_stmts(init);
+        let head = self.fresh_label();
+        let body_l = self.fresh_label();
+        let step = self.fresh_label();
+        let end = self.fresh_label();
+        self.loops.push(LoopCtx {
+            brk: end,
+            cont: step,
+        });
+
+        if let Some((c, cty)) = cond {
+            self.switch_to(head);
+            let b = self.lower_cond(c, cty);
+            self.terminator(Inst::Branch {
+                cond: b,
+                then_label: body_l,
+                else_label: end,
+            });
+        } else {
+            self.switch_to(head);
+            self.terminator(Inst::Jump(body_l));
+        }
+
+        self.switch_to(body_l);
+        self.lower_stmts(body);
+        if !self.terminated {
+            self.terminator(Inst::Jump(step));
+        }
+
+        self.switch_to(step);
+        self.lower_stmts(update);
+        if !self.terminated {
+            self.terminator(Inst::Jump(head));
+        }
+
+        self.switch_to(end);
+        self.loops.pop();
+    }
+
+    fn lower_do_while(&mut self, body: &[TStmt], cond: &TExpr, cond_ty: &Ty) {
+        let body_l = self.fresh_label();
+        let cond_l = self.fresh_label();
+        let end = self.fresh_label();
+        self.loops.push(LoopCtx {
+            brk: end,
+            cont: cond_l,
+        });
+
+        self.terminator(Inst::Jump(body_l));
+        self.switch_to(body_l);
+        self.lower_stmts(body);
+        if !self.terminated {
+            self.terminator(Inst::Jump(cond_l));
+        }
+
+        self.switch_to(cond_l);
+        let c = self.lower_cond(cond, cond_ty);
+        self.terminator(Inst::Branch {
+            cond: c,
+            then_label: body_l,
+            else_label: end,
+        });
+
+        self.switch_to(end);
+        self.loops.pop();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_foreach(
+        &mut self,
+        base: &TExpr,
+        base_ty: &Ty,
+        value_slot: u32,
+        value_ty: &Ty,
+        body: &[TStmt],
+    ) {
+        let _ = base_ty;
+        // The array pointer is computed once in the entry block, so it
+        // dominates every loop block below.
+        let arr = self.lower_expr(base);
+        let count = self.array_count(arr);
+        let idx = self.alloc_temp_slot(Ty::Int);
+        let zero = self.emit_const(Literal::Int(0));
+        self.emit(Inst::SlotSet {
+            slot: idx,
+            src: zero,
+            ty: Ty::Int,
+        });
+
+        let head = self.fresh_label();
+        let body_l = self.fresh_label();
+        let step = self.fresh_label();
+        let end = self.fresh_label();
+        self.loops.push(LoopCtx {
+            brk: end,
+            cont: step,
+        });
+
+        self.switch_to(head);
+        let iv = self.load_slot(idx, Ty::Int);
+        let cmp = self.bin(IBinOp::Lt, iv, &Ty::Int, count, &Ty::Int, &Ty::Bool);
+        self.terminator(Inst::Branch {
+            cond: cmp,
+            then_label: body_l,
+            else_label: end,
+        });
+
+        self.switch_to(body_l);
+        let iv2 = self.load_slot(idx, Ty::Int);
+        let bits = self.array_val_at(arr, iv2);
+        let v = self.decode_bits(bits, value_ty);
+        self.emit(Inst::SlotSet {
+            slot: value_slot,
+            src: v,
+            ty: value_ty.clone(),
+        });
+        self.lower_stmts(body);
+        if !self.terminated {
+            self.terminator(Inst::Jump(step));
+        }
+
+        self.switch_to(step);
+        let iv3 = self.load_slot(idx, Ty::Int);
+        let one = self.emit_const(Literal::Int(1));
+        let ni = self.bin(IBinOp::Add, iv3, &Ty::Int, one, &Ty::Int, &Ty::Int);
+        self.emit(Inst::SlotSet {
+            slot: idx,
+            src: ni,
+            ty: Ty::Int,
+        });
+        self.terminator(Inst::Jump(head));
+
+        self.switch_to(end);
+        self.loops.pop();
+    }
+
+    fn load_slot(&mut self, slot: u32, ty: Ty) -> Value {
+        let dst = self.fresh();
+        self.emit(Inst::SlotGet { dst, slot, ty });
+        dst
+    }
+
+    fn array_val_at(&mut self, arr: Value, idx: Value) -> Value {
+        let dst = self.fresh();
+        self.emit(Inst::Call {
+            dst: Some(dst),
+            callee: "pxr_array_val_bits_at".into(),
+            args: vec![arr, idx],
+            ret: Ty::Int,
+        });
+        dst
+    }
+
+    fn lower_switch(&mut self, subject: &TExpr, subject_ty: &Ty, cases: &[pxr_sema::TCase]) {
+        let sval = self.lower_expr(subject);
+        let end = self.fresh_label();
+        let body_labels: Vec<Label> = cases.iter().map(|_| self.fresh_label()).collect();
+        self.loops.push(LoopCtx {
+            brk: end,
+            cont: end,
+        });
+
+        // Dispatch: compare the subject against each non-default case.
+        let mut default_label = end;
+        for (i, c) in cases.iter().enumerate() {
+            if let Some(t) = &c.test {
+                let tv = self.lower_expr(t);
+                let (a, b, ty) = if subject_ty.is_numeric() && c.test_ty.is_numeric() {
+                    let (x, y, ty) = self.unify_numeric(sval, subject_ty, tv, &c.test_ty);
+                    (x, y, ty)
+                } else {
+                    (sval, tv, subject_ty.clone())
+                };
+                let eq = self.bin(IBinOp::Eq, a, &ty, b, &ty, &Ty::Bool);
+                let cont_l = self.fresh_label();
+                self.terminator(Inst::Branch {
+                    cond: eq,
+                    then_label: body_labels[i],
+                    else_label: cont_l,
+                });
+                self.switch_to(cont_l);
+            } else {
+                default_label = body_labels[i];
+            }
+        }
+        self.terminator(Inst::Jump(default_label));
+
+        // Bodies are emitted in source order without a trailing jump, so that
+        // `case A: case B:` falls through naturally; `break` jumps to `end`.
+        for (i, c) in cases.iter().enumerate() {
+            self.switch_to(body_labels[i]);
+            self.lower_stmts(&c.body);
+        }
+
+        self.switch_to(end);
+        self.loops.pop();
+    }
+
+    fn lower_call(&mut self, callee: &Callee, ret: &Ty, args: &[TExpr], arg_tys: &[Ty]) -> Value {
         match callee {
-            Callee::User { mangled, params, .. } => {
+            Callee::User {
+                mangled, params, ..
+            } => {
                 let mut vals = Vec::new();
                 for (i, a) in args.iter().enumerate() {
                     let v = self.lower_expr(a);
@@ -653,6 +1571,16 @@ impl Lowerer {
                     dst
                 }
             },
+            Builtin::Count => {
+                let dst = self.fresh();
+                self.emit(Inst::Call {
+                    dst: Some(dst),
+                    callee: "pxr_array_count".into(),
+                    args: vec![a],
+                    ret: Ty::Int,
+                });
+                dst
+            }
         }
     }
 }

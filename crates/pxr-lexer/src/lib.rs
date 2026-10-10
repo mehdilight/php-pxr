@@ -29,6 +29,16 @@ pub enum TokenKind {
     Else,
     ElseIf,
     While,
+    For,
+    Foreach,
+    As,
+    Do,
+    Break,
+    Continue,
+    Switch,
+    Case,
+    Default,
+    Match,
     Echo,
     Print,
     True,
@@ -41,6 +51,7 @@ pub enum TokenKind {
     KwString,
     KwBool,
     KwVoid,
+    KwArray,
 
     // Punctuation.
     LParen,
@@ -53,6 +64,7 @@ pub enum TokenKind {
     Semicolon,
     Colon,
     Arrow,
+    DoubleArrow,
     DoubleColon,
     Question,
 
@@ -74,9 +86,31 @@ pub enum TokenKind {
     LtEq,
     Gt,
     GtEq,
+    Spaceship,
     AndAnd,
     OrOr,
     Bang,
+    Coalesce,
+    Amp,
+    Pipe,
+    Caret,
+    Tilde,
+    Shl,
+    Shr,
+
+    // Compound assignment.
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
+    PercentEq,
+    DotEq,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    ShlEq,
+    ShrEq,
+    CoalesceEq,
 
     /// End of input.
     Eof,
@@ -105,6 +139,16 @@ impl TokenKind {
             TokenKind::Else => "else",
             TokenKind::ElseIf => "elseif",
             TokenKind::While => "while",
+            TokenKind::For => "for",
+            TokenKind::Foreach => "foreach",
+            TokenKind::As => "as",
+            TokenKind::Do => "do",
+            TokenKind::Break => "break",
+            TokenKind::Continue => "continue",
+            TokenKind::Switch => "switch",
+            TokenKind::Case => "case",
+            TokenKind::Default => "default",
+            TokenKind::Match => "match",
             TokenKind::Echo => "echo",
             TokenKind::Print => "print",
             TokenKind::True => "true",
@@ -115,6 +159,7 @@ impl TokenKind {
             TokenKind::KwString => "string",
             TokenKind::KwBool => "bool",
             TokenKind::KwVoid => "void",
+            TokenKind::KwArray => "array",
             TokenKind::LParen => "(",
             TokenKind::RParen => ")",
             TokenKind::LBrace => "{",
@@ -125,6 +170,7 @@ impl TokenKind {
             TokenKind::Semicolon => ";",
             TokenKind::Colon => ":",
             TokenKind::Arrow => "->",
+            TokenKind::DoubleArrow => "=>",
             TokenKind::DoubleColon => "::",
             TokenKind::Question => "?",
             TokenKind::Assign => "=",
@@ -144,9 +190,29 @@ impl TokenKind {
             TokenKind::LtEq => "<=",
             TokenKind::Gt => ">",
             TokenKind::GtEq => ">=",
+            TokenKind::Spaceship => "<=>",
             TokenKind::AndAnd => "&&",
             TokenKind::OrOr => "||",
             TokenKind::Bang => "!",
+            TokenKind::Coalesce => "??",
+            TokenKind::Amp => "&",
+            TokenKind::Pipe => "|",
+            TokenKind::Caret => "^",
+            TokenKind::Tilde => "~",
+            TokenKind::Shl => "<<",
+            TokenKind::Shr => ">>",
+            TokenKind::PlusEq => "+=",
+            TokenKind::MinusEq => "-=",
+            TokenKind::StarEq => "*=",
+            TokenKind::SlashEq => "/=",
+            TokenKind::PercentEq => "%=",
+            TokenKind::DotEq => ".=",
+            TokenKind::AmpEq => "&=",
+            TokenKind::PipeEq => "|=",
+            TokenKind::CaretEq => "^=",
+            TokenKind::ShlEq => "<<=",
+            TokenKind::ShrEq => ">>=",
+            TokenKind::CoalesceEq => "??=",
             _ => "token",
         }
     }
@@ -274,7 +340,10 @@ impl<'a> Lexer<'a> {
                     // tokenizing, mirroring how PHP ignores trailing output.
                     self.pos += 2;
                     // Skip any trailing whitespace/newline.
-                    while matches!(self.peek(), Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n')) {
+                    while matches!(
+                        self.peek(),
+                        Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n')
+                    ) {
                         self.pos += 1;
                     }
                     if self.pos < self.src.len() {
@@ -338,11 +407,26 @@ impl<'a> Lexer<'a> {
                         TokenKind::Colon
                     }
                 }
-                b'?' => TokenKind::Question,
+                b'?' => {
+                    if self.peek() == Some(b'?') {
+                        self.pos += 1;
+                        if self.peek() == Some(b'=') {
+                            self.pos += 1;
+                            TokenKind::CoalesceEq
+                        } else {
+                            TokenKind::Coalesce
+                        }
+                    } else {
+                        TokenKind::Question
+                    }
+                }
                 b'+' => {
                     if self.peek() == Some(b'+') {
                         self.pos += 1;
                         TokenKind::PlusPlus
+                    } else if self.peek() == Some(b'=') {
+                        self.pos += 1;
+                        TokenKind::PlusEq
                     } else {
                         TokenKind::Plus
                     }
@@ -356,12 +440,53 @@ impl<'a> Lexer<'a> {
                         self.pos += 1;
                         TokenKind::Arrow
                     }
+                    Some(b'=') => {
+                        self.pos += 1;
+                        TokenKind::MinusEq
+                    }
                     _ => TokenKind::Minus,
                 },
-                b'*' => TokenKind::Star,
-                b'/' => TokenKind::Slash,
-                b'%' => TokenKind::Percent,
-                b'.' => TokenKind::Dot,
+                b'*' => {
+                    if self.peek() == Some(b'=') {
+                        self.pos += 1;
+                        TokenKind::StarEq
+                    } else {
+                        TokenKind::Star
+                    }
+                }
+                b'/' => {
+                    if self.peek() == Some(b'=') {
+                        self.pos += 1;
+                        TokenKind::SlashEq
+                    } else {
+                        TokenKind::Slash
+                    }
+                }
+                b'%' => {
+                    if self.peek() == Some(b'=') {
+                        self.pos += 1;
+                        TokenKind::PercentEq
+                    } else {
+                        TokenKind::Percent
+                    }
+                }
+                b'.' => {
+                    if self.peek() == Some(b'=') {
+                        self.pos += 1;
+                        TokenKind::DotEq
+                    } else {
+                        TokenKind::Dot
+                    }
+                }
+                b'~' => TokenKind::Tilde,
+                b'^' => {
+                    if self.peek() == Some(b'=') {
+                        self.pos += 1;
+                        TokenKind::CaretEq
+                    } else {
+                        TokenKind::Caret
+                    }
+                }
                 b'=' => match self.peek() {
                     Some(b'=') => {
                         self.pos += 1;
@@ -371,6 +496,10 @@ impl<'a> Lexer<'a> {
                         } else {
                             TokenKind::EqEq
                         }
+                    }
+                    Some(b'>') => {
+                        self.pos += 1;
+                        TokenKind::DoubleArrow
                     }
                     _ => TokenKind::Assign,
                 },
@@ -389,7 +518,21 @@ impl<'a> Lexer<'a> {
                 b'<' => match self.peek() {
                     Some(b'=') => {
                         self.pos += 1;
-                        TokenKind::LtEq
+                        if self.peek() == Some(b'>') {
+                            self.pos += 1;
+                            TokenKind::Spaceship
+                        } else {
+                            TokenKind::LtEq
+                        }
+                    }
+                    Some(b'<') => {
+                        self.pos += 1;
+                        if self.peek() == Some(b'=') {
+                            self.pos += 1;
+                            TokenKind::ShlEq
+                        } else {
+                            TokenKind::Shl
+                        }
                     }
                     _ => TokenKind::Lt,
                 },
@@ -398,32 +541,37 @@ impl<'a> Lexer<'a> {
                         self.pos += 1;
                         TokenKind::GtEq
                     }
+                    Some(b'>') => {
+                        self.pos += 1;
+                        if self.peek() == Some(b'=') {
+                            self.pos += 1;
+                            TokenKind::ShrEq
+                        } else {
+                            TokenKind::Shr
+                        }
+                    }
                     _ => TokenKind::Gt,
                 },
                 b'&' => {
                     if self.peek() == Some(b'&') {
                         self.pos += 1;
                         TokenKind::AndAnd
+                    } else if self.peek() == Some(b'=') {
+                        self.pos += 1;
+                        TokenKind::AmpEq
                     } else {
-                        self.diags.emit(
-                            Diagnostic::error("unexpected `&`; bitwise operators are not implemented yet")
-                                .with_code("E0003")
-                                .with_span(Span::new(start, self.pos)),
-                        );
-                        return Err(());
+                        TokenKind::Amp
                     }
                 }
                 b'|' => {
                     if self.peek() == Some(b'|') {
                         self.pos += 1;
                         TokenKind::OrOr
+                    } else if self.peek() == Some(b'=') {
+                        self.pos += 1;
+                        TokenKind::PipeEq
                     } else {
-                        self.diags.emit(
-                            Diagnostic::error("unexpected `|`; bitwise operators are not implemented yet")
-                                .with_code("E0003")
-                                .with_span(Span::new(start, self.pos)),
-                        );
-                        return Err(());
+                        TokenKind::Pipe
                     }
                 }
                 other => {
@@ -623,7 +771,9 @@ impl<'a> Lexer<'a> {
                             b'$' => out.push(b'$'),
                             b'x' | b'X' => {
                                 let h1 = self.peek().filter(u8::is_ascii_hexdigit);
-                                let h2 = h1.and_then(|_| self.peek_at(1)).filter(u8::is_ascii_hexdigit);
+                                let h2 = h1
+                                    .and_then(|_| self.peek_at(1))
+                                    .filter(u8::is_ascii_hexdigit);
                                 if let (Some(h1), Some(h2)) = (h1, h2) {
                                     self.pos += 2;
                                     let hex = [h1, h2];
@@ -692,6 +842,16 @@ fn keyword(word: &str) -> Option<TokenKind> {
         "else" => TokenKind::Else,
         "elseif" => TokenKind::ElseIf,
         "while" => TokenKind::While,
+        "for" => TokenKind::For,
+        "foreach" => TokenKind::Foreach,
+        "as" => TokenKind::As,
+        "do" => TokenKind::Do,
+        "break" => TokenKind::Break,
+        "continue" => TokenKind::Continue,
+        "switch" => TokenKind::Switch,
+        "case" => TokenKind::Case,
+        "default" => TokenKind::Default,
+        "match" => TokenKind::Match,
         "echo" => TokenKind::Echo,
         "print" => TokenKind::Print,
         "true" => TokenKind::True,
@@ -702,6 +862,7 @@ fn keyword(word: &str) -> Option<TokenKind> {
         "string" => TokenKind::KwString,
         "bool" => TokenKind::KwBool,
         "void" => TokenKind::KwVoid,
+        "array" => TokenKind::KwArray,
         _ => return None,
     })
 }
@@ -717,7 +878,11 @@ mod tests {
 
     fn kinds(src: &str) -> Vec<TokenKind> {
         let (toks, diags) = lex(src);
-        assert!(!diags.has_errors(), "unexpected lex errors: {:?}", diags.items());
+        assert!(
+            !diags.has_errors(),
+            "unexpected lex errors: {:?}",
+            diags.items()
+        );
         toks.into_iter().map(|t| t.kind).collect()
     }
 

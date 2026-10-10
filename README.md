@@ -17,13 +17,16 @@ The same `main.php` can still be run by the traditional interpreter for
 comparison; PXR programs themselves run **without PHP**, linking only the small
 PXR runtime.
 
-> **Project status: milestone 0 complete — a minimal but fully functional
-> end‑to‑end compiler.** The pipeline (lexer → parser → AST → semantic analysis
-> → type checker → IR → optimizer → LLVM backend → linked executable) is real and
-> tested. The *language surface* is deliberately small today and grows by
-> documented milestones. Nothing below is claimed unless it is implemented and
-> covered by tests; see [`docs/MILESTONES.md`](docs/MILESTONES.md) and the
-> "Not implemented yet" section.
+> **Project status: milestone 1 complete — language breadth I.** On top of the
+> milestone‑0 pipeline (lexer → parser → AST → semantic analysis → type checker
+> → IR → optimizer → LLVM backend → linked executable), PXR now has **arrays**
+> (ordered maps with `int`/`string` keys), the full C‑style control‑flow set
+> (`for`, `foreach`, `do…while`, `switch`, `match`, `break`/`continue` with
+> levels), ternary/`??`/`<=>`, compound assignment and bitwise operators. The
+> *language surface* is still deliberately small and grows by documented
+> milestones. Nothing below is claimed unless it is implemented and covered by
+> tests; see [`docs/MILESTONES.md`](docs/MILESTONES.md) and the "Not implemented
+> yet" section.
 
 ---
 
@@ -89,17 +92,23 @@ migration path possible.
 * **Semantic analysis / type checker** — undefined variables and functions,
   arity and argument types, operand types of every operator, return type and
   return‑on‑all‑paths, duplicate functions, required parameter/return types.
-* **Builtins** — `strlen`, `intval`, `floatval`, `strval`, `abs`.
+* **Builtins** — `strlen`, `intval`, `floatval`, `strval`, `abs`, `count`.
 * **IR + optimizer** — typed three‑address IR with an SSA‑style value model;
   constant folding, constant‑branch folding, dead‑code elimination and CFG
   cleanup, with reported statistics.
 * **LLVM backend** — emits textual LLVM IR and drives LLVM via `clang` to produce
   a native executable.
 * **Standalone runtime** — an embedded C runtime for printing, string
-  concatenation and numeric conversion; compiled output links only `libSystem`
-  and needs no PHP interpreter.
-* **Control flow** — `if`/`elseif`/`else`, `while`, blocks, `return`,
-  `echo`/`print`, short‑circuit `&&`/`||` with correct semantics.
+  concatenation, numeric conversion and the array API; compiled output links
+  only `libSystem` and needs no PHP interpreter.
+* **Control flow** — `if`/`elseif`/`else`, `while`, `do…while`, `for`,
+  `foreach`, `switch`, `match`, `break`/`continue` (with levels), blocks,
+  `return`, `echo`/`print`, short‑circuit `&&`/`||`.
+* **Data** — homogeneous `array<T>` values (PHP ordered‑map semantics) with
+  `[...]`/`array(...)` literals, indexing, append, `count`, and `foreach`.
+* **Operators** — ternary `? :`, null coalescing `??`, spaceship `<=>`,
+  compound assignment (`+=` … `??=`), `++`/`--`, and bitwise `& | ^ ~ << >>`.
+  Assignment is statement‑only (no assignment expressions).
 
 ## Compatibility with PHP
 
@@ -167,10 +176,11 @@ automatically when no C compiler is available.
 ## Not implemented yet
 
 Tracked honestly in [`docs/ROADMAP.md`](docs/ROADMAP.md). The larger items:
-arrays and strings‑as‑values, classes/objects, generics, `null`/nullable types,
-ownership & borrowing, `for`/`foreach`/`switch`/`match`, `break`/`continue`,
-string interpolation, exceptions, modules/`include`, C interop (`extern`),
-concurrency, and the `mixed`/dynamic escape hatch for gradual migration.
+value‑semantics arrays (PXR arrays are references today), keyed `foreach`,
+`echo` of arrays, nested array assignment, classes/objects, generics,
+`null`/nullable types, ownership & borrowing, string interpolation, exceptions,
+modules/`include`, C interop (`extern`), concurrency, and the `mixed`/dynamic
+escape hatch for gradual migration.
 
 ## License
 

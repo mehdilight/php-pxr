@@ -82,7 +82,10 @@ fn fold(f: &mut Function, stats: &mut OptStats) {
                 if let (Some(la), Some(lb)) = (consts.get(a).cloned(), consts.get(b).cloned()) {
                     if let Some(out) = eval_bin(*op, lhs_ty, rhs_ty, result_ty, &la, &lb) {
                         consts.insert(*dst, out.clone());
-                        *inst = Inst::Const { dst: *dst, lit: out };
+                        *inst = Inst::Const {
+                            dst: *dst,
+                            lit: out,
+                        };
                         stats.constants_folded += 1;
                     }
                 }
@@ -97,7 +100,10 @@ fn fold(f: &mut Function, stats: &mut OptStats) {
                 if let Some(la) = consts.get(a).cloned() {
                     if let Some(out) = eval_un(*op, operand_ty, result_ty, &la) {
                         consts.insert(*dst, out.clone());
-                        *inst = Inst::Const { dst: *dst, lit: out };
+                        *inst = Inst::Const {
+                            dst: *dst,
+                            lit: out,
+                        };
                         stats.constants_folded += 1;
                     }
                 }
@@ -272,6 +278,46 @@ fn eval_bin(
             };
             Some(Bool(r))
         }
+        // `<=>` produces -1 / 0 / 1.
+        BinOp::Cmp => {
+            let ord = |o: std::cmp::Ordering| match o {
+                std::cmp::Ordering::Less => -1i64,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+            let v = match (a, b) {
+                (Int(x), Int(y)) => ord(x.cmp(y)),
+                (Float(x), Float(y)) => ord(x.partial_cmp(y)?),
+                (Str(x), Str(y)) => ord(x.cmp(y)),
+                _ => return None,
+            };
+            Some(Int(v))
+        }
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+            let (Int(x), Int(y)) = (a, b) else {
+                return None;
+            };
+            let v = match op {
+                BinOp::BitAnd => x & y,
+                BinOp::BitOr => x | y,
+                BinOp::BitXor => x ^ y,
+                _ => unreachable!(),
+            };
+            Some(Int(v))
+        }
+        BinOp::Shl | BinOp::Shr => {
+            // Mirrors the emitted code, which masks the shift amount to 0..63.
+            let (Int(x), Int(y)) = (a, b) else {
+                return None;
+            };
+            let shift = (y & 63) as u32;
+            let v = if op == BinOp::Shl {
+                x.wrapping_shl(shift)
+            } else {
+                x.wrapping_shr(shift)
+            };
+            Some(Int(v))
+        }
     }
 }
 
@@ -282,6 +328,7 @@ fn eval_un(op: UnOp, operand_ty: &Ty, result_ty: &Ty, a: &Literal) -> Option<Lit
         }
         (UnOp::Neg, Literal::Float(v)) => Some(Literal::Float(-v)),
         (UnOp::Not, Literal::Bool(b)) => Some(Literal::Bool(!b)),
+        (UnOp::BitNot, Literal::Int(v)) => Some(Literal::Int(!v)),
         _ => None,
     }
 }
@@ -306,8 +353,14 @@ mod tests {
     fn folds_integer_addition() {
         let mut m = module_with(
             vec![
-                Inst::Const { dst: 0, lit: Literal::Int(2) },
-                Inst::Const { dst: 1, lit: Literal::Int(3) },
+                Inst::Const {
+                    dst: 0,
+                    lit: Literal::Int(2),
+                },
+                Inst::Const {
+                    dst: 1,
+                    lit: Literal::Int(3),
+                },
                 Inst::Bin {
                     dst: 2,
                     op: BinOp::Add,
@@ -317,7 +370,10 @@ mod tests {
                     a: 0,
                     b: 1,
                 },
-                Inst::Ret { ty: Ty::Int, src: Some(2) },
+                Inst::Ret {
+                    ty: Ty::Int,
+                    src: Some(2),
+                },
             ],
             Ty::Int,
         );
@@ -325,18 +381,37 @@ mod tests {
         assert!(s.constants_folded >= 1);
         // The add should now be a constant 5.
         let has5 = m.functions[0].body.iter().any(|i| {
-            matches!(i, Inst::Const { lit: Literal::Int(5), .. })
+            matches!(
+                i,
+                Inst::Const {
+                    lit: Literal::Int(5),
+                    ..
+                }
+            )
         });
-        assert!(has5, "expected folded constant 5 in {:?}", m.functions[0].body);
+        assert!(
+            has5,
+            "expected folded constant 5 in {:?}",
+            m.functions[0].body
+        );
     }
 
     #[test]
     fn dead_code_eliminated() {
         let mut m = module_with(
             vec![
-                Inst::Const { dst: 0, lit: Literal::Int(1) },
-                Inst::Const { dst: 1, lit: Literal::Int(2) },
-                Inst::Ret { ty: Ty::Void, src: None },
+                Inst::Const {
+                    dst: 0,
+                    lit: Literal::Int(1),
+                },
+                Inst::Const {
+                    dst: 1,
+                    lit: Literal::Int(2),
+                },
+                Inst::Ret {
+                    ty: Ty::Void,
+                    src: None,
+                },
             ],
             Ty::Void,
         );
@@ -352,12 +427,25 @@ mod tests {
     fn constant_branch_folds() {
         let mut m = module_with(
             vec![
-                Inst::Const { dst: 0, lit: Literal::Bool(true) },
-                Inst::Branch { cond: 0, then_label: 1, else_label: 2 },
+                Inst::Const {
+                    dst: 0,
+                    lit: Literal::Bool(true),
+                },
+                Inst::Branch {
+                    cond: 0,
+                    then_label: 1,
+                    else_label: 2,
+                },
                 Inst::Label(1),
-                Inst::Ret { ty: Ty::Void, src: None },
+                Inst::Ret {
+                    ty: Ty::Void,
+                    src: None,
+                },
                 Inst::Label(2),
-                Inst::Ret { ty: Ty::Void, src: None },
+                Inst::Ret {
+                    ty: Ty::Void,
+                    src: None,
+                },
             ],
             Ty::Void,
         );

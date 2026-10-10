@@ -34,6 +34,8 @@ pub enum Builtin {
     Floatval,
     Strval,
     Abs,
+    /// `count($array)` — number of elements.
+    Count,
 }
 
 impl Builtin {
@@ -44,6 +46,7 @@ impl Builtin {
             "floatval" => Builtin::Floatval,
             "strval" => Builtin::Strval,
             "abs" => Builtin::Abs,
+            "count" => Builtin::Count,
             _ => return None,
         })
     }
@@ -55,6 +58,7 @@ impl Builtin {
             Builtin::Floatval => "floatval",
             Builtin::Strval => "strval",
             Builtin::Abs => "abs",
+            Builtin::Count => "count",
         }
     }
 }
@@ -100,6 +104,34 @@ pub enum TExpr {
         lhs: Box<TExpr>,
         rhs: Box<TExpr>,
     },
+    /// `cond ? then : else`; `then = None` is the short form `cond ?: else`.
+    Ternary {
+        cond: Box<TExpr>,
+        cond_ty: Ty,
+        then: Option<Box<TExpr>>,
+        else_branch: Box<TExpr>,
+        ty: Ty,
+    },
+    /// `match (subject) { ... }`.
+    Match {
+        subject: Box<TExpr>,
+        subject_ty: Ty,
+        arms: Vec<TArm>,
+        ty: Ty,
+    },
+    /// `[k => v, ...]` — `ety` is the (already unified) element type.
+    ArrayLit {
+        elems: Vec<(Option<TExpr>, TExpr)>,
+        ety: Ty,
+    },
+    /// `base[index]` read; `ety` is the element type.
+    Index {
+        base: Box<TExpr>,
+        base_ty: Ty,
+        index: Box<TExpr>,
+        index_ty: Ty,
+        ety: Ty,
+    },
     Call {
         callee: Callee,
         ret: Ty,
@@ -108,6 +140,14 @@ pub enum TExpr {
         arg_tys: Vec<Ty>,
         span: Span,
     },
+}
+
+/// One arm of a typed `match`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TArm {
+    pub conds: Vec<TExpr>,
+    pub is_default: bool,
+    pub result: TExpr,
 }
 
 impl TExpr {
@@ -120,9 +160,35 @@ impl TExpr {
             TExpr::Var { ty, .. } => ty.clone(),
             TExpr::Un { ty, .. } => ty.clone(),
             TExpr::Bin { ty, .. } => ty.clone(),
+            TExpr::Ternary { ty, .. } => ty.clone(),
+            TExpr::Match { ty, .. } => ty.clone(),
+            TExpr::ArrayLit { ety, .. } => Ty::array(ety.clone()),
+            TExpr::Index { ety, .. } => ety.clone(),
             TExpr::Call { ret, .. } => ret.clone(),
         }
     }
+}
+
+/// A typed assignment target.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TTarget {
+    Var {
+        name: String,
+        slot: u32,
+        ty: Ty,
+    },
+    /// `base[key] = ...`; evaluating `base` yields the array pointer.
+    Index {
+        base: Box<TExpr>,
+        elem_ty: Ty,
+        key: Box<TExpr>,
+        key_ty: Ty,
+    },
+    /// `base[] = ...` (push).
+    Push {
+        base: Box<TExpr>,
+        elem_ty: Ty,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -132,9 +198,22 @@ pub enum TStmt {
     Print(TExpr),
     Expr(TExpr),
     Assign {
-        slot: u32,
+        target: TTarget,
         ty: Ty,
         value: TExpr,
+    },
+    /// `target op= value`.
+    AssignOp {
+        target: TTarget,
+        ty: Ty,
+        op: ABinOp,
+        value: TExpr,
+    },
+    /// `target++` / `target--`.
+    IncDec {
+        target: TTarget,
+        ty: Ty,
+        delta: i64,
     },
     If {
         cond: TExpr,
@@ -148,10 +227,43 @@ pub enum TStmt {
         cond_ty: Ty,
         body: Vec<TStmt>,
     },
+    For {
+        init: Vec<TStmt>,
+        cond: Option<(TExpr, Ty)>,
+        update: Vec<TStmt>,
+        body: Vec<TStmt>,
+    },
+    DoWhile {
+        body: Vec<TStmt>,
+        cond: TExpr,
+        cond_ty: Ty,
+    },
+    Foreach {
+        base: TExpr,
+        base_ty: Ty,
+        value_slot: u32,
+        value_ty: Ty,
+        body: Vec<TStmt>,
+    },
+    Switch {
+        subject: TExpr,
+        subject_ty: Ty,
+        cases: Vec<TCase>,
+    },
+    Break(u32),
+    Continue(u32),
     Return {
         value: Option<TExpr>,
         ret: Ty,
     },
+}
+
+/// One arm of a typed `switch` (fall-through preserved).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TCase {
+    pub test: Option<TExpr>,
+    pub test_ty: Ty,
+    pub body: Vec<TStmt>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -199,6 +311,10 @@ struct FnCtx {
     vars: HashMap<String, u32>,
     ret: Ty,
     is_main: bool,
+    /// Enclosing loop nesting depth (for `break`/`continue` validation).
+    loop_depth: u32,
+    /// Enclosing switch nesting depth.
+    switch_depth: u32,
 }
 
 impl FnCtx {
@@ -208,6 +324,8 @@ impl FnCtx {
             vars: HashMap::new(),
             ret,
             is_main,
+            loop_depth: 0,
+            switch_depth: 0,
         }
     }
 
@@ -224,6 +342,18 @@ impl FnCtx {
 
     fn slot_ty(&self, slot: u32) -> Ty {
         self.slots[slot as usize].clone()
+    }
+
+    /// Refine the element type of an array slot created from an empty literal
+    /// `[]`, once its element type becomes known.
+    fn refine_array_slot(&mut self, slot: u32, want_elem: &Ty) -> bool {
+        match &self.slots[slot as usize] {
+            Ty::Array(cur) if matches!(**cur, Ty::Null) => {
+                self.slots[slot as usize] = Ty::array(want_elem.clone());
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -261,10 +391,7 @@ impl Analyzer {
         if self.diags.has_errors() {
             return None;
         }
-        Some(TProgram {
-            funcs,
-            main: main?,
-        })
+        Some(TProgram { funcs, main: main? })
     }
 
     fn collect_signatures(&mut self, program: &ast::Program) {
@@ -273,16 +400,13 @@ impl Analyzer {
             let key = f.name.to_ascii_lowercase();
             if let Some(prev) = self.funcs.get(&key) {
                 self.diags.emit(
-                    Diagnostic::error(format!(
-                        "function `{}` is already defined",
-                        f.name
-                    ))
-                    .with_code("E0201")
-                    .with_span(f.name_span)
-                    .with_note(format!(
-                        "previous definition is at byte offset {}",
-                        prev.span.start
-                    )),
+                    Diagnostic::error(format!("function `{}` is already defined", f.name))
+                        .with_code("E0201")
+                        .with_span(f.name_span)
+                        .with_note(format!(
+                            "previous definition is at byte offset {}",
+                            prev.span.start
+                        )),
                 );
                 continue;
             }
@@ -353,6 +477,18 @@ impl Analyzer {
             ast::TypeRef::String => Ty::String,
             ast::TypeRef::Bool => Ty::Bool,
             ast::TypeRef::Void => Ty::Void,
+            ast::TypeRef::Array(inner) => {
+                let elem = self.resolve_type(inner);
+                if elem == Ty::Void {
+                    self.diags.emit(
+                        Diagnostic::error("an array cannot have element type `void`")
+                            .with_code("E0205")
+                            .with_span(inner.span()),
+                    );
+                    return Ty::array(Ty::Int);
+                }
+                Ty::array(elem)
+            }
             ast::TypeRef::Named(name) => {
                 self.diags.emit(
                     Diagnostic::error(format!(
@@ -431,14 +567,21 @@ impl Analyzer {
     fn analyze_stmt(&mut self, stmt: &ast::Stmt, ctx: &mut FnCtx) -> Option<TStmt> {
         match stmt {
             ast::Stmt::Empty => None,
-            ast::Stmt::Block(body, _) => {
-                let inner = self.analyze_stmts(body, ctx);
-                Some(TStmt::Block(inner))
-            }
+            ast::Stmt::Block(body, _) => Some(TStmt::Block(self.analyze_stmts(body, ctx))),
             ast::Stmt::Echo(exprs, _) => {
                 let mut texprs = Vec::new();
                 for e in exprs {
                     if let Some(t) = self.infer(e, ctx) {
+                        if t.ty().is_array() {
+                            self.diags.emit(
+                                Diagnostic::error(
+                                    "cannot echo an array; index it or use `implode()` (not yet implemented)",
+                                )
+                                .with_code("E0240")
+                                .with_span(e.span()),
+                            );
+                            continue;
+                        }
                         texprs.push(t);
                     }
                 }
@@ -446,6 +589,16 @@ impl Analyzer {
             }
             ast::Stmt::Print(e, _) => {
                 let t = self.infer(e, ctx)?;
+                if t.ty().is_array() {
+                    self.diags.emit(
+                        Diagnostic::error(
+                            "cannot print an array; index it or use `implode()` (not yet implemented)",
+                        )
+                        .with_code("E0240")
+                        .with_span(e.span()),
+                    );
+                    return None;
+                }
                 Some(TStmt::Print(t))
             }
             ast::Stmt::Expr(e, _) => {
@@ -453,11 +606,22 @@ impl Analyzer {
                 Some(TStmt::Expr(t))
             }
             ast::Stmt::Assign {
-                name,
+                target,
                 ty,
                 value,
                 span,
-            } => self.analyze_assign(name, ty.as_ref(), value, *span, ctx),
+            } => self.analyze_assign(target, ty.as_ref(), value, *span, ctx),
+            ast::Stmt::AssignOp {
+                target,
+                op,
+                value,
+                span,
+            } => self.analyze_assign_op(target, *op, value, *span, ctx),
+            ast::Stmt::IncDec {
+                target,
+                delta,
+                span,
+            } => self.analyze_incdec(target, *delta, *span, ctx),
             ast::Stmt::FnDecl(f) => {
                 self.diags.emit(
                     Diagnostic::error("nested function declarations are not supported yet")
@@ -476,35 +640,17 @@ impl Analyzer {
             } => {
                 let cond_t = self.infer(cond, ctx)?;
                 let cond_ty = cond_t.ty();
-                if !is_truthy(&cond_ty) {
-                    self.diags.emit(
-                        Diagnostic::error(format!(
-                            "condition must be a scalar value, found `{cond_ty}`"
-                        ))
-                        .with_code("E0208")
-                        .with_span(cond.span()),
-                    );
-                }
+                self.expect_truthy(&cond_ty, cond.span());
                 let then_t = self.analyze_stmts(then_branch, ctx);
                 let mut elifs_t = Vec::new();
                 for (c, b) in elifs {
                     let ct = self.infer(c, ctx)?;
                     let cty = ct.ty();
-                    if !is_truthy(&cty) {
-                        self.diags.emit(
-                            Diagnostic::error(format!(
-                                "condition must be a scalar value, found `{cty}`"
-                            ))
-                            .with_code("E0208")
-                            .with_span(c.span()),
-                        );
-                    }
+                    self.expect_truthy(&cty, c.span());
                     let bt = self.analyze_stmts(b, ctx);
                     elifs_t.push((ct, cty, bt));
                 }
-                let else_t = else_branch
-                    .as_ref()
-                    .map(|b| self.analyze_stmts(b, ctx));
+                let else_t = else_branch.as_ref().map(|b| self.analyze_stmts(b, ctx));
                 Some(TStmt::If {
                     cond: cond_t,
                     cond_ty,
@@ -516,28 +662,255 @@ impl Analyzer {
             ast::Stmt::While { cond, body, .. } => {
                 let cond_t = self.infer(cond, ctx)?;
                 let cond_ty = cond_t.ty();
-                if !is_truthy(&cond_ty) {
-                    self.diags.emit(
-                        Diagnostic::error(format!(
-                            "condition must be a scalar value, found `{cond_ty}`"
-                        ))
-                        .with_code("E0208")
-                        .with_span(cond.span()),
-                    );
-                }
+                self.expect_truthy(&cond_ty, cond.span());
+                ctx.loop_depth += 1;
                 let body_t = self.analyze_stmts(body, ctx);
+                ctx.loop_depth -= 1;
                 Some(TStmt::While {
                     cond: cond_t,
                     cond_ty,
                     body: body_t,
                 })
             }
+            ast::Stmt::For {
+                init,
+                cond,
+                update,
+                body,
+                ..
+            } => self.analyze_for(init, cond, update, body, ctx),
+            ast::Stmt::DoWhile { body, cond, .. } => {
+                ctx.loop_depth += 1;
+                let body_t = self.analyze_stmts(body, ctx);
+                ctx.loop_depth -= 1;
+                let cond_t = self.infer(cond, ctx)?;
+                let cond_ty = cond_t.ty();
+                self.expect_truthy(&cond_ty, cond.span());
+                Some(TStmt::DoWhile {
+                    body: body_t,
+                    cond: cond_t,
+                    cond_ty,
+                })
+            }
+            ast::Stmt::Foreach {
+                subject,
+                key,
+                key_span,
+                value,
+                value_span,
+                body,
+                ..
+            } => self.analyze_foreach(
+                subject,
+                key.as_deref(),
+                *key_span,
+                value,
+                *value_span,
+                body,
+                ctx,
+            ),
+            ast::Stmt::Switch { subject, cases, .. } => self.analyze_switch(subject, cases, ctx),
+            ast::Stmt::Break(level, span) => self.analyze_jump(*level, *span, ctx, false),
+            ast::Stmt::Continue(level, span) => self.analyze_jump(*level, *span, ctx, true),
+        }
+    }
+
+    fn expect_truthy(&mut self, ty: &Ty, span: Span) {
+        if !is_truthy(ty) {
+            self.diags.emit(
+                Diagnostic::error(format!("condition must be a scalar value, found `{ty}`"))
+                    .with_code("E0208")
+                    .with_span(span),
+            );
+        }
+    }
+
+    fn analyze_for(
+        &mut self,
+        init: &[ast::Stmt],
+        cond: &[ast::Expr],
+        update: &[ast::Stmt],
+        body: &[ast::Stmt],
+        ctx: &mut FnCtx,
+    ) -> Option<TStmt> {
+        let init_t = self.analyze_stmts(init, ctx);
+        let mut cond_t = None;
+        if !cond.is_empty() {
+            if cond.len() > 1 {
+                self.diags.emit(
+                    Diagnostic::error("the `for` condition must be a single expression")
+                        .with_code("E0241")
+                        .with_span(cond[1].span()),
+                );
+            }
+            let c = self.infer(&cond[0], ctx)?;
+            let cty = c.ty();
+            self.expect_truthy(&cty, cond[0].span());
+            cond_t = Some((c, cty));
+        }
+        ctx.loop_depth += 1;
+        let body_t = self.analyze_stmts(body, ctx);
+        ctx.loop_depth -= 1;
+        let update_t = self.analyze_stmts(update, ctx);
+        Some(TStmt::For {
+            init: init_t,
+            cond: cond_t,
+            update: update_t,
+            body: body_t,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn analyze_foreach(
+        &mut self,
+        subject: &ast::Expr,
+        key: Option<&str>,
+        key_span: Span,
+        value: &str,
+        value_span: Span,
+        body: &[ast::Stmt],
+        ctx: &mut FnCtx,
+    ) -> Option<TStmt> {
+        if key.is_some() {
+            self.diags.emit(
+                Diagnostic::error(
+                    "`foreach` with a key variable is not implemented yet; iterate with an index and `count()` instead",
+                )
+                .with_code("E0242")
+                .with_span(key_span),
+            );
+            return None;
+        }
+        let subj = self.infer(subject, ctx)?;
+        let sty = subj.ty();
+        let elem = match sty.array_elem() {
+            Some(e) if !matches!(e, Ty::Null) => e.clone(),
+            Some(_) => {
+                self.diags.emit(
+                    Diagnostic::error(
+                        "cannot iterate an array whose element type is still unknown (an empty `[]`); assign an element or annotate the type",
+                    )
+                    .with_code("E0243")
+                    .with_span(subject.span()),
+                );
+                return None;
+            }
+            None => {
+                self.diags.emit(
+                    Diagnostic::error(format!("`foreach` expects an array, found `{sty}`"))
+                        .with_code("E0244")
+                        .with_span(subject.span()),
+                );
+                return None;
+            }
+        };
+        let vslot = match ctx.slot_of(value) {
+            Some(s) => {
+                let existing = ctx.slot_ty(s);
+                if !elem.assignable_to(&existing) {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "`foreach` value variable `${value}` is already of type `{existing}`, but the array elements are `{elem}`"
+                        ))
+                        .with_code("E0245")
+                        .with_span(value_span),
+                    );
+                }
+                s
+            }
+            None => ctx.declare(value, elem.clone()),
+        };
+        ctx.loop_depth += 1;
+        let body_t = self.analyze_stmts(body, ctx);
+        ctx.loop_depth -= 1;
+        Some(TStmt::Foreach {
+            base: subj,
+            base_ty: sty,
+            value_slot: vslot,
+            value_ty: elem,
+            body: body_t,
+        })
+    }
+
+    fn analyze_switch(
+        &mut self,
+        subject: &ast::Expr,
+        cases: &[ast::SwitchCase],
+        ctx: &mut FnCtx,
+    ) -> Option<TStmt> {
+        let subj = self.infer(subject, ctx)?;
+        let sty = subj.ty();
+        let mut tcases = Vec::new();
+        ctx.switch_depth += 1;
+        for c in cases {
+            let (test_t, test_ty) = match &c.test {
+                Some(t) => {
+                    let te = self.infer(t, ctx)?;
+                    let tt = te.ty();
+                    if !comparable_eq(&sty, &tt) {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "cannot compare `case` value of type `{tt}` with switch subject of type `{sty}`"
+                            ))
+                            .with_code("E0224")
+                            .with_span(t.span()),
+                        );
+                    }
+                    (Some(te), tt)
+                }
+                None => (None, Ty::Int),
+            };
+            let body = self.analyze_stmts(&c.body, ctx);
+            tcases.push(TCase {
+                test: test_t,
+                test_ty,
+                body,
+            });
+        }
+        ctx.switch_depth -= 1;
+        Some(TStmt::Switch {
+            subject: subj,
+            subject_ty: sty,
+            cases: tcases,
+        })
+    }
+
+    fn analyze_jump(
+        &mut self,
+        level: Option<u32>,
+        span: Span,
+        ctx: &FnCtx,
+        is_continue: bool,
+    ) -> Option<TStmt> {
+        let level = level.unwrap_or(1);
+        if is_continue {
+            if level > ctx.loop_depth {
+                self.diags.emit(
+                    Diagnostic::error("`continue` is not inside a loop (or its level is too deep)")
+                        .with_code("E0246")
+                        .with_span(span),
+                );
+                return None;
+            }
+            Some(TStmt::Continue(level))
+        } else {
+            if level > ctx.loop_depth + ctx.switch_depth {
+                self.diags.emit(
+                    Diagnostic::error(
+                        "`break` is not inside a loop or `switch` (or its level is too deep)",
+                    )
+                    .with_code("E0247")
+                    .with_span(span),
+                );
+                return None;
+            }
+            Some(TStmt::Break(level))
         }
     }
 
     fn analyze_assign(
         &mut self,
-        name: &str,
+        target: &ast::LValue,
         annotation: Option<&ast::TypeRef>,
         value: &ast::Expr,
         span: Span,
@@ -555,57 +928,286 @@ impl Analyzer {
             return None;
         }
 
-        let annotated = annotation.map(|t| self.resolve_type(t));
-
-        let (slot, decl_ty) = match ctx.slot_of(name) {
-            Some(slot) => {
-                let existing = ctx.slot_ty(slot);
-                if let Some(a) = &annotated {
-                    if *a != existing {
-                        self.diags.emit(
-                            Diagnostic::error(format!(
-                                "variable `${name}` is already of type `{existing}`, cannot redeclare as `{a}`"
-                            ))
-                            .with_code("E0210")
-                            .with_span(span),
-                        );
-                        return None;
+        match target {
+            ast::LValue::Var { name, .. } => {
+                let annotated = annotation.map(|t| self.resolve_type(t));
+                let (slot, decl_ty) = match ctx.slot_of(name) {
+                    Some(slot) => {
+                        let existing = ctx.slot_ty(slot);
+                        if let Some(a) = &annotated {
+                            if *a != existing {
+                                self.diags.emit(
+                                    Diagnostic::error(format!(
+                                        "variable `${name}` is already of type `{existing}`, cannot redeclare as `{a}`"
+                                    ))
+                                    .with_code("E0210")
+                                    .with_span(span),
+                                );
+                                return None;
+                            }
+                        }
+                        (slot, existing)
                     }
-                }
-                (slot, existing)
-            }
-            None => {
-                let ty = annotated.clone().unwrap_or_else(|| val_ty.clone());
-                if ty == Ty::Void {
+                    None => {
+                        let ty = annotated.clone().unwrap_or_else(|| val_ty.clone());
+                        if ty == Ty::Void {
+                            self.diags.emit(
+                                Diagnostic::error("a variable cannot have type `void`")
+                                    .with_code("E0211")
+                                    .with_span(span),
+                            );
+                            return None;
+                        }
+                        let slot = ctx.declare(name, ty.clone());
+                        (slot, ty)
+                    }
+                };
+
+                if !val_ty.assignable_to(&decl_ty) {
                     self.diags.emit(
-                        Diagnostic::error("a variable cannot have type `void`")
-                            .with_code("E0211")
-                            .with_span(span),
+                        Diagnostic::error(format!(
+                            "cannot assign value of type `{val_ty}` to variable `${name}` of type `{decl_ty}`"
+                        ))
+                        .with_code("E0212")
+                        .with_span(span)
+                        .with_note("PXR only implicitly widens `int` to `float`"),
                     );
                     return None;
                 }
-                let slot = ctx.declare(name, ty.clone());
-                (slot, ty)
-            }
-        };
 
-        if !val_ty.assignable_to(&decl_ty) {
+                Some(TStmt::Assign {
+                    target: TTarget::Var {
+                        name: name.clone(),
+                        slot,
+                        ty: decl_ty.clone(),
+                    },
+                    ty: decl_ty,
+                    value: val,
+                })
+            }
+            ast::LValue::Index { base, index, .. } => {
+                if annotation.is_some() {
+                    self.diags.emit(
+                        Diagnostic::error("an array element cannot carry a type annotation")
+                            .with_code("E0251")
+                            .with_span(span),
+                    );
+                }
+                let target = self.infer_index_target(base, index.as_deref(), span, ctx)?;
+                let elem_ty = self.elem_ty_maybe_refine(&target, &val_ty, ctx);
+                if !val_ty.assignable_to(&elem_ty) {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "cannot assign value of type `{val_ty}` into an array of element type `{elem_ty}`"
+                        ))
+                        .with_code("E0212")
+                        .with_span(span),
+                    );
+                    return None;
+                }
+                Some(TStmt::Assign {
+                    target,
+                    ty: elem_ty,
+                    value: val,
+                })
+            }
+        }
+    }
+
+    /// The element type of a target, refining an `array<null>` slot when the
+    /// assigned value reveals the element type.
+    fn elem_ty_maybe_refine(&mut self, target: &TTarget, val_ty: &Ty, ctx: &mut FnCtx) -> Ty {
+        let (elem, base) = match target {
+            TTarget::Index { elem_ty, base, .. } => (elem_ty.clone(), base),
+            TTarget::Push { elem_ty, base } => (elem_ty.clone(), base),
+            TTarget::Var { ty, .. } => return ty.clone(),
+        };
+        if elem == Ty::Null {
+            if let TExpr::Var { slot, .. } = &**base {
+                if ctx.refine_array_slot(*slot, val_ty) {
+                    return val_ty.clone();
+                }
+            }
+        }
+        elem
+    }
+
+    fn analyze_assign_op(
+        &mut self,
+        target: &ast::LValue,
+        op: ABinOp,
+        value: &ast::Expr,
+        span: Span,
+        ctx: &mut FnCtx,
+    ) -> Option<TStmt> {
+        let (ttarget, tty) = self.infer_target_read(target, span, ctx)?;
+        let val = self.infer(value, ctx)?;
+        let vty = val.ty();
+        let result_ty = self.binary_type(op, &tty, &vty, span)?;
+        if !result_ty.assignable_to(&tty) {
             self.diags.emit(
                 Diagnostic::error(format!(
-                    "cannot assign value of type `{val_ty}` to variable `${name}` of type `{decl_ty}`"
+                    "result of `{}=` has type `{result_ty}`, which cannot be stored back into a target of type `{tty}`",
+                    op.symbol()
                 ))
                 .with_code("E0212")
-                .with_span(span)
-                .with_note("PXR only implicitly widens `int` to `float`"),
+                .with_span(span),
             );
             return None;
         }
-
-        Some(TStmt::Assign {
-            slot,
-            ty: decl_ty,
+        Some(TStmt::AssignOp {
+            target: ttarget,
+            ty: tty,
+            op,
             value: val,
         })
+    }
+
+    fn analyze_incdec(
+        &mut self,
+        target: &ast::LValue,
+        delta: i32,
+        span: Span,
+        ctx: &mut FnCtx,
+    ) -> Option<TStmt> {
+        let (ttarget, tty) = self.infer_target_read(target, span, ctx)?;
+        if !tty.is_numeric() {
+            self.diags.emit(
+                Diagnostic::error(format!(
+                    "`++`/`--` requires a numeric operand, found `{tty}`"
+                ))
+                .with_code("E0252")
+                .with_span(span),
+            );
+            return None;
+        }
+        Some(TStmt::IncDec {
+            target: ttarget,
+            ty: tty,
+            delta: delta as i64,
+        })
+    }
+
+    /// Resolve an assignment target to a typed target together with its own
+    /// (read) type.
+    fn infer_target_read(
+        &mut self,
+        target: &ast::LValue,
+        span: Span,
+        ctx: &mut FnCtx,
+    ) -> Option<(TTarget, Ty)> {
+        match target {
+            ast::LValue::Var { name, .. } => {
+                let slot = match ctx.slot_of(name) {
+                    Some(s) => s,
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error(format!("undefined variable `${name}`"))
+                                .with_code("E0220")
+                                .with_span(span),
+                        );
+                        return None;
+                    }
+                };
+                let ty = ctx.slot_ty(slot);
+                Some((
+                    TTarget::Var {
+                        name: name.clone(),
+                        slot,
+                        ty: ty.clone(),
+                    },
+                    ty,
+                ))
+            }
+            ast::LValue::Index { base, index, .. } => {
+                let t = self.infer_index_target(base, index.as_deref(), span, ctx)?;
+                let ty = match &t {
+                    TTarget::Index { elem_ty, .. } => elem_ty.clone(),
+                    TTarget::Push { elem_ty, .. } => elem_ty.clone(),
+                    TTarget::Var { ty, .. } => ty.clone(),
+                };
+                if ty == Ty::Null {
+                    self.diags.emit(
+                        Diagnostic::error(
+                            "the element type of this array is still unknown (an empty `[]`)",
+                        )
+                        .with_code("E0243")
+                        .with_span(span),
+                    );
+                    return None;
+                }
+                Some((t, ty))
+            }
+        }
+    }
+
+    fn infer_index_target(
+        &mut self,
+        base: &ast::LValue,
+        index: Option<&ast::Expr>,
+        span: Span,
+        ctx: &mut FnCtx,
+    ) -> Option<TTarget> {
+        let ast::LValue::Var { name, .. } = base else {
+            self.diags.emit(
+                Diagnostic::error("nested array assignment is not supported yet")
+                    .with_code("E0248")
+                    .with_span(span),
+            );
+            return None;
+        };
+        let slot = match ctx.slot_of(name) {
+            Some(s) => s,
+            None => {
+                self.diags.emit(
+                    Diagnostic::error(format!("undefined variable `${name}`"))
+                        .with_code("E0220")
+                        .with_span(span),
+                );
+                return None;
+            }
+        };
+        let bty = ctx.slot_ty(slot);
+        let Ty::Array(elem) = bty.clone() else {
+            self.diags.emit(
+                Diagnostic::error(format!("cannot index a value of type `{bty}` with `[]`"))
+                    .with_code("E0249")
+                    .with_span(span),
+            );
+            return None;
+        };
+        let elem = (*elem).clone();
+        let base_expr = TExpr::Var {
+            name: name.clone(),
+            slot,
+            ty: bty.clone(),
+        };
+        match index {
+            None => Some(TTarget::Push {
+                base: Box::new(base_expr),
+                elem_ty: elem,
+            }),
+            Some(ie) => {
+                let key = self.infer(ie, ctx)?;
+                let kty = key.ty();
+                if !matches!(kty, Ty::Int | Ty::String) {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "array keys must be `int` or `string`, found `{kty}`"
+                        ))
+                        .with_code("E0250")
+                        .with_span(ie.span()),
+                    );
+                    return None;
+                }
+                Some(TTarget::Index {
+                    base: Box::new(base_expr),
+                    elem_ty: elem,
+                    key: Box::new(key),
+                    key_ty: kty,
+                })
+            }
+        }
     }
 
     fn analyze_return(
@@ -618,9 +1220,11 @@ impl Analyzer {
         if ctx.is_main {
             if let Some(v) = value {
                 self.diags.emit(
-                    Diagnostic::warning("`return` with a value in the top level of a script is ignored")
-                        .with_code("W0202")
-                        .with_span(v.span()),
+                    Diagnostic::warning(
+                        "`return` with a value in the top level of a script is ignored",
+                    )
+                    .with_code("W0202")
+                    .with_span(v.span()),
                 );
             }
             return Some(TStmt::Return { value: None, ret });
@@ -630,11 +1234,9 @@ impl Analyzer {
             (None, Ty::Void) => Some(TStmt::Return { value: None, ret }),
             (None, _) => {
                 self.diags.emit(
-                    Diagnostic::error(format!(
-                        "function must return a value of type `{ret}`"
-                    ))
-                    .with_code("E0213")
-                    .with_span(span),
+                    Diagnostic::error(format!("function must return a value of type `{ret}`"))
+                        .with_code("E0213")
+                        .with_span(span),
                 );
                 None
             }
@@ -743,20 +1345,50 @@ impl Analyzer {
                             expr: Box::new(operand),
                         })
                     }
+                    AUnOp::BitNot => {
+                        if oty != Ty::Int {
+                            self.diags.emit(
+                                Diagnostic::error(format!(
+                                    "`~` requires an `int` operand, found `{oty}`"
+                                ))
+                                .with_code("E0221")
+                                .with_span(*span),
+                            );
+                            return None;
+                        }
+                        Some(TExpr::Un {
+                            op: AUnOp::BitNot,
+                            operand_ty: oty,
+                            ty: Ty::Int,
+                            expr: Box::new(operand),
+                        })
+                    }
                 }
             }
-            ast::Expr::Binary {
-                op,
-                lhs,
-                rhs,
-                span,
-            } => self.infer_binary(*op, lhs, rhs, *span, ctx),
+            ast::Expr::Binary { op, lhs, rhs, span } => {
+                self.infer_binary(*op, lhs, rhs, *span, ctx)
+            }
             ast::Expr::Call {
                 callee,
                 callee_span,
                 args,
                 span,
             } => self.infer_call(callee, *callee_span, args, *span, ctx),
+            ast::Expr::Ternary {
+                cond,
+                then,
+                else_branch,
+                span,
+            } => self.infer_ternary(cond, then.as_deref(), else_branch, *span, ctx),
+            ast::Expr::Index { base, index, span } => {
+                self.infer_index(base, index.as_deref(), *span, ctx)
+            }
+            ast::Expr::ArrayLit { items, span } => self.infer_array_lit(items, *span, ctx),
+            ast::Expr::Match {
+                subject,
+                arms,
+                span,
+            } => self.infer_match(subject, arms, *span, ctx),
         }
     }
 
@@ -772,47 +1404,60 @@ impl Analyzer {
         let rt = self.infer(rhs, ctx)?;
         let l = lt.ty();
         let r = rt.ty();
-
-        let mk = |op, lty: Ty, rty: Ty, ty: Ty, l: TExpr, r: TExpr| TExpr::Bin {
+        let ty = self.binary_type(op, &l, &r, span)?;
+        Some(TExpr::Bin {
             op,
-            lhs_ty: lty,
-            rhs_ty: rty,
+            lhs_ty: l,
+            rhs_ty: r,
             ty,
-            lhs: Box::new(l),
-            rhs: Box::new(r),
-        };
+            lhs: Box::new(lt),
+            rhs: Box::new(rt),
+        })
+    }
 
+    /// Validate the operands of a binary operator and compute its result type.
+    /// Shared by expression inference and compound assignment.
+    fn binary_type(&mut self, op: ABinOp, l: &Ty, r: &Ty, span: Span) -> Option<Ty> {
         match op {
             ABinOp::Add | ABinOp::Sub | ABinOp::Mul => {
                 if !l.is_numeric() || !r.is_numeric() {
-                    return self.bad_operands(op, &l, &r, span);
+                    return self.bad_operands(op, l, r, span);
                 }
-                let ty = numeric_result(&l, &r);
-                Some(mk(op, l, r, ty, lt, rt))
+                Some(numeric_result(l, r))
             }
             ABinOp::Div => {
                 if !l.is_numeric() || !r.is_numeric() {
-                    return self.bad_operands(op, &l, &r, span);
+                    return self.bad_operands(op, l, r, span);
                 }
                 // PHP `/` always produces a float.
-                Some(mk(op, l, r, Ty::Float, lt, rt))
+                Some(Ty::Float)
             }
             ABinOp::Mod => {
-                if l != Ty::Int || r != Ty::Int {
+                if *l != Ty::Int || *r != Ty::Int {
                     self.diags.emit(
                         Diagnostic::error(format!(
                             "`%` requires two `int` operands, found `{l}` and `{r}`"
                         ))
                         .with_code("E0222")
                         .with_span(span)
-                        .with_note("use `fmod()` for floating point remainders (not yet implemented)"),
+                        .with_note(
+                            "use `fmod()` for floating point remainders (not yet implemented)",
+                        ),
                     );
                     return None;
                 }
-                Some(mk(op, l, r, Ty::Int, lt, rt))
+                Some(Ty::Int)
+            }
+            ABinOp::Pow => {
+                self.diags.emit(
+                    Diagnostic::error("the `**` operator is not implemented yet")
+                        .with_code("E0257")
+                        .with_span(span),
+                );
+                None
             }
             ABinOp::Concat => {
-                for t in [&l, &r] {
+                for t in [l, r] {
                     if !matches!(t, Ty::String | Ty::Int | Ty::Float | Ty::Bool) {
                         self.diags.emit(
                             Diagnostic::error(format!(
@@ -824,13 +1469,10 @@ impl Analyzer {
                         return None;
                     }
                 }
-                Some(mk(op, l, r, Ty::String, lt, rt))
+                Some(Ty::String)
             }
             ABinOp::Eq | ABinOp::NotEq => {
-                let ok = (l.is_numeric() && r.is_numeric())
-                    || (l == Ty::String && r == Ty::String)
-                    || (l == Ty::Bool && r == Ty::Bool);
-                if !ok {
+                if !comparable_eq(l, r) {
                     self.diags.emit(
                         Diagnostic::error(format!(
                             "cannot compare `{l}` and `{r}` with `{}`",
@@ -842,10 +1484,10 @@ impl Analyzer {
                     );
                     return None;
                 }
-                Some(mk(op, l, r, Ty::Bool, lt, rt))
+                Some(Ty::Bool)
             }
             ABinOp::Identical | ABinOp::NotIdentical => {
-                let ok = (l == r) && l.is_scalar();
+                let ok = l == r && l.is_scalar();
                 if !ok {
                     self.diags.emit(
                         Diagnostic::error(format!(
@@ -858,10 +1500,11 @@ impl Analyzer {
                     );
                     return None;
                 }
-                Some(mk(op, l, r, Ty::Bool, lt, rt))
+                Some(Ty::Bool)
             }
             ABinOp::Lt | ABinOp::LtEq | ABinOp::Gt | ABinOp::GtEq => {
-                let ok = (l.is_numeric() && r.is_numeric()) || (l == Ty::String && r == Ty::String);
+                let ok =
+                    (l.is_numeric() && r.is_numeric()) || (*l == Ty::String && *r == Ty::String);
                 if !ok {
                     self.diags.emit(
                         Diagnostic::error(format!(
@@ -874,10 +1517,24 @@ impl Analyzer {
                     );
                     return None;
                 }
-                Some(mk(op, l, r, Ty::Bool, lt, rt))
+                Some(Ty::Bool)
+            }
+            ABinOp::Spaceship => {
+                let ok =
+                    (l.is_numeric() && r.is_numeric()) || (*l == Ty::String && *r == Ty::String);
+                if !ok {
+                    self.diags.emit(
+                        Diagnostic::error(format!("`<=>` cannot compare `{l}` and `{r}`"))
+                            .with_code("E0226")
+                            .with_span(span)
+                            .with_note("operands must both be numeric or both `string`"),
+                    );
+                    return None;
+                }
+                Some(Ty::Int)
             }
             ABinOp::And | ABinOp::Or => {
-                if !is_truthy(&l) || !is_truthy(&r) {
+                if !is_truthy(l) || !is_truthy(r) {
                     self.diags.emit(
                         Diagnostic::error(format!(
                             "`{}` requires scalar operands, found `{l}` and `{r}`",
@@ -888,18 +1545,251 @@ impl Analyzer {
                     );
                     return None;
                 }
-                Some(mk(op, l, r, Ty::Bool, lt, rt))
+                Some(Ty::Bool)
+            }
+            ABinOp::BitAnd | ABinOp::BitOr | ABinOp::BitXor | ABinOp::Shl | ABinOp::Shr => {
+                if *l != Ty::Int || *r != Ty::Int {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "`{}` requires two `int` operands, found `{l}` and `{r}`",
+                            op.symbol()
+                        ))
+                        .with_code("E0222")
+                        .with_span(span),
+                    );
+                    return None;
+                }
+                Some(Ty::Int)
+            }
+            ABinOp::NullCoalesce => self.unify_types(l, r, span),
+        }
+    }
+
+    /// The common type of two branch results (`?:`, `??`, `match`, array
+    /// literals). Allows the same `int`/`float` widening as assignment.
+    fn unify_types(&mut self, a: &Ty, b: &Ty, span: Span) -> Option<Ty> {
+        if a == b {
+            return Some(a.clone());
+        }
+        match (a, b) {
+            (Ty::Null, other) | (other, Ty::Null) => return Some(other.clone()),
+            (x, y) if x.is_numeric() && y.is_numeric() => return Some(numeric_result(x, y)),
+            _ => {}
+        }
+        self.diags.emit(
+            Diagnostic::error(format!("cannot combine values of type `{a}` and `{b}`"))
+                .with_code("E0253")
+                .with_span(span),
+        );
+        None
+    }
+
+    fn infer_ternary(
+        &mut self,
+        cond: &ast::Expr,
+        then: Option<&ast::Expr>,
+        else_branch: &ast::Expr,
+        span: Span,
+        ctx: &mut FnCtx,
+    ) -> Option<TExpr> {
+        let c = self.infer(cond, ctx)?;
+        let cty = c.ty();
+        self.expect_truthy(&cty, cond.span());
+        let eb = self.infer(else_branch, ctx)?;
+        match then {
+            Some(t) => {
+                let tt = self.infer(t, ctx)?;
+                let ty = self.unify_types(&tt.ty(), &eb.ty(), span)?;
+                Some(TExpr::Ternary {
+                    cond: Box::new(c),
+                    cond_ty: cty,
+                    then: Some(Box::new(tt)),
+                    else_branch: Box::new(eb),
+                    ty,
+                })
+            }
+            None => {
+                let ty = self.unify_types(&cty, &eb.ty(), span)?;
+                Some(TExpr::Ternary {
+                    cond: Box::new(c),
+                    cond_ty: cty,
+                    then: None,
+                    else_branch: Box::new(eb),
+                    ty,
+                })
             }
         }
     }
 
-    fn bad_operands<T>(
+    fn infer_index(
         &mut self,
-        op: ABinOp,
-        l: &Ty,
-        r: &Ty,
+        base: &ast::Expr,
+        index: Option<&ast::Expr>,
         span: Span,
-    ) -> Option<T> {
+        ctx: &mut FnCtx,
+    ) -> Option<TExpr> {
+        let b = self.infer(base, ctx)?;
+        let bty = b.ty();
+        let elem = match bty.array_elem() {
+            Some(e) if !matches!(e, Ty::Null) => e.clone(),
+            Some(_) => {
+                self.diags.emit(
+                    Diagnostic::error(
+                        "this array's element type is still unknown (an empty `[]`); assign an element or annotate the type",
+                    )
+                    .with_code("E0243")
+                    .with_span(span),
+                );
+                return None;
+            }
+            None => {
+                self.diags.emit(
+                    Diagnostic::error(format!("cannot index a value of type `{bty}`"))
+                        .with_code("E0249")
+                        .with_span(span),
+                );
+                return None;
+            }
+        };
+        let Some(ie) = index else {
+            self.diags.emit(
+                Diagnostic::error("`[]` (append) is only valid as an assignment target")
+                    .with_code("E0254")
+                    .with_span(span),
+            );
+            return None;
+        };
+        let key = self.infer(ie, ctx)?;
+        let kty = key.ty();
+        if !matches!(kty, Ty::Int | Ty::String) {
+            self.diags.emit(
+                Diagnostic::error(format!(
+                    "array keys must be `int` or `string`, found `{kty}`"
+                ))
+                .with_code("E0250")
+                .with_span(ie.span()),
+            );
+            return None;
+        }
+        Some(TExpr::Index {
+            base: Box::new(b),
+            base_ty: bty,
+            index: Box::new(key),
+            index_ty: kty,
+            ety: elem,
+        })
+    }
+
+    fn infer_array_lit(
+        &mut self,
+        items: &[ast::ArrayItem],
+        span: Span,
+        ctx: &mut FnCtx,
+    ) -> Option<TExpr> {
+        let _ = span;
+        let mut elems = Vec::new();
+        let mut ety: Option<Ty> = None;
+        for item in items {
+            let key = match &item.key {
+                Some(k) => {
+                    let kt = self.infer(k, ctx)?;
+                    let kty = kt.ty();
+                    if !matches!(kty, Ty::Int | Ty::String) {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "array keys must be `int` or `string`, found `{kty}`"
+                            ))
+                            .with_code("E0250")
+                            .with_span(k.span()),
+                        );
+                        return None;
+                    }
+                    Some(kt)
+                }
+                None => None,
+            };
+            let v = self.infer(&item.value, ctx)?;
+            let vt = v.ty();
+            if vt == Ty::Null {
+                self.diags.emit(
+                    Diagnostic::error("`null` is not supported yet")
+                        .with_code("E0209")
+                        .with_span(item.value.span()),
+                );
+                return None;
+            }
+            ety = Some(match &ety {
+                None => vt,
+                Some(e) => self.unify_types(e, &vt, item.value.span())?,
+            });
+            elems.push((key, v));
+        }
+        let ety = ety.unwrap_or(Ty::Null);
+        Some(TExpr::ArrayLit { elems, ety })
+    }
+
+    fn infer_match(
+        &mut self,
+        subject: &ast::Expr,
+        arms: &[ast::MatchArm],
+        _span: Span,
+        ctx: &mut FnCtx,
+    ) -> Option<TExpr> {
+        let s = self.infer(subject, ctx)?;
+        let st = s.ty();
+        let mut tarms = Vec::new();
+        let mut has_default = false;
+        let mut ty: Option<Ty> = None;
+        for arm in arms {
+            if arm.is_default {
+                has_default = true;
+            }
+            let mut conds = Vec::new();
+            for c in &arm.conds {
+                let ct = self.infer(c, ctx)?;
+                let cty = ct.ty();
+                if cty != st {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "match arm condition has type `{cty}` but the subject is `{st}`; `match` uses strict `===` comparison"
+                        ))
+                        .with_code("E0255")
+                        .with_span(c.span()),
+                    );
+                }
+                conds.push(ct);
+            }
+            let r = self.infer(&arm.result, ctx)?;
+            let rt = r.ty();
+            ty = Some(match &ty {
+                None => rt,
+                Some(t) => self.unify_types(t, &rt, arm.result.span())?,
+            });
+            tarms.push(TArm {
+                conds,
+                is_default: arm.is_default,
+                result: r,
+            });
+        }
+        if !has_default {
+            self.diags.emit(
+                Diagnostic::error(
+                    "`match` must have a `default` arm in PXR (there is no runtime exception mechanism yet)",
+                )
+                .with_code("E0256")
+                .with_span(subject.span()),
+            );
+        }
+        let ty = ty.unwrap_or(Ty::Int);
+        Some(TExpr::Match {
+            subject: Box::new(s),
+            subject_ty: st,
+            arms: tarms,
+            ty,
+        })
+    }
+
+    fn bad_operands<T>(&mut self, op: ABinOp, l: &Ty, r: &Ty, span: Span) -> Option<T> {
         self.diags.emit(
             Diagnostic::error(format!(
                 "operator `{}` cannot be applied to `{l}` and `{r}`",
@@ -1019,11 +1909,9 @@ impl Analyzer {
             Builtin::Strlen => {
                 if at != Ty::String {
                     self.diags.emit(
-                        Diagnostic::error(format!(
-                            "`strlen` expects a `string`, found `{at}`"
-                        ))
-                        .with_code("E0234")
-                        .with_span(args[0].span()),
+                        Diagnostic::error(format!("`strlen` expects a `string`, found `{at}`"))
+                            .with_code("E0234")
+                            .with_span(args[0].span()),
                     );
                     return None;
                 }
@@ -1032,11 +1920,9 @@ impl Analyzer {
             Builtin::Intval => {
                 if !matches!(at, Ty::Int | Ty::Float | Ty::Bool | Ty::String) {
                     self.diags.emit(
-                        Diagnostic::error(format!(
-                            "`intval` expects a scalar, found `{at}`"
-                        ))
-                        .with_code("E0234")
-                        .with_span(args[0].span()),
+                        Diagnostic::error(format!("`intval` expects a scalar, found `{at}`"))
+                            .with_code("E0234")
+                            .with_span(args[0].span()),
                     );
                     return None;
                 }
@@ -1045,11 +1931,9 @@ impl Analyzer {
             Builtin::Floatval => {
                 if !matches!(at, Ty::Int | Ty::Float | Ty::Bool | Ty::String) {
                     self.diags.emit(
-                        Diagnostic::error(format!(
-                            "`floatval` expects a scalar, found `{at}`"
-                        ))
-                        .with_code("E0234")
-                        .with_span(args[0].span()),
+                        Diagnostic::error(format!("`floatval` expects a scalar, found `{at}`"))
+                            .with_code("E0234")
+                            .with_span(args[0].span()),
                     );
                     return None;
                 }
@@ -1058,11 +1942,9 @@ impl Analyzer {
             Builtin::Strval => {
                 if !matches!(at, Ty::Int | Ty::Float | Ty::Bool | Ty::String) {
                     self.diags.emit(
-                        Diagnostic::error(format!(
-                            "`strval` expects a scalar, found `{at}`"
-                        ))
-                        .with_code("E0234")
-                        .with_span(args[0].span()),
+                        Diagnostic::error(format!("`strval` expects a scalar, found `{at}`"))
+                            .with_code("E0234")
+                            .with_span(args[0].span()),
                     );
                     return None;
                 }
@@ -1071,15 +1953,24 @@ impl Analyzer {
             Builtin::Abs => {
                 if !at.is_numeric() {
                     self.diags.emit(
-                        Diagnostic::error(format!(
-                            "`abs` expects `int` or `float`, found `{at}`"
-                        ))
-                        .with_code("E0234")
-                        .with_span(args[0].span()),
+                        Diagnostic::error(format!("`abs` expects `int` or `float`, found `{at}`"))
+                            .with_code("E0234")
+                            .with_span(args[0].span()),
                     );
                     return None;
                 }
                 at.clone()
+            }
+            Builtin::Count => {
+                if !at.is_array() {
+                    self.diags.emit(
+                        Diagnostic::error(format!("`count` expects an array, found `{at}`"))
+                            .with_code("E0234")
+                            .with_span(args[0].span()),
+                    );
+                    return None;
+                }
+                Ty::Int
             }
         };
 
@@ -1109,6 +2000,11 @@ fn numeric_result(l: &Ty, r: &Ty) -> Ty {
 /// Types that can be used in boolean context (`if`, `while`, `&&`, `||`, `!`).
 pub fn is_truthy(ty: &Ty) -> bool {
     matches!(ty, Ty::Bool | Ty::Int | Ty::Float | Ty::String)
+}
+
+/// Types that may be compared with `==` / `!=` (and `switch` case matching).
+fn comparable_eq(a: &Ty, b: &Ty) -> bool {
+    (a.is_numeric() && b.is_numeric()) || (a == b && matches!(a, Ty::String | Ty::Bool))
 }
 
 /// Does this statement provably end with a `return` on all paths?
@@ -1160,7 +2056,8 @@ mod tests {
 
     #[test]
     fn typed_arithmetic() {
-        let (_, d) = run("<?php function add(int $a, int $b): int { return $a + $b; } echo add(1,2);");
+        let (_, d) =
+            run("<?php function add(int $a, int $b): int { return $a + $b; } echo add(1,2);");
         assert!(!d.has_errors(), "{:#?}", d.items());
     }
 

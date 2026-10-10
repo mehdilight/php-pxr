@@ -20,11 +20,20 @@ pub enum Ty {
     String,
     /// The type of the `null` literal. Currently not fully implemented.
     Null,
+    /// An array with a statically-known value type and dynamically-typed
+    /// (`int` or `string`) keys, mirroring PHP's ordered maps. `Array(Null)` is
+    /// the element type of an empty literal `[]` before it is refined.
+    Array(Box<Ty>),
     /// A named type (class, struct or future generic instantiation).
     Named(String),
 }
 
 impl Ty {
+    /// Construct `array<elem>`.
+    pub fn array(elem: Ty) -> Ty {
+        Ty::Array(Box::new(elem))
+    }
+
     pub fn is_numeric(&self) -> bool {
         matches!(self, Ty::Int | Ty::Float)
     }
@@ -33,15 +42,33 @@ impl Ty {
         matches!(self, Ty::Bool | Ty::Int | Ty::Float | Ty::String)
     }
 
+    pub fn is_array(&self) -> bool {
+        matches!(self, Ty::Array(_))
+    }
+
+    /// The value type of an array type, if this is an array.
+    pub fn array_elem(&self) -> Option<&Ty> {
+        match self {
+            Ty::Array(e) => Some(e),
+            _ => None,
+        }
+    }
+
     /// Can a value of `self` be implicitly used where `to` is expected?
     ///
     /// This captures the only implicit coercion in the PXR core: a lossless
-    /// widening from `int` to `float`.
+    /// widening from `int` to `float`. Array element types must match exactly.
     pub fn assignable_to(&self, to: &Ty) -> bool {
         if self == to {
             return true;
         }
-        matches!((self, to), (Ty::Int, Ty::Float))
+        match (self, to) {
+            (Ty::Int, Ty::Float) => true,
+            // An empty array literal (element type `null`) is assignable to any
+            // array type; the element type is refined at the assignment site.
+            (Ty::Array(e), Ty::Array(t)) => matches!(**e, Ty::Null) || e == t,
+            _ => false,
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -52,6 +79,7 @@ impl Ty {
             Ty::Float => "float",
             Ty::String => "string",
             Ty::Null => "null",
+            Ty::Array(_) => "array",
             Ty::Named(n) => n.as_str(),
         }
     }
@@ -59,6 +87,9 @@ impl Ty {
 
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
+        match self {
+            Ty::Array(e) => write!(f, "array<{e}>"),
+            other => f.write_str(other.name()),
+        }
     }
 }

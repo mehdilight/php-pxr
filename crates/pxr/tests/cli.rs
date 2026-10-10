@@ -69,12 +69,7 @@ fn build_produces_standalone_executable() {
     }
     let f = temp_php("standalone", "<?php echo 40 + 2;");
     let exe = f.with_extension("bin");
-    let r = run_ok(&[
-        "build",
-        f.to_str().unwrap(),
-        "-o",
-        exe.to_str().unwrap(),
-    ]);
+    let r = run_ok(&["build", f.to_str().unwrap(), "-o", exe.to_str().unwrap()]);
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     let out = Command::new(&exe).output().unwrap();
     assert_eq!(out.status.code(), Some(0));
@@ -144,7 +139,10 @@ fn check_reports_syntax_errors() {
 
 #[test]
 fn emit_ir_contains_functions() {
-    let f = temp_php("ir", "<?php function add(int $a, int $b): int { return $a + $b; } echo add(1,2);");
+    let f = temp_php(
+        "ir",
+        "<?php function add(int $a, int $b): int { return $a + $b; } echo add(1,2);",
+    );
     let r = run_ok(&["emit-ir", f.to_str().unwrap()]);
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert!(r.stdout.contains("func pxr$fn$add"));
@@ -166,7 +164,10 @@ fn type_error_prevents_build() {
         eprintln!("skipping: no C compiler");
         return;
     }
-    let f = temp_php("typeerr", "<?php function f(int $a): int { return $a; } echo f(\"x\");");
+    let f = temp_php(
+        "typeerr",
+        "<?php function f(int $a): int { return $a; } echo f(\"x\");",
+    );
     let r = run_ok(&["run", f.to_str().unwrap()]);
     assert_eq!(r.code, 1);
     assert!(r.stderr.contains("E0231"), "stderr: {}", r.stderr);
@@ -201,4 +202,220 @@ echo floatval("1.25");
     let r = run_ok(&["run", f.to_str().unwrap()]);
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "5 42 3.5 9 1.25");
+}
+
+#[test]
+fn arrays_and_foreach() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let src = r#"<?php
+$a = [3, 1, 4, 1, 5];
+$a[] = 9;
+echo count($a) . " " . $a[0] . " " . $a[5] . "\n";
+$sum = 0;
+foreach ($a as $v) {
+    $sum += $v;
+}
+echo $sum . "\n";
+$m = ["x" => 10, "y" => 20];
+echo $m["x"] + $m["y"] . "\n";
+"#;
+    let f = temp_php("arrays", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "6 3 9\n23\n30\n");
+}
+
+#[test]
+fn array_element_type_refinement() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    // Regression: the assignment that refines an empty `array<null>` must be
+    // stored using the *refined* element type, not the placeholder `null`.
+    let src = r#"<?php
+$a = [];
+$a[] = "x";
+$a[] = "y";
+echo $a[0] . $a[1] . "\n";
+$b = [];
+$b[3] = 4;
+$b[1] = 2;
+echo $b[3] . " " . $b[1] . " " . count($b) . "\n";
+$c = [1, 2.5, 3];
+echo $c[0] . " " . $c[1] . " " . $c[2] . "\n";
+"#;
+    let f = temp_php("refine", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "xy\n4 2 2\n1 2.5 3\n");
+}
+
+#[test]
+fn control_flow_breadth() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let src = r#"<?php
+$s = 0;
+for ($i = 0; $i < 10; $i++) {
+    if ($i == 3) { continue; }
+    if ($i == 7) { break; }
+    $s += $i;
+}
+echo $s . "\n";
+$n = 3;
+$fact = 1;
+while ($n > 1) {
+    $fact *= $n;
+    $n--;
+}
+echo $fact . "\n";
+$j = 0;
+do {
+    $j++;
+} while ($j < 3);
+echo $j . "\n";
+echo (5 <=> 2) . (5 <=> 5) . (2 <=> 5) . "\n";
+$r = match (2) {
+    1 => "a",
+    2 => "b",
+    default => "c",
+};
+echo $r . "\n";
+switch (1) {
+    case 1:
+        echo "one";
+        break;
+    default:
+        echo "other";
+}
+echo "\n";
+echo (5 & 3) . " " . (6 | 1) . " " . (5 ^ 1) . " " . (2 << 3) . " " . (16 >> 2) . " " . (~0) . "\n";
+"#;
+    let f = temp_php("controlflow", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "18\n6\n3\n10-1\nb\none\n1 7 4 16 4 -1\n");
+}
+
+/// The M1 acceptance test: a PHP quicksort compiles and sorts correctly.
+#[test]
+fn quicksort_matches_php() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let src = r#"<?php
+$a = [5, 3, 8, 4, 2, 7, 1, 10, 9, 6];
+$stack = [];
+$sp = 0;
+$stack[$sp] = 0;
+$sp = $sp + 1;
+$stack[$sp] = count($a) - 1;
+$sp = $sp + 1;
+while ($sp > 0) {
+    $sp = $sp - 1;
+    $hi = $stack[$sp];
+    $sp = $sp - 1;
+    $lo = $stack[$sp];
+    if ($lo >= $hi) { continue; }
+    $pivot = $a[$hi];
+    $i = $lo - 1;
+    for ($j = $lo; $j < $hi; $j++) {
+        if ($a[$j] < $pivot) {
+            $i = $i + 1;
+            $tmp = $a[$i];
+            $a[$i] = $a[$j];
+            $a[$j] = $tmp;
+        }
+    }
+    $i = $i + 1;
+    $tmp = $a[$i];
+    $a[$i] = $a[$hi];
+    $a[$hi] = $tmp;
+    $stack[$sp] = $lo; $sp = $sp + 1;
+    $stack[$sp] = $i - 1; $sp = $sp + 1;
+    $stack[$sp] = $i + 1; $sp = $sp + 1;
+    $stack[$sp] = $hi; $sp = $sp + 1;
+}
+foreach ($a as $v) {
+    echo $v . " ";
+}
+echo "\n";
+"#;
+    let f = temp_php("quicksort", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "1 2 3 4 5 6 7 8 9 10 \n");
+}
+
+#[test]
+fn array_misuse_is_rejected() {
+    let f = temp_php("badarray", "<?php $a = [1, 2]; echo $a;");
+    let r = run_ok(&["check", f.to_str().unwrap()]);
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("E0240"), "stderr: {}", r.stderr);
+
+    let f = temp_php(
+        "badforeach",
+        "<?php $a = [1, 2]; foreach ($a as $k => $v) { echo $v; }",
+    );
+    let r = run_ok(&["check", f.to_str().unwrap()]);
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("E0242"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn emit_llvm_declares_array_runtime() {
+    let f = temp_php("llarr", "<?php $a = [1]; echo $a[0];");
+    let r = run_ok(&["emit-llvm", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(r.stdout.contains("declare ptr @pxr_array_new"));
+    assert!(r.stdout.contains("declare i64 @pxr_array_get_bits"));
+}
+
+/// The shared-subset example must produce byte-identical output under PXR and
+/// the PHP interpreter (skipped when PHP is not installed).
+#[test]
+fn compat_example_matches_php() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let have_php = Command::new("php")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !have_php {
+        eprintln!("skipping: no php interpreter");
+        return;
+    }
+    let file = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/compat.php");
+    let r = run_ok(&["run", file]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let php = Command::new("php").arg(file).output().unwrap();
+    assert_eq!(
+        r.stdout,
+        String::from_utf8_lossy(&php.stdout),
+        "PXR and PHP output differ"
+    );
+}
+
+/// The milestone-1 acceptance example runs from the source tree.
+#[test]
+fn quicksort_example_runs() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let file = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/quicksort.php");
+    let r = run_ok(&["run", file]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "1 2 3 4 5 6 7 8 9 10 \n");
 }

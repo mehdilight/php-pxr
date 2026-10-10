@@ -36,8 +36,8 @@ differ):
 ## Caveats
 
 * These are microbenchmarks of the *shared, statically typed subset*. They are
-  not a claim that PXR is universally faster than PHP, and they do not exercise
-  features PXR does not yet have (arrays, objects, strings in loops).
+  not a claim that PXR is universally faster than PHP, and they do not yet
+  exercise arrays, objects, or string‑heavy workloads.
 * Best‑of‑N reduces (but does not remove) scheduler and thermal noise.
 * Compilation time is excluded from the measurements; only program execution is
   timed.
