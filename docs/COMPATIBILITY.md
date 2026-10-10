@@ -34,6 +34,7 @@ and whose output the test suite asserts is byte‑identical.
 | **Array key unification** | a canonical decimal‑integer string key *is* the integer key: `$a["1"]` ≡ `$a[1]` (`"01"`, `"1.5"`, `"+1"`, `" 1"` stay strings) |
 | `count`, `strlen`, `intval`, `floatval`, `strval`, `abs` | |
 | **String builtins** `strtoupper`, `strtolower`, `trim`/`ltrim`/`rtrim`, `substr`, `str_repeat`, `str_replace`, `implode`, `explode`, `str_contains`, `str_starts_with`, `str_ends_with`, `strrev`, `ucfirst`, `lcfirst`, `ucwords`, `str_split`, `str_pad`, `substr_count` | byte-exact vs PHP, embedded NULs safe; see notes below |
+| **Escaping & encoding** `addslashes`, `stripslashes`, `bin2hex`, `base64_encode`, `urlencode`, `rawurlencode`, `urldecode`, `rawurldecode` | byte-exact vs PHP over all 256 byte values, including NULs; see notes below |
 | **Array transforms** `array_values`, `array_reverse`, `array_merge`, `array_slice`, `array_pad`, `array_fill`, `array_key_exists` | byte-exact vs PHP; deep-copy nested arrays (value semantics); see notes below |
 | Division `/` is always `float`; `%` is integer remainder | a zero divisor is a fatal `DivisionByZeroError` (exit 255), exactly as in PHP — not IEEE infinity |
 | **Float stringification** (`echo`, `.`, `strval`) | PHP's `zend_gcvt` with precision 14: `0.1+0.2` → `"0.3"`, `1e15` → `"1.0E+15"`, `1e-5` → `"1.0E-5"`, `1.0` → `"1"`, `-0.0` → `"-0"`, `INF`/`-INF`/`NAN` | |
@@ -77,6 +78,8 @@ behavioural divergence.
 | Wrong argument type (non‑strict mode coercion) | **Error** `E0231` |
 | Undefined variable / function | **Error** `E0220` / `E0232` |
 | Leading‑zero octal literal (`0755`) | **Warning** `W0001`, read as decimal |
+| Functions that return `string|false` / `int|false` (`strpos`, `strstr`, `base64_decode`, `hex2bin`, `substr_compare`, …) | Not yet — needs a union / `false` value type; only the never-failing encoders above are provided |
+| `sprintf`/`printf`, `number_format` | Not yet |
 | Classes, interfaces, traits, enums, namespaces, closures | Not yet |
 | `include`/`require`, `global`, `static`, references `&` | Not yet |
 | Exceptions, generators, attributes | Not yet |
@@ -154,6 +157,20 @@ reindexes; `array_reverse` reverses order, renumbering integer keys and keeping
 string keys (or keeping all keys when the second argument is `true`). Both
 deep-copy nested arrays so value semantics hold. All of these are verified
 byte‑for‑byte against PHP 8.4, including embedded-NUL cases.
+
+**Escaping & encoding.** `addslashes` backslash-escapes `'`, `"` and `\` and
+turns a NUL byte into the two characters `\0`; `stripslashes` is PHP's exact
+inverse — it drops each backslash and emits the following byte, mapping `\0` back
+to a NUL (so, as in PHP, `\n` becomes `n` and a trailing backslash is dropped).
+`bin2hex` is lowercase, two digits per byte. `base64_encode` is standard RFC 4648
+with `=` padding. The URL codecs follow PHP's byte tables exactly: `urlencode`
+passes `A-Za-z0-9-_.`, turns a space into `+` and percent-encodes everything else
+in uppercase hex (including `~`); `rawurlencode` passes `~` too and emits `%20`
+for a space; `urldecode` maps `+` to a space while `rawurldecode` does not; a `%`
+not followed by two hex digits is left literally, as in PHP. All eight are
+verified byte‑for‑byte against PHP over inputs spanning all 256 byte values,
+including high bytes and NULs, and `urldecode(urlencode($x))` /
+`rawurldecode(rawurlencode($x))` round-trip identically.
 
 **Array builtins.** `array_merge` renumbers integer keys in order and lets a
 later string key overwrite an earlier one in place; `array_slice` reproduces

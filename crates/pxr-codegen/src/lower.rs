@@ -1742,6 +1742,14 @@ impl Lowerer {
             Ucfirst => self.rt_call("pxr_ucfirst", vec![a[0]], Ty::String),
             Lcfirst => self.rt_call("pxr_lcfirst", vec![a[0]], Ty::String),
             Ucwords => self.rt_call("pxr_ucwords", vec![a[0]], Ty::String),
+            Addslashes => self.rt_call("pxr_addslashes", vec![a[0]], Ty::String),
+            Stripslashes => self.rt_call("pxr_stripslashes", vec![a[0]], Ty::String),
+            Bin2hex => self.rt_call("pxr_bin2hex", vec![a[0]], Ty::String),
+            Base64Encode => self.rt_call("pxr_base64_encode", vec![a[0]], Ty::String),
+            Urlencode => self.rt_call("pxr_urlencode", vec![a[0]], Ty::String),
+            Rawurlencode => self.rt_call("pxr_rawurlencode", vec![a[0]], Ty::String),
+            Urldecode => self.rt_call("pxr_urldecode", vec![a[0]], Ty::String),
+            Rawurldecode => self.rt_call("pxr_rawurldecode", vec![a[0]], Ty::String),
             StrSplit => {
                 let len = if argc == 2 {
                     a[1]

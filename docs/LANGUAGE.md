@@ -270,6 +270,14 @@ subjects are compared with loose/strict equality respectively.
 | `array_key_exists(int\|string, array<T>): bool` | key presence test | canonical integer strings unify with integer keys |
 | `str_pad(string, int[, string[, int]]): string` | pad to length | pad type `0`/`1`/`2` = left/right/both (default `1`); empty pad or bad type → fatal `ValueError` |
 | `substr_count(string, string[, int[, int]]): int` | non-overlapping count | argument checks in PHP's order (needle, offset, length) → fatal `ValueError` |
+| `addslashes(string): string` | backslash-escape `` ' `` `"` `\` | a NUL byte becomes the two characters `\0` |
+| `stripslashes(string): string` | undo `addslashes` | drops each backslash and emits the next byte (`\0` → NUL); matches PHP exactly, so `\n` → `n` |
+| `bin2hex(string): string` | lowercase hex encoding | two hex digits per input byte |
+| `base64_encode(string): string` | standard RFC 4648 base64 | `=`-padded |
+| `urlencode(string): string` | form URL encoding | space → `+`, `~` percent-encoded; `A-Za-z0-9-_.` pass through |
+| `rawurlencode(string): string` | RFC 3986 URL encoding | space → `%20`, `~` passes through |
+| `urldecode(string): string` | form URL decoding | `+` → space, `%XX` decoded; invalid/incomplete `%` kept literally |
+| `rawurldecode(string): string` | RFC 3986 URL decoding | like `urldecode` but `+` is left alone |
 
 ## Scoping
 

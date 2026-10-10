@@ -127,6 +127,14 @@ long long pxr_substr_count(const pxr_str *h, const pxr_str *n,
                            long long offset, long long length,
                            long long has_length);    /* non-overlapping count */
        /* empty needle first, then offset, then length -> fatal ValueError */
+pxr_str *pxr_addslashes(const pxr_str *s);          /* escapes ', ", \, \0 */
+pxr_str *pxr_stripslashes(const pxr_str *s);        /* strips \, \0 -> NUL */
+pxr_str *pxr_bin2hex(const pxr_str *s);             /* lowercase, 2 chars/byte */
+pxr_str *pxr_base64_encode(const pxr_str *s);       /* RFC 4648, = padded */
+pxr_str *pxr_urlencode(const pxr_str *s);           /* space -> +, uppercase hex */
+pxr_str *pxr_rawurlencode(const pxr_str *s);        /* RFC 3986, space -> %20 */
+pxr_str *pxr_urldecode(const pxr_str *s);           /* + -> space, %XX */
+pxr_str *pxr_rawurldecode(const pxr_str *s);        /* %XX, leaves + alone */
 long long pxr_array_val_tag_at(void *a, long long i);    /* element tag by index */
 
 /* math */

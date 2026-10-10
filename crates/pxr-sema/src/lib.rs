@@ -83,6 +83,15 @@ pub enum Builtin {
     StrPad,
     /// `substr_count($haystack, $needle[, $offset[, $length]])`.
     SubstrCount,
+    /// `(string) -> string` escaping & encoding helpers.
+    Addslashes,
+    Stripslashes,
+    Bin2hex,
+    Base64Encode,
+    Urlencode,
+    Rawurlencode,
+    Urldecode,
+    Rawurldecode,
 }
 
 impl Builtin {
@@ -121,6 +130,14 @@ impl Builtin {
             "array_key_exists" => Builtin::ArrayKeyExists,
             "str_pad" => Builtin::StrPad,
             "substr_count" => Builtin::SubstrCount,
+            "addslashes" => Builtin::Addslashes,
+            "stripslashes" => Builtin::Stripslashes,
+            "bin2hex" => Builtin::Bin2hex,
+            "base64_encode" => Builtin::Base64Encode,
+            "urlencode" => Builtin::Urlencode,
+            "rawurlencode" => Builtin::Rawurlencode,
+            "urldecode" => Builtin::Urldecode,
+            "rawurldecode" => Builtin::Rawurldecode,
             _ => return None,
         })
     }
@@ -160,6 +177,14 @@ impl Builtin {
             Builtin::ArrayKeyExists => "array_key_exists",
             Builtin::StrPad => "str_pad",
             Builtin::SubstrCount => "substr_count",
+            Builtin::Addslashes => "addslashes",
+            Builtin::Stripslashes => "stripslashes",
+            Builtin::Bin2hex => "bin2hex",
+            Builtin::Base64Encode => "base64_encode",
+            Builtin::Urlencode => "urlencode",
+            Builtin::Rawurlencode => "rawurlencode",
+            Builtin::Urldecode => "urldecode",
+            Builtin::Rawurldecode => "rawurldecode",
         }
     }
 }
@@ -2210,7 +2235,18 @@ impl Analyzer {
                 }
                 Ty::Bool
             }
-            Builtin::Strrev | Builtin::Ucfirst | Builtin::Lcfirst | Builtin::Ucwords => {
+            Builtin::Strrev
+            | Builtin::Ucfirst
+            | Builtin::Lcfirst
+            | Builtin::Ucwords
+            | Builtin::Addslashes
+            | Builtin::Stripslashes
+            | Builtin::Bin2hex
+            | Builtin::Base64Encode
+            | Builtin::Urlencode
+            | Builtin::Rawurlencode
+            | Builtin::Urldecode
+            | Builtin::Rawurldecode => {
                 if n != 1 {
                     return self.builtin_arity_err(name, 1, 1, n, span);
                 }

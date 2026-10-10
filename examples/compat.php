@@ -261,3 +261,15 @@ $ib = true;
 echo "interp=$iname/$in/$ipf/$ib\n";
 echo "interp2=a{$iname}b{$in}c\n";
 echo "interp3=[$] [\$in] [$in.] [$$in]\n";
+
+// --- milestone 2: escaping & encoding builtins -----------------------------
+
+$enc = "it's a \"test\" \\ \x00\xff";
+echo "addslashes=" . bin2hex(addslashes($enc)) . "\n";
+echo "stripslashes=" . bin2hex(stripslashes(addslashes($enc))) . "\n";
+echo "bin2hex=" . bin2hex("A\xff\x00") . "\n";
+echo "b64=" . base64_encode("foobar") . " " . base64_encode("f") . "\n";
+echo "url=" . urlencode("a b~c&d=e") . "\n";
+echo "rawurl=" . rawurlencode("a b~c&d=e") . "\n";
+echo "urldec=" . urldecode("a%20b+c%26d") . "\n";
+echo "rawurldec=" . rawurldecode("a%20b+c%26d") . "\n";

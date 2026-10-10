@@ -133,7 +133,7 @@ concatenation are byte-exact — matching PHP.
   also done (M2.interpolation slice); the richer PHP forms remain rejected.
 * A real standard library (sorted by module) reachable via `use`, compiled from
   PXR sources or intrinsic.
-* `sprintf`, `explode`/`implode`, `str_replace`, `substr`, `str_*`, `array_*`.
+* `sprintf`, `explode`/`implode`, `str_replace`, `substr`, `str_*`, `array_*`, encoding/escaping helpers.
 
 **Delivered (M2.strings slice).**
 
@@ -239,6 +239,28 @@ concatenation are byte-exact — matching PHP.
   `array_interpolation_is_a_loud_type_error`) and +2 lexer unit tests — 45 CLI
   tests total; `examples/compat.php` extended (still byte‑identical to PHP 8.4);
   the old `E0008`-on-any-`$` behaviour and its test were retired.
+
+**Delivered (M2.escaping & encoding slice).**
+
+* Eight `(string) -> string` helpers, all byte-exact vs PHP 8.4 over inputs
+  spanning all 256 byte values (including high bytes and NULs), and all verified
+  to round-trip identically:
+  * `addslashes` / `stripslashes` — PHP's exact (and slightly surprising)
+    semantics: `addslashes` escapes `'`, `"`, `\` and turns NUL into the two
+    characters `\0`; `stripslashes` drops each backslash and emits the next byte,
+    mapping `\0` back to NUL, so `\n` → `n` and a trailing backslash is dropped.
+  * `bin2hex` — lowercase, two hex digits per byte.
+  * `base64_encode` — standard RFC 4648 with `=` padding.
+  * `urlencode` / `rawurlencode` — PHP's byte tables exactly (`urlencode`:
+    space → `+`, `~` encoded; `rawurlencode`: space → `%20`, `~` kept).
+  * `urldecode` / `rawurldecode` — `%XX` decoding, `+` → space for the former
+    only, invalid/incomplete `%` sequences kept literally, as in PHP.
+* All eight join the existing one-argument `(string) -> string` arm in sema, and
+  share a small runtime helper (`pxr_url_encode`/`pxr_url_decode` with flags).
+* Tests: +2 CLI tests (`escaping_and_encoding_builtins_match_php`, which
+  cross-checks against the interpreter, and `encoding_builtin_type_errors_are_loud`)
+  plus a reusable `assert_matches_php` helper — 47 CLI tests total;
+  `examples/compat.php` extended (still byte‑identical to PHP 8.4).
 
 **Acceptance.** A string‑heavy program (e.g. word count) compiles and matches PHP —
 the word‑count block at the end of `examples/compat.php` does exactly this. ✅

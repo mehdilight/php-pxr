@@ -49,6 +49,37 @@ fn run_ok(args: &[&str]) -> Run {
     }
 }
 
+fn have_php() -> bool {
+    Command::new("php")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Compile and run `src` with PXR, run it with the PHP interpreter, and assert
+/// the two produce byte-identical stdout. Both are skipped when the tools are
+/// unavailable.
+fn assert_matches_php(name: &str, src: &str) {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    if !have_php() {
+        eprintln!("skipping: no php interpreter");
+        return;
+    }
+    let f = temp_php(name, src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let php = Command::new("php").arg(&f).output().unwrap();
+    assert_eq!(
+        r.stdout,
+        String::from_utf8_lossy(&php.stdout),
+        "PXR and PHP output differ for `{name}`"
+    );
+}
+
 #[test]
 fn run_hello() {
     if !have_cc() {
@@ -830,6 +861,38 @@ fn array_interpolation_is_a_loud_type_error() {
     let r = run_ok(&["check", f.to_str().unwrap()]);
     assert_eq!(r.code, 1, "stderr: {}", r.stderr);
     assert!(r.stderr.contains("E0223"), "stderr: {}", r.stderr);
+}
+
+/// Escaping & encoding builtins: `addslashes`/`stripslashes`, `bin2hex`,
+/// `base64_encode`, and the four URL codecs. Compared byte-for-byte against the
+/// PHP interpreter over a range of inputs, including high bytes and NULs.
+#[test]
+fn escaping_and_encoding_builtins_match_php() {
+    let src = r#"<?php
+$A = "!*'();:@&=+\$,/?#[]~-_. abcXYZ019\x00\x01\x1f\x7f\x80\xa9\xff";
+echo bin2hex(addslashes($A)) . "\n";
+echo bin2hex(stripslashes("a\\'b\\\"c\\\\d\\0e")) . "\n";
+echo bin2hex(stripslashes("abc\\")) . "\n";
+echo bin2hex(bin2hex($A)) . "\n";
+echo base64_encode("") . "|" . base64_encode("f") . "|" .
+    base64_encode("fo") . "|" . base64_encode("foo") . "|" .
+    base64_encode("\xff\xfe\xfd") . "\n";
+echo urlencode($A) . "\n";
+echo rawurlencode($A) . "\n";
+echo urldecode("a%20b+c%2Bd") . "|" . rawurldecode("a%20b+c%2Bd") . "\n";
+echo bin2hex(urldecode(urlencode($A))) . "\n";
+echo bin2hex(rawurldecode(rawurlencode($A))) . "\n";
+echo urldecode("a%2G%z%b") . "|" . urldecode("ab%4") . "\n";
+"#;
+    assert_matches_php("enc", src);
+}
+
+#[test]
+fn encoding_builtin_type_errors_are_loud() {
+    let f = temp_php("enc_err", "<?php echo base64_encode(123);");
+    let r = run_ok(&["check", f.to_str().unwrap()]);
+    assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("E0234"), "stderr: {}", r.stderr);
 }
 
 #[test]

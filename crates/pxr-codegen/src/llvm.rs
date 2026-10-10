@@ -97,6 +97,15 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
         "i64",
         &["ptr", "ptr", "i64", "i64", "i64"],
     ),
+    // Escaping & encoding builtins (M2). All are `(string) -> string`.
+    ("pxr_addslashes", "ptr", &["ptr"]),
+    ("pxr_stripslashes", "ptr", &["ptr"]),
+    ("pxr_bin2hex", "ptr", &["ptr"]),
+    ("pxr_base64_encode", "ptr", &["ptr"]),
+    ("pxr_urlencode", "ptr", &["ptr"]),
+    ("pxr_rawurlencode", "ptr", &["ptr"]),
+    ("pxr_urldecode", "ptr", &["ptr"]),
+    ("pxr_rawurldecode", "ptr", &["ptr"]),
 ];
 
 pub fn llty(ty: &Ty) -> &'static str {

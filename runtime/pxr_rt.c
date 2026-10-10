@@ -1390,3 +1390,215 @@ long long pxr_substr_count(const pxr_str *h, const pxr_str *n, long long offset,
     }
     return count;
 }
+
+/* ---------------------------------------------- escaping & encoding builtins */
+
+/*
+ * PHP `addslashes`: put a backslash before `'`, `"` and `\`, and replace a NUL
+ * byte with the two characters `\0` (backslash + ASCII zero). Other bytes,
+ * including all high bytes, are untouched.
+ */
+pxr_str *pxr_addslashes(const pxr_str *s) {
+    size_t extra = 0;
+    for (size_t i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        if (c == '\'' || c == '"' || c == '\\' || c == '\0') {
+            extra++;
+        }
+    }
+    pxr_str *out = pxr_str_alloc(s->len + extra);
+    size_t j = 0;
+    for (size_t i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        if (c == '\'' || c == '"' || c == '\\') {
+            out->data[j++] = '\\';
+            out->data[j++] = c;
+        } else if (c == '\0') {
+            out->data[j++] = '\\';
+            out->data[j++] = '0';
+        } else {
+            out->data[j++] = c;
+        }
+    }
+    return out;
+}
+
+/*
+ * PHP `stripslashes`: drop each backslash and emit the byte that follows it,
+ * except that `\0` (backslash + ASCII zero) becomes a NUL byte. A trailing
+ * backslash is dropped. Matches PHP 8.4 byte-for-byte, including the (slightly
+ * surprising) fact that `\n` becomes `n`.
+ */
+pxr_str *pxr_stripslashes(const pxr_str *s) {
+    pxr_str *out = pxr_str_alloc(s->len);
+    size_t j = 0;
+    for (size_t i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        if (c == '\\') {
+            if (i + 1 >= s->len) {
+                break;
+            }
+            i++;
+            char n = s->data[i];
+            out->data[j++] = (n == '0') ? '\0' : n;
+        } else {
+            out->data[j++] = c;
+        }
+    }
+    out->len = j;
+    out->data[j] = '\0';
+    return out;
+}
+
+/* Lowercase hexadecimal, two digits per input byte. */
+pxr_str *pxr_bin2hex(const pxr_str *s) {
+    static const char hexd[] = "0123456789abcdef";
+    pxr_str *out = pxr_str_alloc(s->len * 2);
+    for (size_t i = 0; i < s->len; i++) {
+        unsigned char b = (unsigned char)s->data[i];
+        out->data[i * 2] = hexd[b >> 4];
+        out->data[i * 2 + 1] = hexd[b & 0x0f];
+    }
+    return out;
+}
+
+/* Standard RFC 4648 base64, with `=` padding, byte-exact vs PHP. */
+pxr_str *pxr_base64_encode(const pxr_str *s) {
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t n = s->len;
+    pxr_str *out = pxr_str_alloc(((n + 2) / 3) * 4);
+    size_t i = 0;
+    size_t j = 0;
+    while (i + 3 <= n) {
+        uint32_t v = ((uint32_t)(unsigned char)s->data[i] << 16) |
+                     ((uint32_t)(unsigned char)s->data[i + 1] << 8) |
+                     (uint32_t)(unsigned char)s->data[i + 2];
+        out->data[j++] = b64[(v >> 18) & 63];
+        out->data[j++] = b64[(v >> 12) & 63];
+        out->data[j++] = b64[(v >> 6) & 63];
+        out->data[j++] = b64[v & 63];
+        i += 3;
+    }
+    if (n - i == 1) {
+        uint32_t v = (uint32_t)(unsigned char)s->data[i] << 16;
+        out->data[j++] = b64[(v >> 18) & 63];
+        out->data[j++] = b64[(v >> 12) & 63];
+        out->data[j++] = '=';
+        out->data[j++] = '=';
+    } else if (n - i == 2) {
+        uint32_t v = ((uint32_t)(unsigned char)s->data[i] << 16) |
+                     ((uint32_t)(unsigned char)s->data[i + 1] << 8);
+        out->data[j++] = b64[(v >> 18) & 63];
+        out->data[j++] = b64[(v >> 12) & 63];
+        out->data[j++] = b64[(v >> 6) & 63];
+        out->data[j++] = '=';
+    }
+    return out;
+}
+
+/*
+ * The unreserved set PHP's URL encoders pass through: `A-Z a-z 0-9 - _ .`, plus
+ * `~` for `rawurlencode` (RFC 3986). `urlencode` additionally turns a space into
+ * `+` and percent-encodes `~`; everything else becomes uppercase `%XX`.
+ */
+static int pxr_url_unreserved(unsigned char c, int keep_tilde) {
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9')) {
+        return 1;
+    }
+    if (c == '-' || c == '_' || c == '.') {
+        return 1;
+    }
+    return c == '~' && keep_tilde;
+}
+
+static pxr_str *pxr_url_encode(const pxr_str *s, int keep_tilde,
+                               int space_as_plus) {
+    static const char hexu[] = "0123456789ABCDEF";
+    size_t outlen = 0;
+    for (size_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (pxr_url_unreserved(c, keep_tilde)) {
+            outlen++;
+        } else if (space_as_plus && c == ' ') {
+            outlen++;
+        } else {
+            outlen += 3;
+        }
+    }
+    pxr_str *out = pxr_str_alloc(outlen);
+    size_t j = 0;
+    for (size_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (pxr_url_unreserved(c, keep_tilde)) {
+            out->data[j++] = (char)c;
+        } else if (space_as_plus && c == ' ') {
+            out->data[j++] = '+';
+        } else {
+            out->data[j++] = '%';
+            out->data[j++] = hexu[c >> 4];
+            out->data[j++] = hexu[c & 0x0f];
+        }
+    }
+    return out;
+}
+
+pxr_str *pxr_urlencode(const pxr_str *s) {
+    return pxr_url_encode(s, 0, 1);
+}
+
+pxr_str *pxr_rawurlencode(const pxr_str *s) {
+    return pxr_url_encode(s, 1, 0);
+}
+
+static int pxr_hexval(unsigned char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+/*
+ * `%XX` decoding. A `%` not followed by two hex digits is kept literally (PHP
+ * leaves the whole incomplete/invalid sequence untouched). `urldecode` also
+ * maps `+` to a space; `rawurldecode` leaves `+` alone.
+ */
+static pxr_str *pxr_url_decode(const pxr_str *s, int plus_as_space) {
+    pxr_str *out = pxr_str_alloc(s->len);
+    size_t j = 0;
+    for (size_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (plus_as_space && c == '+') {
+            out->data[j++] = ' ';
+        } else if (c == '%' && i + 2 < s->len) {
+            int hi = pxr_hexval((unsigned char)s->data[i + 1]);
+            int lo = pxr_hexval((unsigned char)s->data[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out->data[j++] = (char)((hi << 4) | lo);
+                i += 2;
+            } else {
+                out->data[j++] = '%';
+            }
+        } else {
+            out->data[j++] = (char)c;
+        }
+    }
+    out->len = j;
+    out->data[j] = '\0';
+    return out;
+}
+
+pxr_str *pxr_urldecode(const pxr_str *s) {
+    return pxr_url_decode(s, 1);
+}
+
+pxr_str *pxr_rawurldecode(const pxr_str *s) {
+    return pxr_url_decode(s, 0);
+}
