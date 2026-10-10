@@ -256,6 +256,13 @@ subjects are compared with loose/strict equality respectively.
 | `str_split(string[, int]): string[]` | split into byte chunks | default length `1`; empty string → `[]`; length `< 1` fatal `ValueError` |
 | `array_values(array<T>): array<T>` | values with keys dropped | reindexed `0..n-1` |
 | `array_reverse(array<T>[, bool]): array<T>` | reverse order | default renumbers integer keys, preserves string keys; `true` preserves all keys |
+| `array_merge(array<T>, ...array<T>): array<T>` | concatenate | integer keys renumbered, later string keys overwrite; all arguments must share one element type (`E0253` otherwise) |
+| `array_slice(array<T>, int[, int[, bool]]): array<T>` | contiguous slice | negative offset/length as PHP; string keys kept, integer keys renumbered unless the flag is `true` |
+| `array_pad(array<T>, int, T): array<T>` | pad to `\|size\|` | prepends when negative; no-op returns the array unchanged; `int` value widens to a `float` element type |
+| `array_fill(int, int, T): array<T>` | fill `count` copies | keys `start .. start+count-1`; negative count → fatal `ValueError` |
+| `array_key_exists(int\|string, array<T>): bool` | key presence test | canonical integer strings unify with integer keys |
+| `str_pad(string, int[, string[, int]]): string` | pad to length | pad type `0`/`1`/`2` = left/right/both (default `1`); empty pad or bad type → fatal `ValueError` |
+| `substr_count(string, string[, int[, int]]): int` | non-overlapping count | argument checks in PHP's order (needle, offset, length) → fatal `ValueError` |
 
 ## Scoping
 

@@ -1158,3 +1158,235 @@ void *pxr_array_reverse(void *p, long long preserve_keys) {
     }
     return d;
 }
+
+/* ------------------------------------------------- M2 array builtins ----
+ *
+ * `array_merge`, `array_slice`, `array_pad` and `array_fill` all share the same
+ * value semantics as `array_values`/`array_reverse`: nested arrays are
+ * deep-copied, scalars and (immutable) strings are shared.
+ */
+
+/* Copy an array element payload, deep-copying a nested array if needed. */
+static int64_t pxr_val_bits_copy(long long vt, int64_t bits) {
+    if (vt == PXR_TAG_ARR && bits) {
+        return (int64_t)(intptr_t)pxr_array_copy((void *)(intptr_t)bits);
+    }
+    return bits;
+}
+
+/* Append every entry of `s` onto `d`: integer keys are renumbered sequentially
+ * (PHP's `$d[] = ...`), string keys are kept and overwrite in place. This is
+ * the shared primitive behind `array_merge`, `array_slice` and `array_pad`. */
+static void pxr_array_append(pxr_array *d, const pxr_array *s) {
+    for (size_t i = 0; i < s->len; i++) {
+        const pxr_ent *e = &s->ents[i];
+        int64_t bits = pxr_val_bits_copy(e->vt, e->bits);
+        if (e->ks != NULL) {
+            pxr_array_set(d, PXR_TAG_STR, 0, e->ks, e->vt, bits);
+        } else {
+            pxr_array_push(d, e->vt, bits);
+        }
+    }
+}
+
+/* `array_merge($a, $b)`: appends `$b` onto a fresh copy of `$a`. The compiler
+ * folds a variadic call into a chain, starting from an empty array so that even
+ * a single argument is renumbered (PHP reindexes integer keys). */
+void *pxr_array_merge(void *pa, void *pb) {
+    pxr_array *d = (pxr_array *)pxr_array_new();
+    pxr_array_append(d, (const pxr_array *)pa);
+    pxr_array_append(d, (const pxr_array *)pb);
+    return d;
+}
+
+/* `array_slice($a, $offset, $length, $preserve_keys)`. `$has_length` is 0 when
+ * the caller omitted `$length` (slice to the end). A negative offset counts
+ * from the end; a negative length stops that many elements before the end.
+ * String keys are always kept; integer keys are renumbered unless
+ * `$preserve_keys` (PHP's default is false). */
+void *pxr_array_slice(void *p, long long offset, long long length,
+                      long long has_length, long long preserve_keys) {
+    pxr_array *s = (pxr_array *)p;
+    long long n = (long long)s->len;
+    if (offset < 0) {
+        offset += n;
+        if (offset < 0) {
+            offset = 0;
+        }
+    } else if (offset > n) {
+        offset = n;
+    }
+    long long end;
+    if (!has_length) {
+        end = n;
+    } else if (length < 0) {
+        end = n + length;
+        if (end < offset) {
+            end = offset;
+        }
+    } else {
+        end = offset + length;
+        if (end > n) {
+            end = n;
+        }
+    }
+    pxr_array *d = (pxr_array *)pxr_array_new();
+    for (long long i = offset; i < end; i++) {
+        const pxr_ent *e = &s->ents[(size_t)i];
+        int64_t bits = pxr_val_bits_copy(e->vt, e->bits);
+        if (e->ks != NULL) {
+            pxr_array_set(d, PXR_TAG_STR, 0, e->ks, e->vt, bits);
+        } else if (preserve_keys) {
+            pxr_array_set(d, PXR_TAG_INT, e->ki, NULL, e->vt, bits);
+        } else {
+            pxr_array_push(d, e->vt, bits);
+        }
+    }
+    return d;
+}
+
+/* `array_pad($a, $size, $value)`: pad to `|$size|` elements. With no padding
+ * needed PHP returns the array unchanged (keys preserved); otherwise integer
+ * keys are renumbered and the padding is appended (positive size) or prepended
+ * (negative size) with fresh integer keys. */
+void *pxr_array_pad(void *p, long long size, long long vtag, long long vbits) {
+    pxr_array *s = (pxr_array *)p;
+    long long n = (long long)s->len;
+    long long target = size < 0 ? -size : size;
+    if (target <= n) {
+        return pxr_array_copy(p);
+    }
+    long long pad = target - n;
+    pxr_array *d = (pxr_array *)pxr_array_new();
+    if (size < 0) {
+        for (long long i = 0; i < pad; i++) {
+            pxr_array_push(d, vtag, pxr_val_bits_copy(vtag, vbits));
+        }
+        pxr_array_append(d, s);
+    } else {
+        pxr_array_append(d, s);
+        for (long long i = 0; i < pad; i++) {
+            pxr_array_push(d, vtag, pxr_val_bits_copy(vtag, vbits));
+        }
+    }
+    return d;
+}
+
+/* `array_fill($start, $count, $value)`: `$count` copies under integer keys
+ * `$start .. $start + $count - 1`. A negative count is a fatal ValueError. */
+void *pxr_array_fill(long long start, long long count, long long vtag,
+                     long long vbits) {
+    if (count < 0) {
+        fprintf(stderr,
+                "Fatal error: Uncaught ValueError: array_fill(): Argument #2 "
+                "($count) must be greater than or equal to 0\n");
+        exit(255);
+    }
+    pxr_array *d = (pxr_array *)pxr_array_new();
+    for (long long i = 0; i < count; i++) {
+        pxr_array_set(d, PXR_TAG_INT, start + i, NULL, vtag,
+                      pxr_val_bits_copy(vtag, vbits));
+    }
+    return d;
+}
+
+/* `str_pad($s, $length, $pad, $type)`: pad to `$length` bytes. Each side cycles
+ * the pad string from its start (PHP semantics). An empty pad string or an
+ * invalid pad type is a fatal ValueError. */
+pxr_str *pxr_str_pad(const pxr_str *s, long long length, const pxr_str *pad,
+                     long long type) {
+    if (pad->len == 0) {
+        fprintf(stderr,
+                "Fatal error: Uncaught ValueError: str_pad(): Argument #3 "
+                "($pad_string) must not be empty\n");
+        exit(255);
+    }
+    if (type != 0 && type != 1 && type != 2) {
+        fprintf(stderr,
+                "Fatal error: Uncaught ValueError: str_pad(): Argument #4 "
+                "($pad_type) must be STR_PAD_LEFT, STR_PAD_RIGHT, or "
+                "STR_PAD_BOTH\n");
+        exit(255);
+    }
+    if (length <= (long long)s->len) {
+        pxr_str *out = pxr_str_alloc(s->len);
+        memcpy(out->data, s->data, s->len);
+        return out;
+    }
+    long long padn = length - (long long)s->len;
+    long long plen = (long long)pad->len;
+    long long left = 0, right = 0;
+    if (type == 0) {
+        left = padn;
+    } else if (type == 1) {
+        right = padn;
+    } else {
+        left = padn / 2;
+        right = padn - left;
+    }
+    pxr_str *out = pxr_str_alloc((size_t)((long long)s->len + padn));
+    size_t pos = 0;
+    for (long long i = 0; i < left; i++) {
+        out->data[pos++] = pad->data[(size_t)(i % plen)];
+    }
+    memcpy(out->data + pos, s->data, s->len);
+    pos += s->len;
+    for (long long i = 0; i < right; i++) {
+        out->data[pos++] = pad->data[(size_t)(i % plen)];
+    }
+    return out;
+}
+
+/* `substr_count($haystack, $needle, $offset, $length)`: number of
+ * non-overlapping occurrences of `$needle` in the selected slice. Reproduces
+ * PHP's argument checks (empty needle first, then offset, then length) and their
+ * exact fatal messages. */
+long long pxr_substr_count(const pxr_str *h, const pxr_str *n, long long offset,
+                           long long length, long long has_length) {
+    if (n->len == 0) {
+        fprintf(stderr,
+                "Fatal error: Uncaught ValueError: substr_count(): Argument #2 "
+                "($needle) must not be empty\n");
+        exit(255);
+    }
+    long long len = (long long)h->len;
+    if (offset < 0) {
+        offset += len;
+        if (offset < 0) {
+            fprintf(stderr,
+                    "Fatal error: Uncaught ValueError: substr_count(): Argument "
+                    "#3 ($offset) must be contained in argument #1 ($haystack)\n");
+            exit(255);
+        }
+    } else if (offset > len) {
+        fprintf(stderr,
+                "Fatal error: Uncaught ValueError: substr_count(): Argument #3 "
+                "($offset) must be contained in argument #1 ($haystack)\n");
+        exit(255);
+    }
+    if (!has_length) {
+        length = len - offset;
+    } else if (length < 0) {
+        length += len - offset;
+        if (length < 0) {
+            length = 0;
+        }
+    } else if (length > len - offset) {
+        fprintf(stderr,
+                "Fatal error: Uncaught ValueError: substr_count(): Argument #4 "
+                "($length) must be contained in argument #1 ($haystack)\n");
+        exit(255);
+    }
+    long long count = 0;
+    long long nlen = (long long)n->len;
+    long long stop = offset + length;
+    for (long long i = offset; i + nlen <= stop;) {
+        if (memcmp(h->data + i, n->data, (size_t)nlen) == 0) {
+            count++;
+            i += nlen;
+        } else {
+            i++;
+        }
+    }
+    return count;
+}

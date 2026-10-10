@@ -80,6 +80,23 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     // Array transforms (M2). Both deep-copy nested arrays (value semantics).
     ("pxr_array_values", "ptr", &["ptr"]),
     ("pxr_array_reverse", "ptr", &["ptr", "i64"]),
+    // More array builtins (M2). `array_merge`/`slice`/`pad`/`fill` deep-copy
+    // nested arrays; values cross as a type tag plus a 64-bit payload.
+    ("pxr_array_merge", "ptr", &["ptr", "ptr"]),
+    (
+        "pxr_array_slice",
+        "ptr",
+        &["ptr", "i64", "i64", "i64", "i64"],
+    ),
+    ("pxr_array_pad", "ptr", &["ptr", "i64", "i64", "i64"]),
+    ("pxr_array_fill", "ptr", &["i64", "i64", "i64", "i64"]),
+    // String builtins (M2): `str_pad`, `substr_count`.
+    ("pxr_str_pad", "ptr", &["ptr", "i64", "ptr", "i64"]),
+    (
+        "pxr_substr_count",
+        "i64",
+        &["ptr", "ptr", "i64", "i64", "i64"],
+    ),
 ];
 
 pub fn llty(ty: &Ty) -> &'static str {

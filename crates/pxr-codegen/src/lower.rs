@@ -1628,7 +1628,7 @@ impl Lowerer {
             }
             Callee::Builtin { kind, arg_tys } => {
                 let vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
-                self.lower_builtin(*kind, arg_tys, &vals, args.len())
+                self.lower_builtin(*kind, arg_tys, &vals, args.len(), ret)
             }
         }
     }
@@ -1645,7 +1645,14 @@ impl Lowerer {
         dst
     }
 
-    fn lower_builtin(&mut self, kind: Builtin, arg_tys: &[Ty], a: &[Value], argc: usize) -> Value {
+    fn lower_builtin(
+        &mut self,
+        kind: Builtin,
+        arg_tys: &[Ty],
+        a: &[Value],
+        argc: usize,
+        ret: &Ty,
+    ) -> Value {
         use Builtin::*;
         match kind {
             Strlen => self.rt_call("pxr_strlen", vec![a[0]], Ty::Int),
@@ -1756,6 +1763,97 @@ impl Lowerer {
                 };
                 let ret = arg_tys[0].clone();
                 self.rt_call("pxr_array_reverse", vec![a[0], flag], ret)
+            }
+            ArrayMerge => {
+                // Fold a variadic call into a chain of binary merges, starting
+                // from an empty array so that even one argument is reindexed.
+                let mut acc = self.array_new();
+                for i in 0..argc {
+                    acc = self.rt_call("pxr_array_merge", vec![acc, a[i]], ret.clone());
+                }
+                acc
+            }
+            ArraySlice => {
+                let offset = a[1];
+                let (length, has_length) = if argc >= 3 {
+                    (a[2], 1i64)
+                } else {
+                    (self.emit_const(Literal::Int(0)), 0)
+                };
+                let has_length = self.emit_const(Literal::Int(has_length));
+                let preserve = if argc >= 4 {
+                    self.cast(a[3], &Ty::Bool, &Ty::Int)
+                } else {
+                    self.emit_const(Literal::Int(0))
+                };
+                self.rt_call(
+                    "pxr_array_slice",
+                    vec![a[0], offset, length, has_length, preserve],
+                    ret.clone(),
+                )
+            }
+            ArrayPad => {
+                let elem = arg_tys[0].array_elem().cloned().unwrap_or(Ty::Null);
+                // The value may widen `int` -> `float` to match the elements.
+                let v = self.cast(a[2], &arg_tys[2], &elem);
+                let vtag = self.emit_const(Literal::Int(Self::tag_of(&elem)));
+                let vbits = self.encode_bits(v, &elem);
+                self.rt_call("pxr_array_pad", vec![a[0], a[1], vtag, vbits], ret.clone())
+            }
+            ArrayFill => {
+                let elem = arg_tys[2].clone();
+                let vtag = self.emit_const(Literal::Int(Self::tag_of(&elem)));
+                let vbits = self.encode_bits(a[2], &elem);
+                self.rt_call("pxr_array_fill", vec![a[0], a[1], vtag, vbits], ret.clone())
+            }
+            ArrayKeyExists => {
+                let (ktag, ki, ks) = match arg_tys[0] {
+                    Ty::Int => (
+                        self.emit_const(Literal::Int(1)),
+                        a[0],
+                        self.emit_const(Literal::Str(Vec::new())),
+                    ),
+                    Ty::String => (
+                        self.emit_const(Literal::Int(4)),
+                        self.emit_const(Literal::Int(0)),
+                        a[0],
+                    ),
+                    _ => unreachable!("key type is enforced by sema"),
+                };
+                let v = self.rt_call("pxr_array_has", vec![a[1], ktag, ki, ks], Ty::Int);
+                self.to_bool(v, &Ty::Int)
+            }
+            StrPad => {
+                let length = a[1];
+                let pad = if argc >= 3 {
+                    a[2]
+                } else {
+                    self.emit_const(Literal::Str(vec![b' ']))
+                };
+                let ty = if argc >= 4 {
+                    a[3]
+                } else {
+                    self.emit_const(Literal::Int(1))
+                };
+                self.rt_call("pxr_str_pad", vec![a[0], length, pad, ty], Ty::String)
+            }
+            SubstrCount => {
+                let offset = if argc >= 3 {
+                    a[2]
+                } else {
+                    self.emit_const(Literal::Int(0))
+                };
+                let (length, has_length) = if argc >= 4 {
+                    (a[3], 1i64)
+                } else {
+                    (self.emit_const(Literal::Int(0)), 0)
+                };
+                let has_length = self.emit_const(Literal::Int(has_length));
+                self.rt_call(
+                    "pxr_substr_count",
+                    vec![a[0], a[1], offset, length, has_length],
+                    Ty::Int,
+                )
             }
         }
     }

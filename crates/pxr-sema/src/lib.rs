@@ -68,6 +68,21 @@ pub enum Builtin {
     ArrayValues,
     /// `array_reverse($array[, $preserve_keys])`.
     ArrayReverse,
+    /// `array_merge($array, ...$arrays)` — later values win on string keys,
+    /// integer keys are renumbered; all arrays must share one element type.
+    ArrayMerge,
+    /// `array_slice($array, $offset[, $length[, $preserve_keys]])`.
+    ArraySlice,
+    /// `array_pad($array, $size, $value)`.
+    ArrayPad,
+    /// `array_fill($start, $count, $value)`.
+    ArrayFill,
+    /// `array_key_exists($key, $array)`.
+    ArrayKeyExists,
+    /// `str_pad($str, $length[, $pad[, $type]])`.
+    StrPad,
+    /// `substr_count($haystack, $needle[, $offset[, $length]])`.
+    SubstrCount,
 }
 
 impl Builtin {
@@ -99,6 +114,13 @@ impl Builtin {
             "str_split" => Builtin::StrSplit,
             "array_values" => Builtin::ArrayValues,
             "array_reverse" => Builtin::ArrayReverse,
+            "array_merge" => Builtin::ArrayMerge,
+            "array_slice" => Builtin::ArraySlice,
+            "array_pad" => Builtin::ArrayPad,
+            "array_fill" => Builtin::ArrayFill,
+            "array_key_exists" => Builtin::ArrayKeyExists,
+            "str_pad" => Builtin::StrPad,
+            "substr_count" => Builtin::SubstrCount,
             _ => return None,
         })
     }
@@ -131,6 +153,13 @@ impl Builtin {
             Builtin::StrSplit => "str_split",
             Builtin::ArrayValues => "array_values",
             Builtin::ArrayReverse => "array_reverse",
+            Builtin::ArrayMerge => "array_merge",
+            Builtin::ArraySlice => "array_slice",
+            Builtin::ArrayPad => "array_pad",
+            Builtin::ArrayFill => "array_fill",
+            Builtin::ArrayKeyExists => "array_key_exists",
+            Builtin::StrPad => "str_pad",
+            Builtin::SubstrCount => "substr_count",
         }
     }
 }
@@ -2222,6 +2251,168 @@ impl Analyzer {
                     return self.builtin_ty_err(name, "a `bool` flag", &atys[1], args[1].span());
                 }
                 atys[0].clone()
+            }
+            Builtin::ArrayMerge => {
+                if n < 1 {
+                    self.diags.emit(
+                        Diagnostic::error(format!("builtin `{name}` expects at least 1 argument"))
+                            .with_code("E0233")
+                            .with_span(span),
+                    );
+                    return None;
+                }
+                // All arrays must share one element type (an empty `[]` literal
+                // contributes `null`, which unifies with anything).
+                let mut elem: Option<Ty> = None;
+                for (i, t) in atys.iter().enumerate() {
+                    if !t.is_array() {
+                        return self.builtin_ty_err(name, "an array", t, args[i].span());
+                    }
+                    let e = t.array_elem().unwrap().clone();
+                    if e == Ty::Null {
+                        continue;
+                    }
+                    match &elem {
+                        None => elem = Some(e),
+                        Some(prev) if *prev == e => {}
+                        Some(prev) => {
+                            self.diags.emit(
+                                Diagnostic::error(format!(
+                                    "`{name}` requires arrays with the same element type, \
+                                     found `array<{prev}>` and `array<{e}>`"
+                                ))
+                                .with_code("E0253")
+                                .with_span(args[i].span()),
+                            );
+                            return None;
+                        }
+                    }
+                }
+                Ty::array(elem.unwrap_or(Ty::Null))
+            }
+            Builtin::ArraySlice => {
+                if !(2..=4).contains(&n) {
+                    return self.builtin_arity_err(name, 2, 4, n, span);
+                }
+                if !atys[0].is_array() {
+                    return self.builtin_ty_err(name, "an array", &atys[0], args[0].span());
+                }
+                if atys[1] != Ty::Int {
+                    return self.builtin_ty_err(name, "an `int` offset", &atys[1], args[1].span());
+                }
+                if n >= 3 && atys[2] != Ty::Int {
+                    return self.builtin_ty_err(name, "an `int` length", &atys[2], args[2].span());
+                }
+                if n >= 4 && atys[3] != Ty::Bool {
+                    return self.builtin_ty_err(name, "a `bool` flag", &atys[3], args[3].span());
+                }
+                atys[0].clone()
+            }
+            Builtin::ArrayPad => {
+                if n != 3 {
+                    return self.builtin_arity_err(name, 3, 3, n, span);
+                }
+                if !atys[0].is_array() {
+                    return self.builtin_ty_err(name, "an array", &atys[0], args[0].span());
+                }
+                if atys[1] != Ty::Int {
+                    return self.builtin_ty_err(name, "an `int` size", &atys[1], args[1].span());
+                }
+                let elem = atys[0].array_elem().unwrap().clone();
+                if !atys[2].assignable_to(&elem) {
+                    return self.builtin_ty_err(
+                        name,
+                        &format!("a value assignable to `{elem}`"),
+                        &atys[2],
+                        args[2].span(),
+                    );
+                }
+                Ty::array(elem)
+            }
+            Builtin::ArrayFill => {
+                if n != 3 {
+                    return self.builtin_arity_err(name, 3, 3, n, span);
+                }
+                if atys[0] != Ty::Int {
+                    return self.builtin_ty_err(
+                        name,
+                        "an `int` start index",
+                        &atys[0],
+                        args[0].span(),
+                    );
+                }
+                if atys[1] != Ty::Int {
+                    return self.builtin_ty_err(name, "an `int` count", &atys[1], args[1].span());
+                }
+                Ty::array(atys[2].clone())
+            }
+            Builtin::ArrayKeyExists => {
+                if n != 2 {
+                    return self.builtin_arity_err(name, 2, 2, n, span);
+                }
+                if atys[0] != Ty::Int && atys[0] != Ty::String {
+                    return self.builtin_ty_err(
+                        name,
+                        "an `int` or `string` key",
+                        &atys[0],
+                        args[0].span(),
+                    );
+                }
+                if !atys[1].is_array() {
+                    return self.builtin_ty_err(name, "an array", &atys[1], args[1].span());
+                }
+                Ty::Bool
+            }
+            Builtin::StrPad => {
+                if !(2..=4).contains(&n) {
+                    return self.builtin_arity_err(name, 2, 4, n, span);
+                }
+                if atys[0] != Ty::String {
+                    return self.builtin_ty_err(name, "a `string`", &atys[0], args[0].span());
+                }
+                if atys[1] != Ty::Int {
+                    return self.builtin_ty_err(name, "an `int` length", &atys[1], args[1].span());
+                }
+                if n >= 3 && atys[2] != Ty::String {
+                    return self.builtin_ty_err(name, "a `string` pad", &atys[2], args[2].span());
+                }
+                if n >= 4 && atys[3] != Ty::Int {
+                    return self.builtin_ty_err(
+                        name,
+                        "an `int` pad type",
+                        &atys[3],
+                        args[3].span(),
+                    );
+                }
+                Ty::String
+            }
+            Builtin::SubstrCount => {
+                if !(2..=4).contains(&n) {
+                    return self.builtin_arity_err(name, 2, 4, n, span);
+                }
+                if atys[0] != Ty::String {
+                    return self.builtin_ty_err(
+                        name,
+                        "a `string` haystack",
+                        &atys[0],
+                        args[0].span(),
+                    );
+                }
+                if atys[1] != Ty::String {
+                    return self.builtin_ty_err(
+                        name,
+                        "a `string` needle",
+                        &atys[1],
+                        args[1].span(),
+                    );
+                }
+                if n >= 3 && atys[2] != Ty::Int {
+                    return self.builtin_ty_err(name, "an `int` offset", &atys[2], args[2].span());
+                }
+                if n >= 4 && atys[3] != Ty::Int {
+                    return self.builtin_ty_err(name, "an `int` length", &atys[3], args[3].span());
+                }
+                Ty::Int
             }
         };
 

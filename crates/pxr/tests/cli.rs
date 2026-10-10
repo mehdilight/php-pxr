@@ -780,6 +780,211 @@ echo (strlen("\x00\x01\xFE\xFF") === 4 ? "len4ok" : "len4bad") . "\n";
 }
 
 #[test]
+fn array_merge_matches_php() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let src = r#"<?php
+$m = array_merge([1,2,3],[4,5]);
+echo implode(",", $m) . "\n";
+$m2 = array_merge(["a" => 1, "b" => 2], ["b" => 9, "c" => 3]);
+echo $m2["a"] . $m2["b"] . $m2["c"] . count($m2) . "\n";
+$m3 = array_merge([5 => "p"]);
+echo $m3[0] . count($m3) . "\n";
+$m4 = array_merge([5 => "p", "a" => "q"]);
+echo $m4[0] . $m4["a"] . "\n";
+$m5 = array_merge([1,2], []);
+echo implode(",", $m5) . "\n";
+$a = [1, 2];
+$b = array_merge($a, [3]);
+$b[0] = 99;
+echo $a[0] . "," . $b[0] . "\n";
+"#;
+    let f = temp_php("m23merge", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "1,2,3,4,5\n1933\np1\npq\n1,2\n1,99\n");
+}
+
+#[test]
+fn array_slice_pad_fill_match_php() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let src = r#"<?php
+$s1 = array_slice([1,2,3,4,5], 1);
+echo implode(",", $s1) . "\n";
+$s2 = array_slice([1,2,3,4,5], 1, 2);
+echo implode(",", $s2) . "\n";
+$s3 = array_slice([1,2,3,4,5], -2);
+echo implode(",", $s3) . "\n";
+$s4 = array_slice([1,2,3,4,5], 1, -1);
+echo implode(",", $s4) . "\n";
+$s5 = array_slice([1,2,3], 5);
+echo count($s5) . "\n";
+$s6 = array_slice(["a" => 1, "b" => 2, "c" => 3], 1);
+echo $s6["b"] . $s6["c"] . count($s6) . "\n";
+$s7 = array_slice([1,2,3,4,5], 1, 2, true);
+echo $s7[1] . $s7[2] . "\n";
+$p1 = array_pad([1,2,3], 5, 0);
+echo implode(",", $p1) . "\n";
+$p2 = array_pad([1,2,3], -5, 0);
+echo implode(",", $p2) . "\n";
+$p3 = array_pad([1,2,3], 2, 0);
+echo implode(",", $p3) . "\n";
+$p4 = array_pad([1.5], 3, 0);
+echo implode(",", $p4) . "\n";
+$f1 = array_fill(0, 3, "x");
+echo implode(",", $f1) . "\n";
+$f2 = array_fill(5, 2, 7);
+echo $f2[5] . $f2[6] . "\n";
+$f3 = array_fill(-2, 3, "z");
+echo $f3[-2] . $f3[-1] . $f3[0] . "\n";
+$f4 = array_fill(3, 0, "q");
+echo count($f4) . "\n";
+$k = [1, 2, 3];
+echo (array_key_exists(0, $k) ? "1" : "0");
+echo (array_key_exists(3, $k) ? "1" : "0");
+echo (array_key_exists("1", $k) ? "1" : "0") . "\n";
+$sk = ["a" => 1];
+echo (array_key_exists("a", $sk) ? "1" : "0");
+echo (array_key_exists("b", $sk) ? "1" : "0") . "\n";
+"#;
+    let f = temp_php("m23slice", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "2,3,4,5\n2,3\n4,5\n2,3,4\n0\n232\n23\n\
+         1,2,3,0,0\n0,0,1,2,3\n1,2,3\n1.5,0,0\nx,x,x\n77\nzzz\n0\n101\n10\n"
+    );
+}
+
+#[test]
+fn str_pad_and_substr_count_match_php() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let src = r#"<?php
+echo "[" . str_pad("abc", 5) . "]\n";
+echo "[" . str_pad("abc", 5, "*") . "]\n";
+echo "[" . str_pad("abc", 5, "*", 0) . "]\n";
+echo "[" . str_pad("abc", 6, "*", 2) . "]\n";
+echo "[" . str_pad("a", 4, "xy", 2) . "]\n";
+echo "[" . str_pad("abc", 2) . "]\n";
+echo "[" . str_pad("", 4, "*") . "]\n";
+echo substr_count("hello world", "o") . "\n";
+echo substr_count("aaaa", "aa") . "\n";
+echo substr_count("hello", "l", 3) . "\n";
+echo substr_count("hello", "l", 0, 3) . "\n";
+echo substr_count("hello", "l", 0, -2) . "\n";
+echo substr_count("hello", "l", -2) . "\n";
+echo substr_count("abcabc", "abc") . "\n";
+echo substr_count("ababab", "aba") . "\n";
+echo substr_count("hello", "xyz") . "\n";
+echo substr_count("hello", "l", 5) . "\n";
+"#;
+    let f = temp_php("m23pad", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "[abc  ]\n[abc**]\n[**abc]\n[*abc**]\n[xaxy]\n[abc]\n[****]\n\
+         2\n2\n1\n1\n1\n1\n2\n1\n0\n0\n"
+    );
+}
+
+#[test]
+fn array_fill_negative_count_is_fatal() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let f = temp_php(
+        "afillneg",
+        "<?php $x = array_fill(0, -1, 1); echo count($x);",
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 255, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("array_fill(): Argument #2 ($count) must be greater than or equal to 0"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn str_pad_empty_pad_is_fatal() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let f = temp_php("strpadempty", r#"<?php echo str_pad("abc", 5, "");"#);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 255, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("str_pad(): Argument #3 ($pad_string) must not be empty"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn substr_count_argument_errors_are_fatal() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    // An empty needle is checked before the offset, matching PHP.
+    let f = temp_php("scempty", r#"<?php echo substr_count("abc", "", 100);"#);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 255, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("substr_count(): Argument #2 ($needle) must not be empty"),
+        "stderr: {}",
+        r.stderr
+    );
+
+    let f = temp_php("scoff", r#"<?php echo substr_count("hello", "l", 100);"#);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 255, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains(
+            "substr_count(): Argument #3 ($offset) must be contained in argument #1 ($haystack)"
+        ),
+        "stderr: {}",
+        r.stderr
+    );
+
+    let f = temp_php("sclen", r#"<?php echo substr_count("hello", "l", 0, 100);"#);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 255, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains(
+            "substr_count(): Argument #4 ($length) must be contained in argument #1 ($haystack)"
+        ),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn array_merge_mixed_element_types_rejected() {
+    // PXR arrays are homogeneous: merging an `array<int>` with an `array<float>`
+    // (or `array<string>`) is a loud compile error, not a silent mismatch.
+    let f = temp_php("m23mix", "<?php $x = array_merge([1,2], [1.5]);");
+    let r = run_ok(&["check", f.to_str().unwrap()]);
+    assert_ne!(r.code, 0);
+    assert!(r.stderr.contains("E0253"), "stderr: {}", r.stderr);
+}
+
+#[test]
 fn control_flow_breadth() {
     if !have_cc() {
         eprintln!("skipping: no C compiler");

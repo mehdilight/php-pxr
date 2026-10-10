@@ -179,6 +179,43 @@ concatenation are byte-exact — matching PHP.
   `str_split` fatal, raw bytes) and +1 lexer test — 36 CLI tests total;
   `examples/compat.php` extended (still byte‑identical to PHP).
 
+**Delivered (M2.array builtins & `str_pad`/`substr_count` slice).**
+
+* `array_merge` — variadic; integer keys are renumbered in order, a later string
+  key overwrites an earlier one in place. Folds into a chain of binary runtime
+  merges starting from an empty array, so even a single argument is reindexed.
+  All arguments must share one element type (`[]`/`null` unifies with anything);
+  a mixed `array<int>`/`array<float>`/`array<string>` merge is a loud `E0253`
+  error (PXR arrays are homogeneous — PHP's mixed arrays are simply not a PXR
+  value).
+* `array_slice($a, $offset[, $length[, $preserve_keys]])` — exact PHP offset and
+  length arithmetic (negative offsets count from the end, a negative length
+  stops that many before the end, out-of-range clamps). String keys are always
+  kept; integer keys are renumbered unless `$preserve_keys`.
+* `array_pad($a, $size, $value)` — pad to `|$size|`; prepends when negative,
+  appends when positive. With no padding needed PHP returns the array unchanged
+  (keys preserved); otherwise integer keys are renumbered. An `int` value widens
+  to a `float` element type.
+* `array_fill($start, $count, $value)` — `$count` copies under integer keys
+  `$start .. $start+$count-1` (negative start keys are preserved). `count < 0` is
+  a fatal `ValueError`.
+* `array_key_exists($key, $array)` — `int`/`string` keys only (a float/bool key is
+  a loud type error); reuses the runtime key lookup behind `??`, so canonical
+  integer strings (`"1"`) match integer keys.
+* `str_pad($s, $length[, $pad[, $type]])` — `0`/`1`/`2` = left/right/both
+  (`STR_PAD_*`; PXR has no constants yet, so pass the integer, default `1`).
+  Each side cycles the pad string from its start. Empty pad string or an invalid
+  pad type is a fatal `ValueError`.
+* `substr_count($haystack, $needle[, $offset[, $length]])` — non-overlapping
+  occurrence count; reproduces PHP's exact argument checks **and their order**
+  (empty needle first, then offset, then length) and their fatal messages.
+* All the new array builtins deep-copy nested arrays (PHP value semantics). The
+  `Callee::Builtin` lowering now receives the resolved return type, so
+  `array_merge`'s unified element type and `array_pad`'s element type are exact.
+* Tests: +7 CLI tests (merge, slice/pad/fill/key-exists, `str_pad`/`substr_count`,
+  three fatal cases, mixed-element rejection) — 43 CLI tests total;
+  `examples/compat.php` extended (still byte‑identical to PHP 8.4).
+
 **Acceptance.** A string‑heavy program (e.g. word count) compiles and matches PHP —
 the word‑count block at the end of `examples/compat.php` does exactly this. ✅
 

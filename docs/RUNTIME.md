@@ -110,6 +110,23 @@ void    *pxr_str_split(const pxr_str *s, long long length);
 void    *pxr_array_values(void *a);                   /* reindexed, keys dropped */
 void    *pxr_array_reverse(void *a, long long preserve_keys);
        /* int keys renumbered unless preserve_keys; deep-copies nested arrays */
+void    *pxr_array_merge(void *a, void *b);           /* b appended onto a */
+       /* int keys renumbered, string keys overwrite in place, deep copies */
+void    *pxr_array_slice(void *a, long long offset, long long length,
+                         long long has_length, long long preserve_keys);
+       /* has_length==0 => to the end; string keys always kept */
+void    *pxr_array_pad(void *a, long long size, long long vtag, long long vbits);
+       /* pad to |size|; prepend if negative; no-op keeps keys */
+void    *pxr_array_fill(long long start, long long count,
+                        long long vtag, long long vbits);
+       /* count<0 -> fatal ValueError; keys start..start+count-1 */
+pxr_str *pxr_str_pad(const pxr_str *s, long long length, const pxr_str *pad,
+                     long long type);                /* 0/1/2 = left/right/both */
+       /* empty pad or bad type -> fatal ValueError */
+long long pxr_substr_count(const pxr_str *h, const pxr_str *n,
+                           long long offset, long long length,
+                           long long has_length);    /* non-overlapping count */
+       /* empty needle first, then offset, then length -> fatal ValueError */
 long long pxr_array_val_tag_at(void *a, long long i);    /* element tag by index */
 
 /* math */

@@ -209,3 +209,45 @@ echo "revp=" . $revp[2] . $revp[0] . "\n";
 
 // High `\xHH` escapes are raw bytes, not UTF-8 replacement characters.
 echo "byte=" . strlen("\xA9\xC3") . " " . (strrev("\xA9\xC3") === "\xC3\xA9" ? "ok" : "bad") . "\n";
+
+// --- milestone 2: array merge/slice/pad/fill, str_pad, substr_count ---------
+
+$merged = array_merge([1, 2, 3], [4, 5]);
+echo "merge=" . implode(",", $merged) . " n=" . count($merged) . "\n";
+$mkeys = array_merge(["a" => 1, "b" => 2], ["b" => 9, "c" => 3]);
+echo "mergek=" . $mkeys["a"] . $mkeys["b"] . $mkeys["c"] . " n=" . count($mkeys) . "\n";
+$mre = array_merge([5 => "p", 9 => "q"]);
+echo "mergere=" . $mre[0] . $mre[1] . "\n";
+
+$slice1 = array_slice([1, 2, 3, 4, 5], 1);
+echo "slice=" . implode(",", $slice1) . "\n";
+$slice2 = array_slice([1, 2, 3, 4, 5], -2);
+echo "sliceNeg=" . implode(",", $slice2) . "\n";
+$slice3 = array_slice([1, 2, 3, 4, 5], 1, -1);
+echo "sliceBoth=" . implode(",", $slice3) . "\n";
+$slice4 = array_slice([1, 2, 3, 4, 5], 1, 2, true);
+echo "sliceKeep=" . $slice4[1] . $slice4[2] . "\n";
+
+$pad1 = array_pad([1, 2, 3], 5, 0);
+echo "pad=" . implode(",", $pad1) . "\n";
+$pad2 = array_pad([1, 2, 3], -5, 0);
+echo "padNeg=" . implode(",", $pad2) . "\n";
+
+$fill1 = array_fill(0, 3, "x");
+echo "fill=" . implode(",", $fill1) . "\n";
+$fill2 = array_fill(-2, 2, 7);
+echo "fillNeg=" . $fill2[-2] . $fill2[-1] . "\n";
+
+$hay = [10, 20, 30];
+echo "ake=" . (array_key_exists(1, $hay) ? "1" : "0") .
+    (array_key_exists(3, $hay) ? "1" : "0") .
+    (array_key_exists("2", $hay) ? "1" : "0") . "\n";
+
+echo "spad=" . "[" . str_pad("abc", 5) . "]" .
+    "[" . str_pad("abc", 5, "*") . "]" .
+    "[" . str_pad("abc", 6, "12", 2) . "]\n";
+
+echo "scount=" . substr_count("hello world", "o") . "," .
+    substr_count("aaaa", "aa") . "," .
+    substr_count("hello", "l", -2) . "," .
+    substr_count("hello", "l", 0, -2) . "\n";

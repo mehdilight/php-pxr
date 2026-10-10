@@ -32,8 +32,8 @@ and whose output the test suite asserts is byte‑identical.
 | **Array value semantics** | assignment, function arguments, returns and `foreach` all operate on copies (copy‑on‑write, realised as an eager deep copy) |
 | **Array key unification** | a canonical decimal‑integer string key *is* the integer key: `$a["1"]` ≡ `$a[1]` (`"01"`, `"1.5"`, `"+1"`, `" 1"` stay strings) |
 | `count`, `strlen`, `intval`, `floatval`, `strval`, `abs` | |
-| **String builtins** `strtoupper`, `strtolower`, `trim`/`ltrim`/`rtrim`, `substr`, `str_repeat`, `str_replace`, `implode`, `explode`, `str_contains`, `str_starts_with`, `str_ends_with`, `strrev`, `ucfirst`, `lcfirst`, `ucwords`, `str_split` | byte-exact vs PHP, embedded NULs safe; see notes below |
-| **Array transforms** `array_values`, `array_reverse` | byte-exact vs PHP; deep-copy nested arrays (value semantics) |
+| **String builtins** `strtoupper`, `strtolower`, `trim`/`ltrim`/`rtrim`, `substr`, `str_repeat`, `str_replace`, `implode`, `explode`, `str_contains`, `str_starts_with`, `str_ends_with`, `strrev`, `ucfirst`, `lcfirst`, `ucwords`, `str_split`, `str_pad`, `substr_count` | byte-exact vs PHP, embedded NULs safe; see notes below |
+| **Array transforms** `array_values`, `array_reverse`, `array_merge`, `array_slice`, `array_pad`, `array_fill`, `array_key_exists` | byte-exact vs PHP; deep-copy nested arrays (value semantics); see notes below |
 | Division `/` is always `float`; `%` is integer remainder | a zero divisor is a fatal `DivisionByZeroError` (exit 255), exactly as in PHP — not IEEE infinity |
 | **Float stringification** (`echo`, `.`, `strval`) | PHP's `zend_gcvt` with precision 14: `0.1+0.2` → `"0.3"`, `1e15` → `"1.0E+15"`, `1e-5` → `"1.0E-5"`, `1.0` → `"1"`, `-0.0` → `"-0"`, `INF`/`-INF`/`NAN` | |
 | `echo true` → `1`, `echo false` → *(nothing)*; `.` on `bool` → `"1"`/`""` | |
@@ -72,6 +72,7 @@ behavioural divergence.
 | Nested assignment `$a[0][1] = x` | **Error** `E0248` |
 | `**` (exponentiation) | **Error** `E0257` |
 | `+` with numeric strings (`"1" + 2`) | **Error** — convert with `intval()` / `floatval()` |
+| Heterogeneous arrays (mixed value types) | **Error** — PXR arrays are homogeneous (`array<T>`); e.g. `array_merge` of an `array<int>` and an `array<string>` is `E0253` |
 | Wrong argument type (non‑strict mode coercion) | **Error** `E0231` |
 | Undefined variable / function | **Error** `E0220` / `E0232` |
 | Leading‑zero octal literal (`0755`) | **Warning** `W0001`, read as decimal |
@@ -140,6 +141,31 @@ reindexes; `array_reverse` reverses order, renumbering integer keys and keeping
 string keys (or keeping all keys when the second argument is `true`). Both
 deep-copy nested arrays so value semantics hold. All of these are verified
 byte‑for‑byte against PHP 8.4, including embedded-NUL cases.
+
+**Array builtins.** `array_merge` renumbers integer keys in order and lets a
+later string key overwrite an earlier one in place; `array_slice` reproduces
+PHP's offset/length arithmetic (negative offsets count from the end, a negative
+length stops that many before the end, out-of-range clamps) and keeps string keys
+while renumbering integer keys unless `$preserve_keys` is `true`. `array_pad`
+pads to `|$size|` (prepend when negative) and, when no padding is needed, returns
+the array unchanged with its keys; `array_fill` uses keys
+`$start .. $start+$count-1` and a negative count raises PHP's fatal `ValueError`
+(exit 255). `array_key_exists` accepts `int`/`string` keys and unifies canonical
+integer strings, so `array_key_exists("1", $a)` matches the integer key `1`.
+`str_pad`'s pad type is the integer `STR_PAD_*` value (`0`/`1`/`2` =
+left/right/both, default `1`); each padded side cycles the pad string from its
+start, and an empty pad string or an invalid pad type raises PHP's fatal
+`ValueError`. `substr_count` counts non-overlapping occurrences and reproduces
+PHP's argument checks *in their exact order* (empty needle, then offset, then
+length) and their fatal messages. All of these are verified byte-for-byte against
+PHP 8.4.
+
+**Homogeneous arrays.** PXR arrays have a single static element type, so PHP's
+*heterogeneous* arrays have no PXR representation. `array_merge` of two arrays
+with different element types (`array<int>` with `array<float>` or `array<string>`,
+etc.) is therefore a loud `E0253` error, as is `array_pad` with a value that is
+not assignable to the element type. An empty literal `[]` (element type `null`)
+unifies with any element type. See the "Not implemented yet" table.
 
 **Missing array keys.** PHP warns and yields `null`. PXR has no `null` yet, so a
 direct read yields the zero value; `??` / `??=` detect absence correctly.
