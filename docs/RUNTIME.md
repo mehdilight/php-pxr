@@ -15,7 +15,7 @@ operations the backend emits.
 | `int` | `long long` (int64) | `i64` |
 | `float` | `double` | `double` |
 | `bool` | `int` in the ABI | `i1` (zero‑extended to `i32`/`i64` at calls) |
-| `string` | `const char *` (NUL‑terminated) | `ptr` |
+| `string` | `pxr_str *` (length‑prefixed, NUL/binary‑safe) | `ptr` |
 | `array<T>` | opaque `void *` | `ptr` |
 
 `bool` is `i1` inside generated code and is passed to the runtime as an `i32`
@@ -28,7 +28,8 @@ Strings and arrays are immutable‑to‑the‑runtime. Operations that produce a
 from a **bump arena**:
 
 * `pxr_arena_alloc(n)` — 8‑byte aligned allocation from the current page.
-* `pxr_str_alloc(len)` — NUL‑terminated string allocation.
+* `pxr_str_alloc(len)` — allocates a `pxr_str` header (`{ size_t len;
+  char data[]; }`) plus `len + 1` bytes; `data` is zero‑terminated.
 
 The arena is a linked list of pages (64 KiB each, doubling only for oversized
 requests), so growing it never invalidates pointers handed out earlier. This was
@@ -42,42 +43,45 @@ ownership/borrow checking are roadmap items. Until then, long‑running programs
 that build strings or arrays in a loop can grow memory; this is documented rather
 than hidden.
 
-Strings are NUL‑terminated, so an embedded `\0` byte truncates the value.
-Embedded‑NUL‑safe strings (length + pointer) are a roadmap item.
+A string is a `pxr_str *`: `len` bytes of `data`, followed by a NUL terminator
+that is not part of the value. Embedded `\0` bytes are first‑class, matching PHP
+(`strlen("a\0b")` is 3), and the ABI stays a single `ptr` — only the allocation
+layout differs from the former bare `const char *`. `data` sits at offset 8,
+mirrored by the `{ i64, [N x i8] }` LLVM constant pool entries the backend emits.
 
 ## ABI
 
 ```c
 /* arena */
-void  *pxr_arena_alloc(size_t n);
-char  *pxr_str_alloc(size_t len);
+void    *pxr_arena_alloc(size_t n);
+pxr_str *pxr_str_alloc(size_t len);  /* { len, data[..len] } + NUL terminator */
 
 /* printing (no separator, matching PHP `echo`) */
 void   pxr_print_i64(long long v);
 void   pxr_print_f64(double v);
-void   pxr_print_str(const char *s);
+void   pxr_print_str(const pxr_str *s);   /* fwrite of s->len bytes */
 void   pxr_print_bool(int v);        /* 1 -> "1", 0 -> "" */
 
-/* strings */
-char  *pxr_str_concat(const char *a, const char *b);
-char  *pxr_i64_to_str(long long v);
-char  *pxr_f64_to_str(double v);   /* PHP zend_gcvt, precision 14 (see below) */
-char  *pxr_bool_to_str(int v);
-long long pxr_strlen(const char *s);
+/* strings — every `pxr_str *` below is NUL/binary-safe */
+pxr_str *pxr_str_concat(const pxr_str *a, const pxr_str *b);
+pxr_str *pxr_i64_to_str(long long v);
+pxr_str *pxr_f64_to_str(double v);   /* PHP zend_gcvt, precision 14 (see below) */
+pxr_str *pxr_bool_to_str(int v);
+long long pxr_strlen(const pxr_str *s);
 
 /* string -> number (leading numeric prefix, like PHP) */
-long long pxr_str_to_i64(const char *s);
-double    pxr_str_to_f64(const char *s);
+long long pxr_str_to_i64(const pxr_str *s);
+double    pxr_str_to_f64(const pxr_str *s);
 
 /* truthiness (PHP rules; NaN and "0" handled) */
 int    pxr_truthy_i64(long long v);
 int    pxr_truthy_f64(double v);
-int    pxr_truthy_str(const char *s);
+int    pxr_truthy_str(const pxr_str *s);
 
 /* string comparison */
-int    pxr_str_eq(const char *a, const char *b);   /* 1 if equal (bytes) */
-int    pxr_str_cmp(const char *a, const char *b);  /* strcmp */
-long long pxr_str_cmp_loose(const char *a, const char *b);
+int    pxr_str_eq(const pxr_str *a, const pxr_str *b);   /* 1 if equal (bytes) */
+int    pxr_str_cmp(const pxr_str *a, const pxr_str *b);  /* byte-wise order */
+long long pxr_str_cmp_loose(const pxr_str *a, const pxr_str *b);
        /* PHP `==`/ordering/`<=>`: -1/0/1, numeric-aware for numeric strings */
 
 /* math */

@@ -140,3 +140,9 @@ switch ($sw) {
 // PHP float stringification (zend_gcvt, precision 14).
 echo "floats=" . 1e14 . "," . 1e16 . "," . 1e-5 . "," . (0.1 + 0.2) . "," .
     (1.0 / 3.0) . "," . 3.14159265358979 . "," . -0.0 . "\n";
+
+// PHP strings are byte strings: embedded NULs survive length, equality and
+// concatenation.
+$nul = "a\0b";
+echo "nul=" . strlen($nul) . "," . ($nul === "a\0b" ? "eq" : "ne") . "," .
+    strlen($nul . "c") . "\n";

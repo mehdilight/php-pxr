@@ -7,7 +7,7 @@
  *
  * Design notes (see docs/RUNTIME.md):
  *   - Values are unboxed: int -> int64_t, float -> double, bool -> i1/_Bool,
- *     string -> `const char *` (NUL-terminated UTF-8/byte string).
+ *     string -> `pxr_str *` (length-prefixed byte string; NUL- and binary-safe).
  *   - String-producing operations allocate from a process-wide bump arena.
  *     There is no per-value free yet; owned strings / reference counting are a
  *     roadmap item. The arena is released by the operating system at exit.
@@ -63,9 +63,25 @@ void *pxr_arena_alloc(size_t n) {
     return p;
 }
 
-char *pxr_str_alloc(size_t len) {
-    char *p = (char *)pxr_arena_alloc(len + 1);
-    p[len] = '\0';
+/*
+ * A length-prefixed byte string, matching PHP's byte-string semantics:
+ * `len` is the number of bytes, and `data` is exactly `len` bytes followed by a
+ * NUL terminator that is *not* part of the string. Embedded NULs are therefore
+ * representable (`strlen("a\0b") == 3`), unlike a bare `char *`.
+ *
+ * The ABI stays a single pointer (like the old `char *`), so the LLVM
+ * declarations and codegen call sites are unchanged; only the allocation
+ * layout differs. `data` sits at offset 8 (after `size_t len`).
+ */
+typedef struct {
+    size_t len;
+    char data[];
+} pxr_str;
+
+pxr_str *pxr_str_alloc(size_t len) {
+    pxr_str *p = (pxr_str *)pxr_arena_alloc(sizeof(pxr_str) + len + 1);
+    p->len = len;
+    p->data[len] = '\0';
     return p;
 }
 
@@ -181,8 +197,10 @@ void pxr_print_f64(double v) {
     fputs(buf, stdout);
 }
 
-void pxr_print_str(const char *s) {
-    fputs(s ? s : "", stdout);
+void pxr_print_str(const pxr_str *s) {
+    if (s && s->len) {
+        fwrite(s->data, 1, s->len, stdout);
+    }
 }
 
 /* bool prints as "1" for true and "" for false, matching PHP. */
@@ -194,65 +212,67 @@ void pxr_print_bool(int v) {
 
 /* ---------------------------------------------------------------- strings */
 
-char *pxr_str_concat(const char *a, const char *b) {
-    if (!a) a = "";
-    if (!b) b = "";
-    size_t la = strlen(a);
-    size_t lb = strlen(b);
-    char *out = pxr_str_alloc(la + lb);
-    memcpy(out, a, la);
-    memcpy(out + la, b, lb);
-    return out;
-}
-
-char *pxr_i64_to_str(long long v) {
-    char buf[32];
-    int n = snprintf(buf, sizeof buf, "%lld", v);
-    char *out = pxr_str_alloc((size_t)n);
-    memcpy(out, buf, (size_t)n);
-    return out;
-}
-
-char *pxr_f64_to_str(double v) {
-    char buf[48];
-    pxr_gcvt(v, buf);
-    size_t n = strlen(buf);
-    char *out = pxr_str_alloc(n);
-    memcpy(out, buf, n);
-    return out;
-}
-
-char *pxr_bool_to_str(int v) {
-    char *out = pxr_str_alloc(v ? 1u : 0u);
-    if (v) {
-        out[0] = '1';
+pxr_str *pxr_str_concat(const pxr_str *a, const pxr_str *b) {
+    size_t la = a ? a->len : 0;
+    size_t lb = b ? b->len : 0;
+    pxr_str *out = pxr_str_alloc(la + lb);
+    if (a) {
+        memcpy(out->data, a->data, la);
+    }
+    if (b) {
+        memcpy(out->data + la, b->data, lb);
     }
     return out;
 }
 
-long long pxr_strlen(const char *s) {
-    return s ? (long long)strlen(s) : 0;
+pxr_str *pxr_i64_to_str(long long v) {
+    char buf[32];
+    int n = snprintf(buf, sizeof buf, "%lld", v);
+    pxr_str *out = pxr_str_alloc((size_t)n);
+    memcpy(out->data, buf, (size_t)n);
+    return out;
+}
+
+pxr_str *pxr_f64_to_str(double v) {
+    char buf[48];
+    pxr_gcvt(v, buf);
+    size_t n = strlen(buf);
+    pxr_str *out = pxr_str_alloc(n);
+    memcpy(out->data, buf, n);
+    return out;
+}
+
+pxr_str *pxr_bool_to_str(int v) {
+    pxr_str *out = pxr_str_alloc(v ? 1u : 0u);
+    if (v) {
+        out->data[0] = '1';
+    }
+    return out;
+}
+
+long long pxr_strlen(const pxr_str *s) {
+    return s ? (long long)s->len : 0;
 }
 
 /* PHP-like numeric string coercion: read the leading numeric prefix. */
-long long pxr_str_to_i64(const char *s) {
+long long pxr_str_to_i64(const pxr_str *s) {
     if (!s) return 0;
     char *end = NULL;
-    long long v = strtoll(s, &end, 10);
-    if (end == s) {
+    long long v = strtoll(s->data, &end, 10);
+    if (end == s->data) {
         /* Fall back to a float prefix, e.g. "3.9abc" -> 3. */
-        double d = strtod(s, &end);
-        if (end == s) return 0;
+        double d = strtod(s->data, &end);
+        if (end == s->data) return 0;
         return (long long)d;
     }
     return v;
 }
 
-double pxr_str_to_f64(const char *s) {
+double pxr_str_to_f64(const pxr_str *s) {
     if (!s) return 0.0;
     char *end = NULL;
-    double v = strtod(s, &end);
-    if (end == s) return 0.0;
+    double v = strtod(s->data, &end);
+    if (end == s->data) return 0.0;
     return v;
 }
 
@@ -267,16 +287,36 @@ int pxr_truthy_f64(double v) {
     return v != 0.0;
 }
 
-int pxr_truthy_str(const char *s) {
-    return s != NULL && s[0] != '\0' && !(s[0] == '0' && s[1] == '\0');
+int pxr_truthy_str(const pxr_str *s) {
+    if (!s || s->len == 0) {
+        return 0;
+    }
+    /* PHP: only "" and "0" are falsy. */
+    return !(s->len == 1 && s->data[0] == '0');
 }
 
-int pxr_str_eq(const char *a, const char *b) {
-    return strcmp(a ? a : "", b ? b : "") == 0;
+int pxr_str_eq(const pxr_str *a, const pxr_str *b) {
+    size_t la = a ? a->len : 0;
+    size_t lb = b ? b->len : 0;
+    if (la != lb) {
+        return 0;
+    }
+    return la == 0 || memcmp(a->data, b->data, la) == 0;
 }
 
-int pxr_str_cmp(const char *a, const char *b) {
-    return strcmp(a ? a : "", b ? b : "");
+/* Byte-wise comparison (PHP's rule for non-numeric strings): compare the
+ * common prefix, then the shorter string sorts first. */
+int pxr_str_cmp(const pxr_str *a, const pxr_str *b) {
+    size_t la = a ? a->len : 0;
+    size_t lb = b ? b->len : 0;
+    size_t n = la < lb ? la : lb;
+    if (n) {
+        int c = memcmp(a->data, b->data, n);
+        if (c != 0) {
+            return c < 0 ? -1 : 1;
+        }
+    }
+    return la < lb ? -1 : (la > lb ? 1 : 0);
 }
 
 static int pxr_is_space(int c) {
@@ -288,30 +328,33 @@ static int pxr_is_space(int c) {
  * PHP's `is_numeric_string`: the whole string (surrounding whitespace allowed)
  * must be a decimal integer or float. Hex, `inf`/`nan` and `_` separators are
  * excluded. `*is_int` distinguishes an in-range integer string from a float
- * (an out-of-range integer string is treated as a float, as in PHP).
+ * (an out-of-range integer string is treated as a float, as in PHP). The scan
+ * is bounded by the string's length, so embedded NULs terminate it exactly as
+ * they do for PHP.
  */
-static int pxr_scan_numeric(const char *s, int *is_int, long long *iv,
+static int pxr_scan_numeric(const pxr_str *s, int *is_int, long long *iv,
                             double *dv) {
     if (!s) {
         return 0;
     }
-    const char *p = s;
-    while (pxr_is_space((unsigned char)*p)) {
+    const char *p = s->data;
+    const char *endp = s->data + s->len;
+    while (p < endp && pxr_is_space((unsigned char)*p)) {
         p++;
     }
     const char *start = p;
-    if (*p == '+' || *p == '-') {
+    if (p < endp && (*p == '+' || *p == '-')) {
         p++;
     }
     int digits = 0, dot = 0, exp = 0;
-    while (*p >= '0' && *p <= '9') {
+    while (p < endp && *p >= '0' && *p <= '9') {
         p++;
         digits++;
     }
-    if (*p == '.') {
+    if (p < endp && *p == '.') {
         dot = 1;
         p++;
-        while (*p >= '0' && *p <= '9') {
+        while (p < endp && *p >= '0' && *p <= '9') {
             p++;
             digits++;
         }
@@ -319,14 +362,14 @@ static int pxr_scan_numeric(const char *s, int *is_int, long long *iv,
     if (digits == 0) {
         return 0;
     }
-    if (*p == 'e' || *p == 'E') {
+    if (p < endp && (*p == 'e' || *p == 'E')) {
         const char *save = p;
         p++;
-        if (*p == '+' || *p == '-') {
+        if (p < endp && (*p == '+' || *p == '-')) {
             p++;
         }
         int ed = 0;
-        while (*p >= '0' && *p <= '9') {
+        while (p < endp && *p >= '0' && *p <= '9') {
             p++;
             ed++;
         }
@@ -336,18 +379,18 @@ static int pxr_scan_numeric(const char *s, int *is_int, long long *iv,
             exp = 1;
         }
     }
-    const char *end = p;
-    while (pxr_is_space((unsigned char)*p)) {
+    const char *num_end = p;
+    while (p < endp && pxr_is_space((unsigned char)*p)) {
         p++;
     }
-    if (*p != '\0') {
+    if (p != endp) {
         return 0;
     }
     if (!dot && !exp) {
         errno = 0;
         char *e2 = NULL;
         long long v = strtoll(start, &e2, 10);
-        if (errno != ERANGE && e2 == end) {
+        if (errno != ERANGE && e2 == num_end) {
             *is_int = 1;
             *iv = v;
             return 1;
@@ -363,14 +406,12 @@ static int pxr_scan_numeric(const char *s, int *is_int, long long *iv,
  * Loose comparison of two strings, matching PHP: if both are numeric strings
  * they are compared as numbers, otherwise byte-wise. Returns -1, 0 or 1.
  */
-long long pxr_str_cmp_loose(const char *a, const char *b) {
-    const char *x = a ? a : "";
-    const char *y = b ? b : "";
+long long pxr_str_cmp_loose(const pxr_str *a, const pxr_str *b) {
     int xi = 0, yi = 0;
     long long xil = 0, yil = 0;
     double xd = 0, yd = 0;
-    if (pxr_scan_numeric(x, &xi, &xil, &xd) &&
-        pxr_scan_numeric(y, &yi, &yil, &yd)) {
+    if (pxr_scan_numeric(a, &xi, &xil, &xd) &&
+        pxr_scan_numeric(b, &yi, &yil, &yd)) {
         if (xi && yi) {
             return xil < yil ? -1 : (xil > yil ? 1 : 0);
         }
@@ -378,7 +419,7 @@ long long pxr_str_cmp_loose(const char *a, const char *b) {
         double ly = yi ? (double)yil : yd;
         return lx < ly ? -1 : (lx > ly ? 1 : 0);
     }
-    int c = strcmp(x, y);
+    int c = pxr_str_cmp(a, b);
     return c < 0 ? -1 : (c > 0 ? 1 : 0);
 }
 
@@ -460,10 +501,10 @@ typedef enum {
 } pxr_tag;
 
 typedef struct {
-    int64_t vt;   /* value tag */
-    int64_t bits; /* value payload */
-    char   *ks;   /* string key, or NULL for an integer key */
-    int64_t ki;   /* integer key (valid when ks == NULL) */
+    int64_t vt;    /* value tag */
+    int64_t bits;  /* value payload */
+    pxr_str *ks;   /* string key, or NULL for an integer key */
+    int64_t ki;    /* integer key (valid when ks == NULL) */
 } pxr_ent;
 
 typedef struct {
@@ -478,24 +519,25 @@ typedef struct {
  * optional `-`, then either `0` or a non-zero digit followed by digits (no
  * leading zeros, no `+`), and the value must fit in a signed 64-bit integer.
  */
-static int pxr_key_parse_int(const char *s, int64_t *out) {
-    if (!s || !*s) {
+static int pxr_key_parse_int(const pxr_str *s, int64_t *out) {
+    if (!s || s->len == 0) {
         return 0;
     }
-    const char *p = s;
+    const char *p = s->data;
+    const char *end = s->data + s->len;
     int neg = 0;
     if (*p == '-') {
         neg = 1;
         p++;
     }
-    if (*p < '0' || *p > '9') {
+    if (p >= end || *p < '0' || *p > '9') {
         return 0;
     }
-    if (*p == '0' && p[1] != '\0') {
+    if (*p == '0' && p + 1 != end) {
         return 0; /* leading zero, e.g. "01" or "00" */
     }
     unsigned long long acc = 0;
-    for (; *p; p++) {
+    for (; p < end; p++) {
         if (*p < '0' || *p > '9') {
             return 0;
         }
@@ -520,8 +562,8 @@ static int pxr_key_parse_int(const char *s, int64_t *out) {
 }
 
 /* Rewrite a canonical integer string key into an integer key in place. */
-static void pxr_norm_key(long long *ktag, long long *ki, const char **ks) {
-    if (*ktag == PXR_TAG_STR && *ks && *ks[0]) {
+static void pxr_norm_key(long long *ktag, long long *ki, const pxr_str **ks) {
+    if (*ktag == PXR_TAG_STR && *ks && (*ks)->len > 0) {
         int64_t v;
         if (pxr_key_parse_int(*ks, &v)) {
             *ktag = PXR_TAG_INT;
@@ -532,15 +574,16 @@ static void pxr_norm_key(long long *ktag, long long *ki, const char **ks) {
 }
 
 /* Linear scan; a hash index is a roadmap item. */
-static long pxr_array_find(pxr_array *a, long long ktag, long long ki, const char *ks) {
+static long pxr_array_find(pxr_array *a, long long ktag, long long ki,
+                           const pxr_str *ks) {
     for (size_t i = 0; i < a->len; i++) {
         pxr_ent *e = &a->ents[i];
         if (e->ks == NULL) {
             if (ktag == PXR_TAG_INT && e->ki == (int64_t)ki) {
                 return (long)i;
             }
-        } else if (ktag == PXR_TAG_STR) {
-            if (strcmp(e->ks, ks ? ks : "") == 0) {
+        } else if (ktag == PXR_TAG_STR && ks != NULL) {
+            if (pxr_str_eq(e->ks, ks)) {
                 return (long)i;
             }
         }
@@ -569,7 +612,7 @@ void *pxr_array_new(void) {
     return a;
 }
 
-void pxr_array_set(void *p, long long ktag, long long ki, const char *ks,
+void pxr_array_set(void *p, long long ktag, long long ki, const pxr_str *ks,
                    long long vt, long long bits) {
     pxr_array *a = (pxr_array *)p;
     pxr_norm_key(&ktag, &ki, &ks);
@@ -589,7 +632,7 @@ void pxr_array_set(void *p, long long ktag, long long ki, const char *ks,
         e->ks = NULL;
         e->ki = (int64_t)ki;
     } else {
-        e->ks = (char *)(ks ? ks : "");
+        e->ks = (pxr_str *)ks;
         e->ki = 0;
     }
 }
@@ -606,7 +649,7 @@ void pxr_array_push(void *p, long long vt, long long bits) {
     pxr_array_set(p, PXR_TAG_INT, nk, NULL, vt, bits);
 }
 
-long long pxr_array_get_bits(void *p, long long ktag, long long ki, const char *ks) {
+long long pxr_array_get_bits(void *p, long long ktag, long long ki, const pxr_str *ks) {
     pxr_array *a = (pxr_array *)p;
     pxr_norm_key(&ktag, &ki, &ks);
     long idx = pxr_array_find(a, ktag, ki, ks);
@@ -614,7 +657,7 @@ long long pxr_array_get_bits(void *p, long long ktag, long long ki, const char *
 }
 
 /* Returns 1 when the key exists, 0 otherwise (used by `??` / `??=`). */
-long long pxr_array_has(void *p, long long ktag, long long ki, const char *ks) {
+long long pxr_array_has(void *p, long long ktag, long long ki, const pxr_str *ks) {
     pxr_array *a = (pxr_array *)p;
     pxr_norm_key(&ktag, &ki, &ks);
     return pxr_array_find(a, ktag, ki, ks) >= 0 ? 1 : 0;

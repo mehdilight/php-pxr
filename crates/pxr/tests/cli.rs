@@ -437,6 +437,32 @@ fn division_by_zero_is_fatal() {
 }
 
 #[test]
+fn string_with_embedded_nul() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    // PHP strings are byte strings: `strlen` counts bytes including embedded
+    // NULs, `===` compares bytes, ordering is byte-exact, and concatenation
+    // preserves them. (The old `char *` representation truncated at NUL.)
+    let src = r#"<?php
+echo strlen("a\0b") . "\n";
+echo ("a\0b" === "a\0b") ? "eq\n" : "ne\n";
+echo ("a\0b" === "a\0c") ? "eq\n" : "ne\n";
+echo ("a\0b" === "a") ? "eq\n" : "ne\n";
+echo strlen("a\0b" . "c") . "\n";
+echo ("a\0b" < "a\0c") ? "lt\n" : "ge\n";
+echo ("0\0" ? "truthy\n" : "falsy\n");
+echo ("\0" ? "nul-truthy\n" : "nul-falsy\n");
+echo strlen("\0\0\0") . "\n";
+"#;
+    let f = temp_php("nulstr", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "3\neq\nne\nne\n4\nlt\ntruthy\nnul-truthy\n3\n");
+}
+
+#[test]
 fn control_flow_breadth() {
     if !have_cc() {
         eprintln!("skipping: no C compiler");

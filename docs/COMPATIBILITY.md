@@ -102,6 +102,12 @@ are not). Arithmetic, however, is **not** coerced: PXR requires numeric operands
 and rejects `"1" + 2` at compile time; convert explicitly with `intval()` /
 `floatval()`.
 
+**Byte strings.** PHP strings are byte strings and PXR's are too: `len` bytes,
+so embedded `\0` bytes are first‑class. `strlen("a\0b")` is `3`, `===`/`!==` and
+ordering compare all bytes, and concatenation preserves them. Escapes follow PHP
+(`\n \t \r \v \f \e \\ \" \$ \0 \xHH`; single quotes only `\\` and `\'`); the
+byte value of the sequence is what matters, so `"\x80"` is a one‑byte string.
+
 **Missing array keys.** PHP warns and yields `null`. PXR has no `null` yet, so a
 direct read yields the zero value; `??` / `??=` detect absence correctly.
 

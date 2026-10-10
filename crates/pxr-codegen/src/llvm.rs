@@ -111,11 +111,15 @@ pub fn emit_llvm(module: &Module, opts: &LlvmOptions) -> String {
         }
     }
     for (i, s) in pool.iter().enumerate() {
-        let escaped = escape_bytes(s.as_bytes());
+        let bytes = s.as_bytes();
+        let escaped = escape_bytes(bytes);
+        let n = bytes.len() + 1;
+        // A `pxr_str` (runtime): `{ size_t len; char data[]; }`. The constant
+        // carries the length up front so embedded NUL bytes survive.
         let _ = writeln!(
             out,
-            "@.pxr.str.{i} = private unnamed_addr constant [{} x i8] c\"{escaped}\\00\", align 1",
-            s.len() + 1
+            "@.pxr.str.{i} = private unnamed_addr constant {{ i64, [{n} x i8] }} {{ i64 {len}, [{n} x i8] c\"{escaped}\\00\" }}, align 8",
+            len = bytes.len(),
         );
     }
     if !pool.is_empty() {
@@ -263,7 +267,7 @@ impl<'a> FnGen<'a> {
                         let n = s.len() + 1;
                         (
                             format!(
-                                "%v{dst} = getelementptr inbounds [{n} x i8], ptr @.pxr.str.{idx}, i64 0, i64 0"
+                                "%v{dst} = getelementptr inbounds {{ i64, [{n} x i8] }}, ptr @.pxr.str.{idx}, i64 0"
                             ),
                             Ty::String,
                         )

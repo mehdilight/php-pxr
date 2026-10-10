@@ -120,11 +120,15 @@ numeric-aware (`"10" < "9"` = false, `"1" == "01"` = true, `===` stays byte
 equality, `switch` follows), floats stringify exactly like PHP (`zend_gcvt`
 precision 14: `1e15` → `"1.0E+15"`, `1e-5` → `"1.0E-5"`, `-0.0` → `"-0"`),
 `/` and `%` by zero raise PHP's fatal `DivisionByZeroError`, and double-quoted
-interpolation is rejected at compile time as `E0008`.
+interpolation is rejected at compile time as `E0008`. Strings became **owned
+byte strings** (`pxr_str { len, data[] }`, still a single `ptr` in the ABI), so
+embedded NULs are first-class: `strlen("a\0b")` is `3`, equality/ordering and
+concatenation are byte-exact — matching PHP.
 
 ## ⛔ M2 — Strings & standard library
 
-* Owned string type (length + data, embedded NUL safe), string interpolation.
+* Owned string type (length + data, embedded NUL safe) — **done** in the M1.x
+  fidelity round; string interpolation remains.
 * A real standard library (sorted by module) reachable via `use`, compiled from
   PXR sources or intrinsic.
 * `sprintf`, `explode`/`implode`, `str_replace`, `substr`, `str_*`, `array_*`.
