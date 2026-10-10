@@ -1750,6 +1750,24 @@ impl Lowerer {
             Rawurlencode => self.rt_call("pxr_rawurlencode", vec![a[0]], Ty::String),
             Urldecode => self.rt_call("pxr_urldecode", vec![a[0]], Ty::String),
             Rawurldecode => self.rt_call("pxr_rawurldecode", vec![a[0]], Ty::String),
+            Sprintf => {
+                let arr = self.array_new();
+                for i in 1..argc {
+                    let vtag = self.emit_const(Literal::Int(Self::tag_of(&arg_tys[i])));
+                    let vbits = self.encode_bits(a[i], &arg_tys[i]);
+                    self.array_push(arr, vtag, vbits);
+                }
+                self.rt_call("pxr_sprintf", vec![a[0], arr], Ty::String)
+            }
+            Printf => {
+                let arr = self.array_new();
+                for i in 1..argc {
+                    let vtag = self.emit_const(Literal::Int(Self::tag_of(&arg_tys[i])));
+                    let vbits = self.encode_bits(a[i], &arg_tys[i]);
+                    self.array_push(arr, vtag, vbits);
+                }
+                self.rt_call("pxr_printf", vec![a[0], arr], Ty::Int)
+            }
             StrSplit => {
                 let len = if argc == 2 {
                     a[1]

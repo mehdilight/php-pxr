@@ -1602,3 +1602,383 @@ pxr_str *pxr_urldecode(const pxr_str *s) {
 pxr_str *pxr_rawurldecode(const pxr_str *s) {
     return pxr_url_decode(s, 0);
 }
+
+/* ---------------------------------------------------- sprintf / printf (M2) */
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} pxr_buf;
+
+static void pxr_buf_init(pxr_buf *b, size_t cap) {
+    if (cap < 64) cap = 64;
+    b->data = (char *)malloc(cap);
+    b->len = 0;
+    b->cap = cap;
+}
+
+static void pxr_buf_append(pxr_buf *b, const char *s, size_t n) {
+    if (!n) return;
+    if (b->len + n > b->cap) {
+        size_t ncap = b->cap * 2;
+        while (b->len + n > ncap) ncap *= 2;
+        b->data = (char *)realloc(b->data, ncap);
+        b->cap = ncap;
+    }
+    memcpy(b->data + b->len, s, n);
+    b->len += n;
+}
+
+static void pxr_buf_append_byte(pxr_buf *b, char c) {
+    pxr_buf_append(b, &c, 1);
+}
+
+static void pxr_buf_append_pad(pxr_buf *b, char pad, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        pxr_buf_append_byte(b, pad);
+    }
+}
+
+static pxr_str *pxr_arg_to_str(const pxr_array *args, size_t idx) {
+    if (idx >= args->len) return pxr_str_alloc(0);
+    return pxr_val_to_str(args->ents[idx].vt, args->ents[idx].bits);
+}
+
+static int64_t pxr_arg_to_i64(const pxr_array *args, size_t idx) {
+    if (idx >= args->len) return 0;
+    int64_t vt = args->ents[idx].vt;
+    int64_t bits = args->ents[idx].bits;
+    switch (vt) {
+        case PXR_TAG_INT:
+        case PXR_TAG_BOOL:
+            return bits;
+        case PXR_TAG_FLOAT:
+            return (int64_t)pxr_bits_to_double(bits);
+        case PXR_TAG_STR:
+            return pxr_str_to_i64((const pxr_str *)(intptr_t)bits);
+        default:
+            return 0;
+    }
+}
+
+static double pxr_arg_to_f64(const pxr_array *args, size_t idx) {
+    if (idx >= args->len) return 0.0;
+    int64_t vt = args->ents[idx].vt;
+    int64_t bits = args->ents[idx].bits;
+    switch (vt) {
+        case PXR_TAG_FLOAT:
+            return pxr_bits_to_double(bits);
+        case PXR_TAG_INT:
+        case PXR_TAG_BOOL:
+            return (double)bits;
+        case PXR_TAG_STR:
+            return pxr_str_to_f64((const pxr_str *)(intptr_t)bits);
+        default:
+            return 0.0;
+    }
+}
+
+pxr_str *pxr_sprintf(const pxr_str *fmt, void *vargs) {
+    const pxr_array *args = (const pxr_array *)vargs;
+    pxr_buf out;
+    pxr_buf_init(&out, fmt ? fmt->len + 64 : 64);
+    if (!fmt || fmt->len == 0) {
+        pxr_str *empty = pxr_str_alloc(0);
+        free(out.data);
+        return empty;
+    }
+
+    size_t currarg = 0;
+    long long max_missing_argnum = -1;
+    size_t i = 0;
+
+    while (i < fmt->len) {
+        if (fmt->data[i] != '%') {
+            pxr_buf_append_byte(&out, fmt->data[i]);
+            i++;
+            continue;
+        }
+        i++; /* skip '%' */
+        if (i >= fmt->len) {
+            if (max_missing_argnum >= 0) {
+                fprintf(stderr,
+                        "Fatal error: Uncaught ArgumentCountError: %lld arguments are required, %zu given\n",
+                        max_missing_argnum + 2, args->len + 1);
+                exit(255);
+            }
+            if (currarg >= args->len) {
+                fprintf(stderr,
+                        "Fatal error: Uncaught ArgumentCountError: %zu arguments are required, %zu given\n",
+                        currarg + 2, args->len + 1);
+                exit(255);
+            }
+            fprintf(stderr,
+                    "Fatal error: Uncaught ValueError: Missing format specifier at end of string\n");
+            exit(255);
+        }
+        if (fmt->data[i] == '%') {
+            pxr_buf_append_byte(&out, '%');
+            i++;
+            continue;
+        }
+
+        long long argnum = -1;
+        char padding = ' ';
+        int align_left = 0;
+        int always_sign = 0;
+        int width = 0;
+        int precision = -1;
+
+        /* 1. Positional argnum: digits followed by '$' */
+        size_t k = i;
+        while (k < fmt->len && fmt->data[k] >= '0' && fmt->data[k] <= '9') {
+            k++;
+        }
+        if (k < fmt->len && fmt->data[k] == '$' && k > i) {
+            long long n = 0;
+            for (size_t d = i; d < k; d++) {
+                n = n * 10 + (fmt->data[d] - '0');
+            }
+            if (n <= 0 || n > 2147483647) {
+                fprintf(stderr,
+                        "Fatal error: Uncaught ValueError: Argument number specifier must be greater than zero and less than 2147483647\n");
+                exit(255);
+            }
+            argnum = n - 1;
+            i = k + 1;
+        }
+
+        /* 2. Modifiers: ' ', '0', '-', '+', '\'' */
+        while (i < fmt->len) {
+            char c = fmt->data[i];
+            if (c == ' ' || c == '0') {
+                padding = c;
+                i++;
+            } else if (c == '-') {
+                align_left = 1;
+                i++;
+            } else if (c == '+') {
+                always_sign = 1;
+                i++;
+            } else if (c == '\'') {
+                if (i + 1 < fmt->len) {
+                    padding = fmt->data[i + 1];
+                    i += 2;
+                } else {
+                    fprintf(stderr,
+                            "Fatal error: Uncaught ValueError: Missing padding character\n");
+                    exit(255);
+                }
+            } else {
+                break;
+            }
+        }
+
+        /* 3. Width: digits */
+        if (i < fmt->len && fmt->data[i] >= '0' && fmt->data[i] <= '9') {
+            long long w = 0;
+            while (i < fmt->len && fmt->data[i] >= '0' && fmt->data[i] <= '9') {
+                w = w * 10 + (fmt->data[i] - '0');
+                i++;
+            }
+            width = (int)w;
+        }
+
+        /* 4. Precision: '.' followed by optional digits */
+        if (i < fmt->len && fmt->data[i] == '.') {
+            i++;
+            long long p = 0;
+            while (i < fmt->len && fmt->data[i] >= '0' && fmt->data[i] <= '9') {
+                p = p * 10 + (fmt->data[i] - '0');
+                i++;
+            }
+            precision = (int)p;
+        }
+
+        /* 5. Optional 'l' */
+        if (i < fmt->len && fmt->data[i] == 'l') {
+            i++;
+        }
+
+        if (argnum < 0) {
+            argnum = (long long)currarg;
+            currarg++;
+        }
+
+        if (argnum >= (long long)args->len) {
+            if (argnum > max_missing_argnum) {
+                max_missing_argnum = argnum;
+            }
+            if (i < fmt->len) {
+                i++;
+            }
+            continue;
+        }
+
+        if (i >= fmt->len) {
+            fprintf(stderr,
+                    "Fatal error: Uncaught ValueError: Missing format specifier at end of string\n");
+            exit(255);
+        }
+
+        char spec = fmt->data[i];
+        i++;
+
+        char num_buf[128];
+        const char *raw_buf = NULL;
+        size_t raw_len = 0;
+
+        switch (spec) {
+            case 's': {
+                pxr_str *s = pxr_arg_to_str(args, (size_t)argnum);
+                size_t slen = s->len;
+                if (precision >= 0 && (size_t)precision < slen) {
+                    slen = (size_t)precision;
+                }
+                raw_buf = s->data;
+                raw_len = slen;
+                break;
+            }
+            case 'c': {
+                num_buf[0] = (char)pxr_arg_to_i64(args, (size_t)argnum);
+                raw_buf = num_buf;
+                raw_len = 1;
+                break;
+            }
+            case 'd':
+            case 'i': {
+                int64_t v = pxr_arg_to_i64(args, (size_t)argnum);
+                snprintf(num_buf, sizeof(num_buf), always_sign ? "%+lld" : "%lld", (long long)v);
+                raw_buf = num_buf;
+                raw_len = strlen(num_buf);
+                break;
+            }
+            case 'u': {
+                uint64_t v = (uint64_t)pxr_arg_to_i64(args, (size_t)argnum);
+                snprintf(num_buf, sizeof(num_buf), "%llu", (unsigned long long)v);
+                raw_buf = num_buf;
+                raw_len = strlen(num_buf);
+                break;
+            }
+            case 'x': {
+                uint64_t v = (uint64_t)pxr_arg_to_i64(args, (size_t)argnum);
+                snprintf(num_buf, sizeof(num_buf), "%llx", (unsigned long long)v);
+                raw_buf = num_buf;
+                raw_len = strlen(num_buf);
+                break;
+            }
+            case 'X': {
+                uint64_t v = (uint64_t)pxr_arg_to_i64(args, (size_t)argnum);
+                snprintf(num_buf, sizeof(num_buf), "%llX", (unsigned long long)v);
+                raw_buf = num_buf;
+                raw_len = strlen(num_buf);
+                break;
+            }
+            case 'o': {
+                uint64_t v = (uint64_t)pxr_arg_to_i64(args, (size_t)argnum);
+                snprintf(num_buf, sizeof(num_buf), "%llo", (unsigned long long)v);
+                raw_buf = num_buf;
+                raw_len = strlen(num_buf);
+                break;
+            }
+            case 'b': {
+                uint64_t v = (uint64_t)pxr_arg_to_i64(args, (size_t)argnum);
+                if (v == 0) {
+                    num_buf[0] = '0';
+                    num_buf[1] = '\0';
+                    raw_buf = num_buf;
+                    raw_len = 1;
+                } else {
+                    int bpos = 64;
+                    num_buf[bpos] = '\0';
+                    while (v > 0) {
+                        num_buf[--bpos] = (v & 1) ? '1' : '0';
+                        v >>= 1;
+                    }
+                    raw_buf = &num_buf[bpos];
+                    raw_len = 64 - bpos;
+                }
+                break;
+            }
+            case 'f':
+            case 'F': {
+                double v = pxr_arg_to_f64(args, (size_t)argnum);
+                int p = (precision >= 0) ? precision : 6;
+                snprintf(num_buf, sizeof(num_buf), always_sign ? "%+.*f" : "%.*f", p, v);
+                raw_buf = num_buf;
+                raw_len = strlen(num_buf);
+                break;
+            }
+            case 'e':
+            case 'E': {
+                double v = pxr_arg_to_f64(args, (size_t)argnum);
+                int p = (precision >= 0) ? precision : 6;
+                char fspec[16];
+                snprintf(fspec, sizeof(fspec), always_sign ? "%%+.*%c" : "%%.*%c", spec);
+                snprintf(num_buf, sizeof(num_buf), fspec, p, v);
+                raw_buf = num_buf;
+                raw_len = strlen(num_buf);
+                break;
+            }
+            case 'g':
+            case 'G':
+            case 'h':
+            case 'H': {
+                double v = pxr_arg_to_f64(args, (size_t)argnum);
+                int p = (precision >= 0) ? (precision == 0 ? 1 : precision) : 6;
+                char target_c = (spec == 'h' ? 'g' : (spec == 'H' ? 'G' : spec));
+                char fspec[16];
+                snprintf(fspec, sizeof(fspec), always_sign ? "%%+.*%c" : "%%.*%c", target_c);
+                snprintf(num_buf, sizeof(num_buf), fspec, p, v);
+                raw_buf = num_buf;
+                raw_len = strlen(num_buf);
+                break;
+            }
+            default:
+                fprintf(stderr,
+                        "Fatal error: Uncaught ValueError: Unknown format specifier \"%c\"\n", spec);
+                exit(255);
+        }
+
+        if ((size_t)width <= raw_len) {
+            pxr_buf_append(&out, raw_buf, raw_len);
+        } else {
+            size_t pad_len = (size_t)width - raw_len;
+            if (align_left) {
+                char actual_pad = (padding == '0') ? ' ' : padding;
+                pxr_buf_append(&out, raw_buf, raw_len);
+                pxr_buf_append_pad(&out, actual_pad, pad_len);
+            } else {
+                if (padding == '0' && (raw_buf[0] == '-' || raw_buf[0] == '+')) {
+                    pxr_buf_append_byte(&out, raw_buf[0]);
+                    pxr_buf_append_pad(&out, '0', pad_len);
+                    pxr_buf_append(&out, raw_buf + 1, raw_len - 1);
+                } else {
+                    pxr_buf_append_pad(&out, padding, pad_len);
+                    pxr_buf_append(&out, raw_buf, raw_len);
+                }
+            }
+        }
+    }
+
+    if (max_missing_argnum >= 0) {
+        fprintf(stderr,
+                "Fatal error: Uncaught ArgumentCountError: %lld arguments are required, %zu given\n",
+                max_missing_argnum + 2, args->len + 1);
+        exit(255);
+    }
+
+    pxr_str *res = pxr_str_alloc(out.len);
+    memcpy(res->data, out.data, out.len);
+    free(out.data);
+    return res;
+}
+
+long long pxr_printf(const pxr_str *fmt, void *args) {
+    pxr_str *s = pxr_sprintf(fmt, args);
+    if (s && s->len > 0) {
+        fwrite(s->data, 1, s->len, stdout);
+    }
+    return s ? (long long)s->len : 0;
+}

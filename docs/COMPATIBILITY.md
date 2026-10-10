@@ -35,6 +35,7 @@ and whose output the test suite asserts is byte‑identical.
 | `count`, `strlen`, `intval`, `floatval`, `strval`, `abs` | |
 | **String builtins** `strtoupper`, `strtolower`, `trim`/`ltrim`/`rtrim`, `substr`, `str_repeat`, `str_replace`, `implode`, `explode`, `str_contains`, `str_starts_with`, `str_ends_with`, `strrev`, `ucfirst`, `lcfirst`, `ucwords`, `str_split`, `str_pad`, `substr_count` | byte-exact vs PHP, embedded NULs safe; see notes below |
 | **Escaping & encoding** `addslashes`, `stripslashes`, `bin2hex`, `base64_encode`, `urlencode`, `rawurlencode`, `urldecode`, `rawurldecode` | byte-exact vs PHP over all 256 byte values, including NULs; see notes below |
+| **Formatted printing** `sprintf`, `printf` | byte-exact vs PHP; supports `%s`, `%d`/`%i`, `%u`, `%f`/`%F`, `%e`/`%E`, `%g`/`%G`, `%x`/`%X`, `%o`, `%b`, `%c`, `%%`, widths, precision, padding, alignment, positional arguments; see notes below |
 | **Array transforms** `array_values`, `array_reverse`, `array_merge`, `array_slice`, `array_pad`, `array_fill`, `array_key_exists` | byte-exact vs PHP; deep-copy nested arrays (value semantics); see notes below |
 | Division `/` is always `float`; `%` is integer remainder | a zero divisor is a fatal `DivisionByZeroError` (exit 255), exactly as in PHP — not IEEE infinity |
 | **Float stringification** (`echo`, `.`, `strval`) | PHP's `zend_gcvt` with precision 14: `0.1+0.2` → `"0.3"`, `1e15` → `"1.0E+15"`, `1e-5` → `"1.0E-5"`, `1.0` → `"1"`, `-0.0` → `"-0"`, `INF`/`-INF`/`NAN` | |
@@ -79,7 +80,7 @@ behavioural divergence.
 | Undefined variable / function | **Error** `E0220` / `E0232` |
 | Leading‑zero octal literal (`0755`) | **Warning** `W0001`, read as decimal |
 | Functions that return `string|false` / `int|false` (`strpos`, `strstr`, `base64_decode`, `hex2bin`, `substr_compare`, …) | Not yet — needs a union / `false` value type; only the never-failing encoders above are provided |
-| `sprintf`/`printf`, `number_format` | Not yet |
+| `number_format` | Not yet |
 | Classes, interfaces, traits, enums, namespaces, closures | Not yet |
 | `include`/`require`, `global`, `static`, references `&` | Not yet |
 | Exceptions, generators, attributes | Not yet |
@@ -171,6 +172,17 @@ not followed by two hex digits is left literally, as in PHP. All eight are
 verified byte‑for‑byte against PHP over inputs spanning all 256 byte values,
 including high bytes and NULs, and `urldecode(urlencode($x))` /
 `rawurldecode(rawurlencode($x))` round-trip identically.
+
+**Formatted printing.** `sprintf` and `printf` reproduce PHP's formatting
+engine: conversion specifiers `%s`, `%d`/`%i`, `%u`, `%f`/`%F`, `%e`/`%E`,
+`%g`/`%G`/`%h`/`%H`, `%x`/`%X`, `%o`, `%b`, `%c`, and literal `%%`. Modifiers
+include positional arguments (`%2$s %1$s`), sign prefix (`%+d`), padding
+(spaces, zeros, or custom character `%'*10s`), left-alignment (`%-10s`), width,
+and precision (`%.2f`, `%.3s`). Scalar arguments (`int`, `float`, `string`,
+`bool`) are coerced matching PHP's type rules. Missing arguments raise PHP's
+fatal `ArgumentCountError` (exit 255); unknown format specifiers or dangling
+percent signs raise fatal `ValueError` (exit 255). Verified byte-for-byte
+against PHP 8.4.
 
 **Array builtins.** `array_merge` renumbers integer keys in order and lets a
 later string key overwrite an earlier one in place; `array_slice` reproduces

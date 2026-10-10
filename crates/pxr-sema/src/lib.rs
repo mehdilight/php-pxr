@@ -92,6 +92,10 @@ pub enum Builtin {
     Rawurlencode,
     Urldecode,
     Rawurldecode,
+    /// `sprintf(string $format, ...$values): string`.
+    Sprintf,
+    /// `printf(string $format, ...$values): int`.
+    Printf,
 }
 
 impl Builtin {
@@ -138,6 +142,8 @@ impl Builtin {
             "rawurlencode" => Builtin::Rawurlencode,
             "urldecode" => Builtin::Urldecode,
             "rawurldecode" => Builtin::Rawurldecode,
+            "sprintf" => Builtin::Sprintf,
+            "printf" => Builtin::Printf,
             _ => return None,
         })
     }
@@ -185,6 +191,8 @@ impl Builtin {
             Builtin::Rawurlencode => "rawurlencode",
             Builtin::Urldecode => "urldecode",
             Builtin::Rawurldecode => "rawurldecode",
+            Builtin::Sprintf => "sprintf",
+            Builtin::Printf => "printf",
         }
     }
 }
@@ -2449,6 +2457,40 @@ impl Analyzer {
                     return self.builtin_ty_err(name, "an `int` length", &atys[3], args[3].span());
                 }
                 Ty::Int
+            }
+            Builtin::Sprintf | Builtin::Printf => {
+                if n < 1 {
+                    self.diags.emit(
+                        Diagnostic::error(format!("builtin `{name}` expects at least 1 argument"))
+                            .with_code("E0233")
+                            .with_span(span),
+                    );
+                    return None;
+                }
+                if atys[0] != Ty::String {
+                    return self.builtin_ty_err(name, "a `string` format", &atys[0], args[0].span());
+                }
+                for i in 1..n {
+                    match &atys[i] {
+                        Ty::Int | Ty::Float | Ty::Bool | Ty::String => {}
+                        other => {
+                            self.diags.emit(
+                                Diagnostic::error(format!(
+                                    "builtin `{name}` argument {} must be a scalar, got `{other}`",
+                                    i + 1
+                                ))
+                                .with_code("E0234")
+                                .with_span(args[i].span()),
+                            );
+                            return None;
+                        }
+                    }
+                }
+                if kind == Builtin::Sprintf {
+                    Ty::String
+                } else {
+                    Ty::Int
+                }
             }
         };
 

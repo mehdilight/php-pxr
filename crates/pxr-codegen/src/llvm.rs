@@ -106,6 +106,9 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     ("pxr_rawurlencode", "ptr", &["ptr"]),
     ("pxr_urldecode", "ptr", &["ptr"]),
     ("pxr_rawurldecode", "ptr", &["ptr"]),
+    // Formatted printing builtins (M2): sprintf / printf.
+    ("pxr_sprintf", "ptr", &["ptr", "ptr"]),
+    ("pxr_printf", "i64", &["ptr", "ptr"]),
 ];
 
 pub fn llty(ty: &Ty) -> &'static str {

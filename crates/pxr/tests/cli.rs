@@ -896,6 +896,72 @@ fn encoding_builtin_type_errors_are_loud() {
 }
 
 #[test]
+fn sprintf_and_printf_match_php() {
+    let src = r#"<?php
+echo sprintf("%s %d %.2f %x %X %o %b %c %%", "world", 42, 3.14159, 255, 255, 42, 42, 65) . "\n";
+echo sprintf("[%10s] [%-10s] [%05d] [%-5d] [%+d] [%+d]", "hi", "hi", 7, 7, 7, -7) . "\n";
+echo sprintf("[%'*10s] [%08b] [%.3s] [%10.4s] [%-10.4s]", "bar", 42, "abcdef", "abcdef", "abcdef") . "\n";
+echo sprintf("%2\$s %1\$s %s", "first", "second") . "\n";
+echo sprintf("%s %s %s %s", 123, 4.5, true, false) . "\n";
+echo sprintf("nul=%s\n", "a\x00b");
+echo sprintf("empty: [%s]\n", "");
+$n = printf("printed %d bytes\n", 42);
+echo "ret=$n\n";
+"#;
+    assert_matches_php("sprintf_printf", src);
+}
+
+#[test]
+fn sprintf_missing_args_is_fatal() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let f = temp_php("sprintf_few", r#"<?php echo sprintf("%s %s", "one");"#);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 255, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("ArgumentCountError: 3 arguments are required, 2 given"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn sprintf_unknown_specifier_is_fatal() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let f = temp_php("sprintf_unk", r#"<?php echo sprintf("%q", "foo");"#);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 255, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("ValueError: Unknown format specifier \"q\""),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn sprintf_type_errors_are_loud() {
+    let f = temp_php("spf_err0", "<?php echo sprintf();");
+    let r = run_ok(&["check", f.to_str().unwrap()]);
+    assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("E0233"), "stderr: {}", r.stderr);
+
+    let f2 = temp_php("spf_err1", "<?php echo sprintf(123);");
+    let r2 = run_ok(&["check", f2.to_str().unwrap()]);
+    assert_eq!(r2.code, 1, "stderr: {}", r2.stderr);
+    assert!(r2.stderr.contains("E0234"), "stderr: {}", r2.stderr);
+
+    let f3 = temp_php("spf_err2", "<?php echo sprintf(\"%s\", [1, 2]);");
+    let r3 = run_ok(&["check", f3.to_str().unwrap()]);
+    assert_eq!(r3.code, 1, "stderr: {}", r3.stderr);
+    assert!(r3.stderr.contains("E0234"), "stderr: {}", r3.stderr);
+}
+
+#[test]
 fn array_merge_matches_php() {
     if !have_cc() {
         eprintln!("skipping: no C compiler");

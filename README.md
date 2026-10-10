@@ -17,16 +17,15 @@ The same `main.php` can still be run by the traditional interpreter for
 comparison; PXR programs themselves run **without PHP**, linking only the small
 PXR runtime.
 
-> **Project status: milestone 1 complete — language breadth I.** On top of the
-> milestone‑0 pipeline (lexer → parser → AST → semantic analysis → type checker
-> → IR → optimizer → LLVM backend → linked executable), PXR now has **arrays**
-> (ordered maps with `int`/`string` keys), the full C‑style control‑flow set
-> (`for`, `foreach`, `do…while`, `switch`, `match`, `break`/`continue` with
-> levels), ternary/`??`/`<=>`, compound assignment and bitwise operators. The
-> *language surface* is still deliberately small and grows by documented
-> milestones. Nothing below is claimed unless it is implemented and covered by
-> tests; see [`docs/MILESTONES.md`](docs/MILESTONES.md) and the "Not implemented
-> yet" section.
+> **Project status: milestone 2 complete — strings & standard library.** On top of the
+> milestone‑1 breadth (arrays, control flow, operators), PXR now has **owned
+> NUL‑safe byte strings** (`pxr_str`), simple double‑quoted string interpolation
+> (`"$name"` / `"{$name}"`), formatted printing (`sprintf` / `printf`), and an
+> extensive suite of byte‑exact standard‑library builtins (strings, encoding,
+> array transforms). The *language surface* is still deliberately small and grows
+> by documented milestones. Nothing below is claimed unless it is implemented
+> and covered by tests; see [`docs/MILESTONES.md`](docs/MILESTONES.md) and the
+> "Not implemented yet" section.
 
 ---
 
@@ -92,7 +91,15 @@ migration path possible.
 * **Semantic analysis / type checker** — undefined variables and functions,
   arity and argument types, operand types of every operator, return type and
   return‑on‑all‑paths, duplicate functions, required parameter/return types.
-* **Builtins** — `strlen`, `intval`, `floatval`, `strval`, `abs`, `count`.
+* **Builtins** — `strlen`, `intval`, `floatval`, `strval`, `abs`, `count`,
+  string transforms (`strtoupper`, `strtolower`, `trim`/`ltrim`/`rtrim`,
+  `substr`, `str_repeat`, `str_replace`, `implode`, `explode`, `str_split`,
+  `str_pad`, `substr_count`), predicates & case (`str_contains`,
+  `str_starts_with`, `str_ends_with`, `strrev`, `ucfirst`, `lcfirst`, `ucwords`),
+  escaping & encoding (`addslashes`, `stripslashes`, `bin2hex`, `base64_encode`,
+  `urlencode`, `rawurlencode`, `urldecode`, `rawurldecode`), formatted printing
+  (`sprintf`, `printf`), and array helpers (`array_values`, `array_reverse`,
+  `array_merge`, `array_slice`, `array_pad`, `array_fill`, `array_key_exists`).
 * **IR + optimizer** — typed three‑address IR with an SSA‑style value model;
   constant folding, constant‑branch folding, dead‑code elimination and CFG
   cleanup, with reported statistics.

@@ -126,7 +126,7 @@ byte strings** (`pxr_str { len, data[] }`, still a single `ptr` in the ABI), so
 embedded NULs are first-class: `strlen("a\0b")` is `3`, equality/ordering and
 concatenation are byte-exact — matching PHP.
 
-## 🚧 M2 — Strings & standard library
+## ✅ M2 — Strings & standard library
 
 * Owned string type (length + data, embedded NUL safe) — **done** in the M1.x
   fidelity round; simple double‑quoted interpolation (`"$name"` / `"{$name}"`)
@@ -261,6 +261,27 @@ concatenation are byte-exact — matching PHP.
   cross-checks against the interpreter, and `encoding_builtin_type_errors_are_loud`)
   plus a reusable `assert_matches_php` helper — 47 CLI tests total;
   `examples/compat.php` extended (still byte‑identical to PHP 8.4).
+
+**Delivered (M2.formatted printing slice).**
+
+* `sprintf` and `printf` — formatted string creation and printing, reproducing
+  PHP's formatting engine:
+  * Specifiers: `%s` (string), `%d`/`%i` (signed int), `%u` (unsigned int),
+    `%f`/`%F` (float decimal), `%e`/`%E` (exponential), `%g`/`%G`/`%h`/`%H`
+    (shortest float), `%x`/`%X` (hexadecimal), `%o` (octal), `%b` (binary),
+    `%c` (single char from ASCII byte), literal `%%`.
+  * Modifiers: positional arguments (`%2$s %1$s`), sign prefix (`%+d`), padding
+    (spaces, zeros with sign-aware placement, or custom padding character
+    `%'*10s`), left-alignment (`%-10s`), width, and precision (`%.2f`, `%.3s`).
+  * Argument coercion: scalar values (`int`, `float`, `string`, `bool`) coerce
+    matching PHP's rules.
+  * Runtime errors: too few arguments raises fatal `ArgumentCountError` (exit
+    255); unknown format specifiers or missing specifier at end of string raise
+    fatal `ValueError` (exit 255).
+  * `printf` outputs to stdout via `fwrite` and returns the number of bytes written.
+* Tests: +4 CLI tests (`sprintf_and_printf_match_php`, `sprintf_missing_args_is_fatal`,
+  `sprintf_unknown_specifier_is_fatal`, `sprintf_type_errors_are_loud`) — 51 CLI
+  tests total; `examples/compat.php` extended (still byte‑identical to PHP 8.4).
 
 **Acceptance.** A string‑heavy program (e.g. word count) compiles and matches PHP —
 the word‑count block at the end of `examples/compat.php` does exactly this. ✅

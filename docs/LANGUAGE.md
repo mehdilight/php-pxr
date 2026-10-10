@@ -278,6 +278,8 @@ subjects are compared with loose/strict equality respectively.
 | `rawurlencode(string): string` | RFC 3986 URL encoding | space → `%20`, `~` passes through |
 | `urldecode(string): string` | form URL decoding | `+` → space, `%XX` decoded; invalid/incomplete `%` kept literally |
 | `rawurldecode(string): string` | RFC 3986 URL decoding | like `urldecode` but `+` is left alone |
+| `sprintf(string, (int\|float\|string\|bool)...): string` | formatted string creation | PHP conversion specifiers, modifiers, widths, precision, positional args |
+| `printf(string, (int\|float\|string\|bool)...): int` | formatted string output | prints to stdout, returns length in bytes |
 
 ## Scoping
 

@@ -45,7 +45,7 @@ Two commitments make this practical rather than a rewrite‑everything exercise:
 today     typed scalars, arrays, control flow, LLVM backend, tests, benchmarks
   │
   ├─ M1  arrays, loops, switch/match, compound ops        ✅ done
-  ├─ M2  owned strings + a real standard library          (usability)
+  ├─ M2  owned strings + a real standard library          ✅ done
   ├─ M3  classes, namespaces, modules                     (structure)
   ├─ M4  mixed/dynamic + include interop                  (gradual migration)
   ├─ M5  generics + inference                             (zero-cost abstraction)

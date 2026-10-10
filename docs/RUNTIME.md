@@ -135,6 +135,8 @@ pxr_str *pxr_urlencode(const pxr_str *s);           /* space -> +, uppercase hex
 pxr_str *pxr_rawurlencode(const pxr_str *s);        /* RFC 3986, space -> %20 */
 pxr_str *pxr_urldecode(const pxr_str *s);           /* + -> space, %XX */
 pxr_str *pxr_rawurldecode(const pxr_str *s);        /* %XX, leaves + alone */
+pxr_str *pxr_sprintf(const pxr_str *fmt, void *args); /* formatted string creation */
+long long pxr_printf(const pxr_str *fmt, void *args); /* formatted print to stdout, returns bytes */
 long long pxr_array_val_tag_at(void *a, long long i);    /* element tag by index */
 
 /* math */

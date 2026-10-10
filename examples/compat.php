@@ -273,3 +273,12 @@ echo "url=" . urlencode("a b~c&d=e") . "\n";
 echo "rawurl=" . rawurlencode("a b~c&d=e") . "\n";
 echo "urldec=" . urldecode("a%20b+c%26d") . "\n";
 echo "rawurldec=" . rawurldecode("a%20b+c%26d") . "\n";
+
+// --- milestone 2: formatted printing (sprintf / printf) --------------------
+
+echo sprintf("spf1=%s/%d/%.2f/%x/%X/%o/%b/%c\n", "str", 123, 4.567, 255, 255, 63, 10, 65);
+echo sprintf("spf2=[%10s] [%-10s] [%05d] [%-5d] [%+d] [%+d]\n", "hi", "hi", 7, 7, 7, -7);
+echo sprintf("spf3=[%'*10s] [%08b] [%.3s]\n", "baz", 42, "abcdef");
+echo sprintf("spf4=%2\$s/%1\$s/%s\n", "first", "second");
+$pr_len = printf("printf=%s/%d\n", "out", 99);
+echo "printf_len=$pr_len\n";
