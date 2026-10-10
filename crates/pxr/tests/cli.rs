@@ -463,6 +463,186 @@ echo strlen("\0\0\0") . "\n";
 }
 
 #[test]
+fn string_builtins_match_php() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let src = r#"<?php
+echo strtoupper("Hello, World 123!") . "\n";
+echo strtoupper("héllo") . "\n";
+echo strtolower("HeLLo 123!") . "\n";
+echo "[" . trim("  hello  \n\t") . "]\n";
+echo "[" . trim("xxhelloxy", "xy") . "]\n";
+echo "[" . trim(" \0 ab \0 ") . "]\n";
+echo "[" . ltrim("  hi  ") . "]\n";
+echo "[" . rtrim("  hi  ") . "]\n";
+echo "[" . rtrim("hello///", "/") . "]\n";
+echo "[" . trim(" x ", "") . "]\n";
+echo "[" . trim("\x0b x \x0b") . "]\n";
+echo substr("abcdef", 1) . "\n";
+echo substr("abcdef", -4) . "\n";
+echo substr("abcdef", 2, 3) . "\n";
+echo substr("abcdef", -3, -1) . "\n";
+echo substr("abcdef", 4) . "\n";
+echo substr("abcdef", 0, 99) . "\n";
+echo substr("abcdef", 4, -1) . "\n";
+echo substr("abcdef", -99) . "\n";
+echo substr("abcdef", 2, 0) . "\n";
+echo "[" . substr("a", 2) . "]\n";
+echo "[" . substr("abcdef", 6) . "]\n";
+echo str_repeat("ab", 3) . "\n";
+echo str_repeat("ab", 0) . "\n";
+echo str_replace("l", "L", "hello world") . "\n";
+echo str_replace("", "x", "abc") . "\n";
+echo str_replace("a", "", "abc") . "\n";
+echo str_replace("ab", "aab", "abab") . "\n";
+echo str_replace("aa", "x", "aaaa") . "\n";
+echo substr("a\0b", 1, 1) === "\0" ? "nul-sub ok\n" : "nul-sub bad\n";
+echo strtoupper("a\0z") === "A\0Z" ? "nul-case ok\n" : "nul-case bad\n";
+"#;
+    let f = temp_php("m2strings", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let expected = "\
+HELLO, WORLD 123!
+HéLLO
+hello 123!
+[hello]
+[hello]
+[ab]
+[hi  ]
+[  hi]
+[hello]
+[ x ]
+[x]
+bcdef
+cdef
+cde
+de
+ef
+abcdef
+e
+abcdef
+
+[]
+[]
+ababab
+
+heLLo worLd
+abc
+bc
+aabaab
+xx
+nul-sub ok
+nul-case ok
+";
+    assert_eq!(r.stdout, expected);
+}
+
+#[test]
+fn explode_implode_match_php() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let src = r#"<?php
+$e = explode(",", "a,b,c");
+echo "[" . implode("|", $e) . "] count=" . count($e) . "\n";
+$e = explode(",", "a,b,c", 2);
+echo "[" . implode("|", $e) . "] count=" . count($e) . "\n";
+$e = explode(",", "a,b,c", -1);
+echo "[" . implode("|", $e) . "] count=" . count($e) . "\n";
+$e = explode(",", "a,b,c", 0);
+echo "[" . implode("|", $e) . "] count=" . count($e) . "\n";
+$e = explode(",", "abc");
+echo "[" . implode("|", $e) . "] count=" . count($e) . "\n";
+$e = explode("x", "");
+echo "[" . implode("|", $e) . "] count=" . count($e) . "\n";
+$e = explode(",", ",a,");
+echo "[" . implode("|", $e) . "] count=" . count($e) . "\n";
+$e = explode(",", ",a,", 2);
+echo "[" . implode("|", $e) . "] count=" . count($e) . "\n";
+$e = explode(",", "a,,,");
+echo "[" . implode("|", $e) . "] count=" . count($e) . "\n";
+$e = explode(",", "a,,,", -2);
+echo "[" . implode("|", $e) . "] count=" . count($e) . "\n";
+$e = explode(",", "a,b", -5);
+echo "[" . implode("|", $e) . "] count=" . count($e) . "\n";
+$e = explode("::", "a::b::c");
+echo "[" . implode("|", $e) . "] count=" . count($e) . "\n";
+echo implode(" ", ["a", "b"]) . "\n";
+echo implode(["a", "b", "c"]) . "\n";
+echo implode("-", [1, 2, 3]) . "\n";
+echo implode("-", [1.5, 2]) . "\n";
+echo implode("|", [true, false]) . "\n";
+$w = explode(" ", "the quick brown fox jumps over the lazy dog");
+echo count($w) . " words, longest: " . strtoupper($w[4]) . "\n";
+"#;
+    let f = temp_php("m2explode", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let expected = "\
+[a|b|c] count=3
+[a|b,c] count=2
+[a|b] count=2
+[a,b,c] count=1
+[abc] count=1
+[] count=1
+[|a|] count=3
+[|a,] count=2
+[a|||] count=4
+[a|] count=2
+[] count=0
+[a|b|c] count=3
+a b
+abc
+1-2-3
+1.5-2
+1|
+9 words, longest: JUMPS
+";
+    assert_eq!(r.stdout, expected);
+}
+
+#[test]
+fn str_repeat_negative_is_fatal() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let f = temp_php("repneg", "<?php echo str_repeat(\"a\", -1);");
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 255, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("str_repeat(): Argument #2 ($times) must be greater than or equal to 0"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn explode_empty_separator_is_fatal() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let f = temp_php(
+        "exempty",
+        "<?php echo implode(\"|\", explode(\"\", \"ab\"));",
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 255, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("explode(): Argument #1 ($separator) must not be empty"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
 fn control_flow_breadth() {
     if !have_cc() {
         eprintln!("skipping: no C compiler");

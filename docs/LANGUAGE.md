@@ -236,6 +236,16 @@ subjects are compared with loose/strict equality respectively.
 | `strval(int\|float\|bool\|string): string` | convert to string | |
 | `abs(int): int`, `abs(float): float` | absolute value | |
 | `count(array<T>): int` | number of elements | `E0234` if not an array |
+| `strtoupper(string): string` | ASCII bytes → upper | `é` stays `é`, like PHP |
+| `strtolower(string): string` | ASCII bytes → lower | |
+| `trim(string[, string]): string` | strip ends | optional byte mask; default `` " \t\n\r\0\x0B" ``; explicit `""` strips nothing |
+| `ltrim(string[, string]): string` | strip left end | |
+| `rtrim(string[, string]): string` | strip right end | |
+| `substr(string, int[, int]): string` | substring | PHP 8 semantics: clamp, negative length, `""` never `false` |
+| `str_repeat(string, int): string` | repeat | negative count → fatal `ValueError` |
+| `str_replace(string, string, string): string` | replace | non-overlapping, no rescan; array form rejected (`E0234`) |
+| `implode(string, array<string\|int\|float\|bool>): string` | join with glue | 1-arg form `implode(array)` uses `""`; elements `(string)`-coerced |
+| `explode(string, string[, int]): string[]` | split into `array<string>` | `0` limit ≡ `1`; negative drops trailing pieces; empty separator fatal `ValueError` |
 
 ## Scoping
 

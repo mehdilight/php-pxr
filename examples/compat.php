@@ -146,3 +146,39 @@ echo "floats=" . 1e14 . "," . 1e16 . "," . 1e-5 . "," . (0.1 + 0.2) . "," .
 $nul = "a\0b";
 echo "nul=" . strlen($nul) . "," . ($nul === "a\0b" ? "eq" : "ne") . "," .
     strlen($nul . "c") . "\n";
+
+// --- milestone 2: string builtins ------------------------------------------
+
+echo strtoupper("Hello, World 123!") . " " . strtolower("HeLLo 123!") . "\n";
+echo strtoupper("héllo") . "\n";
+echo "[" . trim("  hello \n\t") . "] [" . trim("xxhelloxy", "xy") . "]\n";
+echo "[" . ltrim("  hi  ") . "] [" . rtrim("  hi  ") . "] [" . rtrim("hello///", "/") . "]\n";
+echo "[" . trim(" \x0b x \x0b") . "] [" . trim(" \x00 ab \x00 ") . "]\n";
+echo substr("abcdef", 1) . " " . substr("abcdef", -4) . " " . substr("abcdef", 2, 3) . " " .
+    substr("abcdef", -3, -1) . " " . substr("abcdef", 0, 99) . " " .
+    substr("abcdef", 4, -1) . "\n";
+echo "[" . substr("a", 2) . "] [" . substr("abcdef", 6) . "] [" . substr("abcdef", 2, 0) . "]\n";
+echo str_repeat("ab", 3) . " [" . str_repeat("ab", 0) . "]\n";
+echo str_replace("l", "L", "hello world") . "\n";
+echo str_replace("ab", "aab", "abab") . " " . str_replace("aa", "x", "aaaa") . "\n";
+
+$pieces = explode(",", "a,b,c");
+echo "ex=" . implode("|", $pieces) . " count=" . count($pieces) . "\n";
+$pieces = explode(",", "a,b,c", 2);
+echo "ex2=" . implode("|", $pieces) . "\n";
+$pieces = explode(",", "a,b,c", -1);
+echo "ex-1=" . implode("|", $pieces) . "\n";
+$pieces = explode(",", ",a,");
+echo "exedge=" . implode("|", $pieces) . " count=" . count($pieces) . "\n";
+echo "im=" . implode("-", ["x", "y", "z"]) . " " . implode(["a", "b"]) . "\n";
+echo "imnum=" . implode("-", [1, 2, 3]) . " " . implode("-", [1.5, 2]) . " " . implode("|", [true, false]) . "\n";
+
+// A word count with the string subset, like a compile-able PHP program.
+$words = explode(" ", "the quick brown fox");
+$longest = "";
+foreach ($words as $w) {
+    if (strlen($w) > strlen($longest)) {
+        $longest = $w;
+    }
+}
+echo "words=" . count($words) . " longest=" . strtoupper($longest) . "\n";

@@ -704,3 +704,300 @@ void *pxr_array_copy(void *p) {
     }
     return d;
 }
+
+/* ------------------------------------------------- M2 string builtins ----
+ *
+ * All of these reproduce PHP's exact byte-level behaviour, verified against
+ * PHP 8.4. Byte strings are length-prefixed, so embedded NULs flow through
+ * every operation below.
+ */
+
+pxr_str *pxr_str_toupper(const pxr_str *s) {
+    pxr_str *out = pxr_str_alloc(s->len);
+    for (size_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        out->data[i] = (char)((c >= 'a' && c <= 'z') ? (unsigned char)(c - 32) : c);
+    }
+    return out;
+}
+
+pxr_str *pxr_str_tolower(const pxr_str *s) {
+    pxr_str *out = pxr_str_alloc(s->len);
+    for (size_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        out->data[i] = (char)((c >= 'A' && c <= 'Z') ? (unsigned char)(c + 32) : c);
+    }
+    return out;
+}
+
+/* PHP's default trim mask: space, tab, newline, carriage return, NUL and
+ * vertical tab. A non-NULL `mask` replaces it entirely (an empty mask strips
+ * nothing, matching PHP). */
+static int pxr_trim_char(unsigned char c, const pxr_str *mask) {
+    if (mask) {
+        for (size_t i = 0; i < mask->len; i++) {
+            if ((unsigned char)mask->data[i] == c) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+    switch (c) {
+        case ' ':
+        case '\t':
+        case '\n':
+        case '\r':
+        case '\0':
+        case '\v':
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/* mode: 0 = trim both ends, 1 = trim left only, 2 = trim right only. */
+pxr_str *pxr_str_trim(const pxr_str *s, const pxr_str *mask, long long mode) {
+    size_t begin = 0, end = s->len;
+    if (mode != 2) {
+        while (begin < end && pxr_trim_char((unsigned char)s->data[begin], mask)) {
+            begin++;
+        }
+    }
+    if (mode != 1) {
+        while (end > begin && pxr_trim_char((unsigned char)s->data[end - 1], mask)) {
+            end--;
+        }
+    }
+    pxr_str *out = pxr_str_alloc(end - begin);
+    memcpy(out->data, s->data + begin, end - begin);
+    return out;
+}
+
+/* PHP 8 `substr`: offsets clamp, negative length cuts from the end, and
+ * out-of-range results are the empty string (never `false`). */
+pxr_str *pxr_substr(const pxr_str *s, long long f, long long l, long long has_len) {
+    long long len = (long long)(s ? s->len : 0);
+    if (f < 0) {
+        f = len + f;
+        if (f < 0) {
+            f = 0;
+        }
+    }
+    long long length;
+    if (has_len) {
+        length = l;
+        if (length < 0) {
+            length = len + length - f;
+            if (length < 0) {
+                length = 0;
+            }
+        } else if (length > len - f) {
+            length = len - f;
+        }
+    } else {
+        length = len - f;
+    }
+    if (f > len || f == len || length <= 0) {
+        return pxr_str_alloc(0);
+    }
+    pxr_str *out = pxr_str_alloc((size_t)length);
+    memcpy(out->data, s->data + f, (size_t)length);
+    return out;
+}
+
+pxr_str *pxr_str_repeat(const pxr_str *s, long long n) {
+    if (n < 0) {
+        fprintf(stderr,
+                "Fatal error: Uncaught ValueError: str_repeat(): Argument #2 "
+                "($times) must be greater than or equal to 0\n");
+        exit(255);
+    }
+    if (n == 0 || s->len == 0) {
+        return pxr_str_alloc(0);
+    }
+    size_t sl = s->len;
+    pxr_str *out = pxr_str_alloc(sl * (size_t)n);
+    for (long long i = 0; i < n; i++) {
+        memcpy(out->data + (size_t)i * sl, s->data, sl);
+    }
+    return out;
+}
+
+/* PHP `str_replace` with string arguments: replace every non-overlapping
+ * occurrence scanning left to right, without rescanning replacement text. An
+ * empty search returns the subject unchanged. */
+pxr_str *pxr_str_replace(const pxr_str *hay, const pxr_str *rep, const pxr_str *subj) {
+    size_t hl = hay ? hay->len : 0;
+    size_t rl = rep ? rep->len : 0;
+    size_t sl = subj ? subj->len : 0;
+    if (hl == 0) {
+        return (pxr_str *)subj;
+    }
+    size_t count = 0;
+    const char *p = subj->data;
+    const char *end = subj->data + sl;
+    while ((size_t)(end - p) >= hl) {
+        if (memcmp(p, hay->data, hl) == 0) {
+            count++;
+            p += hl;
+        } else {
+            p++;
+        }
+    }
+    if (count == 0) {
+        return (pxr_str *)subj;
+    }
+    pxr_str *out = pxr_str_alloc(sl + count * (rl - hl));
+    char *o = out->data;
+    p = subj->data;
+    while ((size_t)(end - p) >= hl) {
+        if (memcmp(p, hay->data, hl) == 0) {
+            memcpy(o, rep->data, rl);
+            o += rl;
+            p += hl;
+        } else {
+            *o++ = *p++;
+        }
+    }
+    memcpy(o, p, (size_t)(end - p));
+    return out;
+}
+
+/* Unpack a float stored as its IEEE-754 bit pattern in an i64 payload. */
+static double pxr_bits_to_double(long long bits) {
+    double d;
+    memcpy(&d, &bits, sizeof d);
+    return d;
+}
+
+/* String form of an array value by its runtime tag and payload. */
+static pxr_str *pxr_val_to_str(long long tag, long long bits) {
+    switch (tag) {
+        case PXR_TAG_INT:
+            return pxr_i64_to_str((long long)bits);
+        case PXR_TAG_FLOAT:
+            return pxr_f64_to_str(pxr_bits_to_double(bits));
+        case PXR_TAG_BOOL:
+            return pxr_bool_to_str((int)bits);
+        default: /* PXR_TAG_STR */
+            return (pxr_str *)(intptr_t)bits;
+    }
+}
+
+/* `implode`: join array values in insertion order with `glue`, coercing each
+ * scalar element exactly as PHP does (`(string)` cast; floats via zend_gcvt). */
+pxr_str *pxr_implode(const pxr_str *glue, void *p) {
+    pxr_array *a = (pxr_array *)p;
+    size_t gl = glue ? glue->len : 0;
+    size_t total = a->len ? (a->len - 1) * gl : 0;
+    for (size_t i = 0; i < a->len; i++) {
+        pxr_str *v = pxr_val_to_str(a->ents[i].vt, a->ents[i].bits);
+        total += v->len;
+    }
+    pxr_str *out = pxr_str_alloc(total);
+    size_t o = 0;
+    for (size_t i = 0; i < a->len; i++) {
+        if (i > 0) {
+            memcpy(out->data + o, glue->data, gl);
+            o += gl;
+        }
+        pxr_str *v = pxr_val_to_str(a->ents[i].vt, a->ents[i].bits);
+        memcpy(out->data + o, v->data, v->len);
+        o += v->len;
+    }
+    return out;
+}
+
+/* Find the first occurrence of `needle` in `data[0..n)` (no built-in memmem). */
+static const char *pxr_find(const char *data, size_t n, const char *needle, size_t nl) {
+    if (nl == 0 || nl > n) {
+        return NULL;
+    }
+    for (size_t i = 0; i + nl <= n; i++) {
+        if (memcmp(data + i, needle, nl) == 0) {
+            return data + i;
+        }
+    }
+    return NULL;
+}
+
+static void pxr_explode_push(pxr_array *out, const char *data, size_t len) {
+    pxr_str *piece = pxr_str_alloc(len);
+    memcpy(piece->data, data, len);
+    pxr_array_push(out, PXR_TAG_STR, (long long)(intptr_t)piece);
+}
+
+/* `explode`: split by a non-empty separator. Positive limits keep the rest of
+ * the string as the final piece; `0` means `1`; negative limits drop the last
+ * |limit| pieces. Trailing empty pieces are preserved exactly like PHP. */
+void *pxr_explode(const pxr_str *sep, const pxr_str *s, long long limit) {
+    pxr_str *es = (pxr_str *)sep;
+    pxr_str *st = (pxr_str *)s;
+    if (!es || es->len == 0) {
+        fprintf(stderr,
+                "Fatal error: Uncaught ValueError: explode(): Argument #1 "
+                "($separator) must not be empty\n");
+        exit(255);
+    }
+    pxr_array *out = (pxr_array *)pxr_array_new();
+    size_t sl = st ? st->len : 0;
+    size_t dl = es->len;
+    const char *data = st ? st->data : "";
+    const char *end = data + sl;
+    if (limit == 0) {
+        limit = 1;
+    }
+    if (limit > 0) {
+        const char *p = data;
+        long long n = 0;
+        while (n < limit - 1) {
+            const char *hit = pxr_find(p, (size_t)(end - p), es->data, dl);
+            if (!hit) {
+                break;
+            }
+            pxr_explode_push(out, p, (size_t)(hit - p));
+            p = hit + dl;
+            n++;
+        }
+        pxr_explode_push(out, p, (size_t)(end - p));
+        return out;
+    }
+    /* Negative limit: split fully, then keep all but the last |limit| pieces. */
+    long long total = 1;
+    const char *p = data;
+    while (p < end) {
+        const char *hit = pxr_find(p, (size_t)(end - p), es->data, dl);
+        if (!hit) {
+            break;
+        }
+        total++;
+        p = hit + dl;
+    }
+    long long keep = total + limit; /* limit < 0 */
+    if (keep <= 0) {
+        return out;
+    }
+    p = data;
+    long long n = 0;
+    while (p < end && n < keep) {
+        const char *hit = pxr_find(p, (size_t)(end - p), es->data, dl);
+        if (hit) {
+            pxr_explode_push(out, p, (size_t)(hit - p));
+            p = hit + dl;
+            n++;
+        } else {
+            pxr_explode_push(out, p, (size_t)(end - p));
+            p = end;
+            n++;
+        }
+    }
+    return out;
+}
+
+long long pxr_array_val_tag_at(void *p, long long i) {
+    pxr_array *a = (pxr_array *)p;
+    if (i < 0 || (size_t)i >= a->len) {
+        return 0;
+    }
+    return a->ents[(size_t)i].vt;
+}

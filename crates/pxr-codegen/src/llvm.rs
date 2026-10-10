@@ -56,7 +56,17 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     ("pxr_array_has", "i64", &["ptr", "i64", "i64", "ptr"]),
     ("pxr_array_count", "i64", &["ptr"]),
     ("pxr_array_val_bits_at", "i64", &["ptr", "i64"]),
+    ("pxr_array_val_tag_at", "i64", &["ptr", "i64"]),
     ("pxr_array_copy", "ptr", &["ptr"]),
+    // String builtins (M2). All operate on `pxr_str *` byte strings.
+    ("pxr_str_toupper", "ptr", &["ptr"]),
+    ("pxr_str_tolower", "ptr", &["ptr"]),
+    ("pxr_str_trim", "ptr", &["ptr", "ptr", "i64"]),
+    ("pxr_substr", "ptr", &["ptr", "i64", "i64", "i64"]),
+    ("pxr_str_repeat", "ptr", &["ptr", "i64"]),
+    ("pxr_str_replace", "ptr", &["ptr", "ptr", "ptr"]),
+    ("pxr_implode", "ptr", &["ptr", "ptr"]),
+    ("pxr_explode", "ptr", &["ptr", "ptr", "i64"]),
 ];
 
 pub fn llty(ty: &Ty) -> &'static str {
@@ -66,7 +76,9 @@ pub fn llty(ty: &Ty) -> &'static str {
         Ty::Int => "i64",
         Ty::Float => "double",
         Ty::String => "ptr",
-        Ty::Null => "i8",
+        // A `null` value is a null pointer (`inttoptr i64 0 to ptr`); the null
+        // literal itself is otherwise rejected at compile time.
+        Ty::Null => "ptr",
         Ty::Array(_) => "ptr",
         Ty::Named(_) => "ptr",
     }
@@ -272,6 +284,7 @@ impl<'a> FnGen<'a> {
                             Ty::String,
                         )
                     }
+                    Literal::Null => (format!("%v{dst} = inttoptr i64 0 to ptr"), Ty::Null),
                 };
                 self.set(*dst, ty);
                 self.line(&line);

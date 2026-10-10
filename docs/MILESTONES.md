@@ -125,7 +125,7 @@ byte strings** (`pxr_str { len, data[] }`, still a single `ptr` in the ABI), so
 embedded NULs are first-class: `strlen("a\0b")` is `3`, equality/ordering and
 concatenation are byte-exact — matching PHP.
 
-## ⛔ M2 — Strings & standard library
+## 🚧 M2 — Strings & standard library
 
 * Owned string type (length + data, embedded NUL safe) — **done** in the M1.x
   fidelity round; string interpolation remains.
@@ -133,7 +133,32 @@ concatenation are byte-exact — matching PHP.
   PXR sources or intrinsic.
 * `sprintf`, `explode`/`implode`, `str_replace`, `substr`, `str_*`, `array_*`.
 
-**Acceptance.** A string‑heavy program (e.g. word count) compiles and matches PHP.
+**Delivered (M2.strings slice).**
+
+* `strtoupper`, `strtolower` — ASCII byte mapping, `"héllo"` → `"héllo"` like PHP.
+* `trim`/`ltrim`/`rtrim` — PHP default mask `` " \t\n\r\0\x0B" ``, byte masks, an
+  explicit empty mask strips nothing (`mask == NULL` means "default").
+* `substr` — PHP 8 exact: offsets clamp, negative length cuts from the end,
+  out-of-range → `""` (never `false`).
+* `str_repeat` — negative count → PHP's fatal `ValueError` (exit 255).
+* `str_replace` — string form only, PHP's non-overlapping left-to-right scan.
+* `implode` — `(array)` / `(separator, array)`, scalar elements `(string)`-coerced
+  via the same `zend_gcvt` float path; arrays of arrays rejected at compile time.
+* `explode` — `array<string>`, positive/`0`/negative limits exactly as PHP,
+  empty separator → fatal `ValueError`; default limit `PHP_INT_MAX`.
+* Infrastructure: `Callee::Builtin` now carries `Vec<Ty>` argument types; the 1‑arg
+  builtin machinery became a general multi‑arg/optional‑arg lowering (`substr`
+  length, `explode` limit, `trim` mask, `implode` glue all default in codegen);
+  `Literal::Null` added for the "no charlist" pointer.
+* All operations are length‑aware, so embedded NULs flow through everywhere
+  (`substr("a\0b", 1, 1)` → `"\0"`).
+* Tests: +4 CLI tests (`string_builtins_match_php`, `explode_implode_match_php`,
+  `str_repeat_negative_is_fatal`, `explode_empty_separator_is_fatal`) — 31 CLI
+  tests total; `examples/compat.php` extended and still asserted byte‑identical
+  to PHP against PHP 8.4.
+
+**Acceptance.** A string‑heavy program (e.g. word count) compiles and matches PHP —
+the word‑count block at the end of `examples/compat.php` does exactly this. ✅
 
 ## ⛔ M3 — User types & modules
 

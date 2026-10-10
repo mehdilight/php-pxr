@@ -1626,77 +1626,101 @@ impl Lowerer {
                 });
                 dst
             }
-            Callee::Builtin { kind, arg_ty } => {
-                let a = self.lower_expr(&args[0]);
-                self.lower_builtin(*kind, arg_ty, a)
+            Callee::Builtin { kind, arg_tys } => {
+                let vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
+                self.lower_builtin(*kind, arg_tys, &vals, args.len())
             }
         }
     }
 
-    fn lower_builtin(&mut self, kind: Builtin, arg_ty: &Ty, a: Value) -> Value {
+    /// Emit a one-shot runtime call and return its result value.
+    fn rt_call(&mut self, callee: &str, args: Vec<Value>, ret: Ty) -> Value {
+        let dst = self.fresh();
+        self.emit(Inst::Call {
+            dst: Some(dst),
+            callee: callee.into(),
+            args,
+            ret,
+        });
+        dst
+    }
+
+    fn lower_builtin(&mut self, kind: Builtin, arg_tys: &[Ty], a: &[Value], argc: usize) -> Value {
+        use Builtin::*;
         match kind {
-            Builtin::Strlen => {
-                let dst = self.fresh();
-                self.emit(Inst::Call {
-                    dst: Some(dst),
-                    callee: "pxr_strlen".into(),
-                    args: vec![a],
-                    ret: Ty::Int,
-                });
-                dst
+            Strlen => self.rt_call("pxr_strlen", vec![a[0]], Ty::Int),
+            Intval => match arg_tys[0] {
+                Ty::Int => a[0],
+                Ty::Float => self.cast(a[0], &Ty::Float, &Ty::Int),
+                Ty::Bool => self.cast(a[0], &Ty::Bool, &Ty::Int),
+                Ty::String => self.cast(a[0], &Ty::String, &Ty::Int),
+                _ => a[0],
+            },
+            Floatval => match arg_tys[0] {
+                Ty::Float => a[0],
+                Ty::Int => self.cast(a[0], &Ty::Int, &Ty::Float),
+                Ty::Bool => self.cast(a[0], &Ty::Bool, &Ty::Float),
+                Ty::String => self.cast(a[0], &Ty::String, &Ty::Float),
+                _ => a[0],
+            },
+            Strval => match arg_tys[0] {
+                Ty::String => a[0],
+                Ty::Int => self.cast(a[0], &Ty::Int, &Ty::String),
+                Ty::Float => self.cast(a[0], &Ty::Float, &Ty::String),
+                Ty::Bool => self.cast(a[0], &Ty::Bool, &Ty::String),
+                _ => a[0],
+            },
+            Abs => match arg_tys[0] {
+                Ty::Int => self.rt_call("pxr_abs_i64", vec![a[0]], Ty::Int),
+                _ => self.rt_call("fabs", vec![a[0]], Ty::Float),
+            },
+            Count => self.rt_call("pxr_array_count", vec![a[0]], Ty::Int),
+            Strtoupper => self.rt_call("pxr_str_toupper", vec![a[0]], Ty::String),
+            Strtolower => self.rt_call("pxr_str_tolower", vec![a[0]], Ty::String),
+            Trim | Ltrim | Rtrim => {
+                let mode = match kind {
+                    Trim => 0,
+                    Ltrim => 1,
+                    _ => 2,
+                };
+                let mask = a
+                    .get(1)
+                    .copied()
+                    .unwrap_or_else(|| self.emit_const(Literal::Null));
+                let mode_v = self.emit_const(Literal::Int(mode));
+                self.rt_call("pxr_str_trim", vec![a[0], mask, mode_v], Ty::String)
             }
-            Builtin::Intval => match arg_ty {
-                Ty::Int => a,
-                Ty::Float => self.cast(a, &Ty::Float, &Ty::Int),
-                Ty::Bool => self.cast(a, &Ty::Bool, &Ty::Int),
-                Ty::String => self.cast(a, &Ty::String, &Ty::Int),
-                _ => a,
-            },
-            Builtin::Floatval => match arg_ty {
-                Ty::Float => a,
-                Ty::Int => self.cast(a, &Ty::Int, &Ty::Float),
-                Ty::Bool => self.cast(a, &Ty::Bool, &Ty::Float),
-                Ty::String => self.cast(a, &Ty::String, &Ty::Float),
-                _ => a,
-            },
-            Builtin::Strval => match arg_ty {
-                Ty::String => a,
-                Ty::Int => self.cast(a, &Ty::Int, &Ty::String),
-                Ty::Float => self.cast(a, &Ty::Float, &Ty::String),
-                Ty::Bool => self.cast(a, &Ty::Bool, &Ty::String),
-                _ => a,
-            },
-            Builtin::Abs => match arg_ty {
-                Ty::Int => {
-                    let dst = self.fresh();
-                    self.emit(Inst::Call {
-                        dst: Some(dst),
-                        callee: "pxr_abs_i64".into(),
-                        args: vec![a],
-                        ret: Ty::Int,
-                    });
-                    dst
-                }
-                _ => {
-                    let dst = self.fresh();
-                    self.emit(Inst::Call {
-                        dst: Some(dst),
-                        callee: "fabs".into(),
-                        args: vec![a],
-                        ret: Ty::Float,
-                    });
-                    dst
-                }
-            },
-            Builtin::Count => {
-                let dst = self.fresh();
-                self.emit(Inst::Call {
-                    dst: Some(dst),
-                    callee: "pxr_array_count".into(),
-                    args: vec![a],
-                    ret: Ty::Int,
-                });
-                dst
+            Substr => {
+                let has_len = self.emit_const(Literal::Int(if argc >= 3 { 1 } else { 0 }));
+                let l = if argc >= 3 {
+                    a[2]
+                } else {
+                    self.emit_const(Literal::Int(0))
+                };
+                self.rt_call("pxr_substr", vec![a[0], a[1], l, has_len], Ty::String)
+            }
+            StrRepeat => self.rt_call("pxr_str_repeat", vec![a[0], a[1]], Ty::String),
+            StrReplace => self.rt_call("pxr_str_replace", vec![a[0], a[1], a[2]], Ty::String),
+            Implode => {
+                let glue = if argc == 1 {
+                    self.emit_const(Literal::Str(String::new()))
+                } else {
+                    a[0]
+                };
+                let arr = if argc == 1 { a[0] } else { a[1] };
+                self.rt_call("pxr_implode", vec![glue, arr], Ty::String)
+            }
+            Explode => {
+                let limit = if argc == 3 {
+                    a[2]
+                } else {
+                    self.emit_const(Literal::Int(i64::MAX))
+                };
+                self.rt_call(
+                    "pxr_explode",
+                    vec![a[0], a[1], limit],
+                    Ty::array(Ty::String),
+                )
             }
         }
     }

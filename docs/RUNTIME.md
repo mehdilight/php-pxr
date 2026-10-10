@@ -84,6 +84,22 @@ int    pxr_str_cmp(const pxr_str *a, const pxr_str *b);  /* byte-wise order */
 long long pxr_str_cmp_loose(const pxr_str *a, const pxr_str *b);
        /* PHP `==`/ordering/`<=>`: -1/0/1, numeric-aware for numeric strings */
 
+/* stdlib string builtins (all `pxr_str *`, byte-exact vs PHP 8.4) */
+pxr_str *pxr_str_toupper(const pxr_str *s);
+pxr_str *pxr_str_tolower(const pxr_str *s);
+pxr_str *pxr_str_trim(const pxr_str *s, const pxr_str *mask, long long mode);
+       /* mask == NULL -> PHP default " \t\n\r\0\x0B"; mode 0=both, 1=left, 2=right */
+pxr_str *pxr_substr(const pxr_str *s, long long off, long long len, long long has_len);
+       /* PHP 8 semantics; out-of-range -> "" (never false) */
+pxr_str *pxr_str_repeat(const pxr_str *s, long long n);  /* n<0 -> fatal ValueError */
+pxr_str *pxr_str_replace(const pxr_str *search, const pxr_str *replace,
+                         const pxr_str *subject);
+       /* non-overlapping, left-to-right, no rescan of replacements */
+pxr_str *pxr_implode(const pxr_str *glue, void *a);      /* (string) each scalar element */
+void    *pxr_explode(const pxr_str *sep, const pxr_str *s, long long limit);
+       /* -> new array<string>; empty sep -> fatal ValueError */
+long long pxr_array_val_tag_at(void *a, long long i);    /* element tag by index */
+
 /* math */
 long long pxr_abs_i64(long long v);
 long long pxr_shl(long long a, long long b);   /* PHP shift rules           */

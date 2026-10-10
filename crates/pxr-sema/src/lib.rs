@@ -36,6 +36,23 @@ pub enum Builtin {
     Abs,
     /// `count($array)` — number of elements.
     Count,
+    /// `strtoupper($str)` — ASCII case conversion (bytes only, like PHP).
+    Strtoupper,
+    Strtolower,
+    /// `trim($str[, $charlist])`.
+    Trim,
+    Ltrim,
+    Rtrim,
+    /// `substr($str, $offset[, $length])`.
+    Substr,
+    /// `str_repeat($str, $times)`.
+    StrRepeat,
+    /// `str_replace($search, $replace, $subject)` — string arguments only.
+    StrReplace,
+    /// `implode($glue, $pieces)` / `implode($pieces)`.
+    Implode,
+    /// `explode($separator, $str[, $limit])` → `array<string>`.
+    Explode,
 }
 
 impl Builtin {
@@ -47,6 +64,16 @@ impl Builtin {
             "strval" => Builtin::Strval,
             "abs" => Builtin::Abs,
             "count" => Builtin::Count,
+            "strtoupper" => Builtin::Strtoupper,
+            "strtolower" => Builtin::Strtolower,
+            "trim" => Builtin::Trim,
+            "ltrim" => Builtin::Ltrim,
+            "rtrim" => Builtin::Rtrim,
+            "substr" => Builtin::Substr,
+            "str_repeat" => Builtin::StrRepeat,
+            "str_replace" => Builtin::StrReplace,
+            "implode" => Builtin::Implode,
+            "explode" => Builtin::Explode,
             _ => return None,
         })
     }
@@ -59,6 +86,16 @@ impl Builtin {
             Builtin::Strval => "strval",
             Builtin::Abs => "abs",
             Builtin::Count => "count",
+            Builtin::Strtoupper => "strtoupper",
+            Builtin::Strtolower => "strtolower",
+            Builtin::Trim => "trim",
+            Builtin::Ltrim => "ltrim",
+            Builtin::Rtrim => "rtrim",
+            Builtin::Substr => "substr",
+            Builtin::StrRepeat => "str_repeat",
+            Builtin::StrReplace => "str_replace",
+            Builtin::Implode => "implode",
+            Builtin::Explode => "explode",
         }
     }
 }
@@ -74,8 +111,8 @@ pub enum Callee {
     },
     Builtin {
         kind: Builtin,
-        /// The single argument's type, after semantic resolution.
-        arg_ty: Ty,
+        /// The argument types, after semantic resolution.
+        arg_tys: Vec<Ty>,
     },
 }
 
@@ -1881,6 +1918,40 @@ impl Analyzer {
         None
     }
 
+    /// Emit an arity error for a builtin call and abort the call type.
+    fn builtin_arity_err(
+        &mut self,
+        name: &str,
+        min: usize,
+        max: usize,
+        got: usize,
+        span: Span,
+    ) -> Option<TExpr> {
+        let want = if min == max {
+            min.to_string()
+        } else {
+            format!("{min} to {max}")
+        };
+        self.diags.emit(
+            Diagnostic::error(format!(
+                "builtin `{name}` expects {want} argument(s), but {got} were given"
+            ))
+            .with_code("E0233")
+            .with_span(span),
+        );
+        None
+    }
+
+    /// Emit a type error for a builtin argument and abort the call type.
+    fn builtin_ty_err(&mut self, name: &str, desc: &str, found: &Ty, span: Span) -> Option<TExpr> {
+        self.diags.emit(
+            Diagnostic::error(format!("`{name}` expects {desc}, found `{found}`"))
+                .with_code("E0234")
+                .with_span(span),
+        );
+        None
+    }
+
     fn infer_builtin(
         &mut self,
         kind: Builtin,
@@ -1890,87 +1961,178 @@ impl Analyzer {
         span: Span,
         ctx: &mut FnCtx,
     ) -> Option<TExpr> {
-        if args.len() != 1 {
-            self.diags.emit(
-                Diagnostic::error(format!(
-                    "builtin `{}` expects 1 argument, but {} were given",
-                    kind.name(),
-                    args.len()
-                ))
-                .with_code("E0233")
-                .with_span(span),
-            );
-            return None;
+        let name = kind.name();
+        let mut targs = Vec::new();
+        for a in args {
+            targs.push(self.infer(a, ctx)?);
         }
-        let arg = self.infer(&args[0], ctx)?;
-        let at = arg.ty();
+        let atys: Vec<Ty> = targs.iter().map(|t| t.ty()).collect();
+        let n = args.len();
 
         let ret = match kind {
             Builtin::Strlen => {
-                if at != Ty::String {
-                    self.diags.emit(
-                        Diagnostic::error(format!("`strlen` expects a `string`, found `{at}`"))
-                            .with_code("E0234")
-                            .with_span(args[0].span()),
-                    );
-                    return None;
+                if n != 1 {
+                    return self.builtin_arity_err(name, 1, 1, n, span);
+                }
+                if atys[0] != Ty::String {
+                    return self.builtin_ty_err(name, "a `string`", &atys[0], args[0].span());
                 }
                 Ty::Int
             }
             Builtin::Intval => {
-                if !matches!(at, Ty::Int | Ty::Float | Ty::Bool | Ty::String) {
-                    self.diags.emit(
-                        Diagnostic::error(format!("`intval` expects a scalar, found `{at}`"))
-                            .with_code("E0234")
-                            .with_span(args[0].span()),
-                    );
-                    return None;
+                if n != 1 {
+                    return self.builtin_arity_err(name, 1, 1, n, span);
+                }
+                if !atys[0].is_scalar() {
+                    return self.builtin_ty_err(name, "a scalar", &atys[0], args[0].span());
                 }
                 Ty::Int
             }
             Builtin::Floatval => {
-                if !matches!(at, Ty::Int | Ty::Float | Ty::Bool | Ty::String) {
-                    self.diags.emit(
-                        Diagnostic::error(format!("`floatval` expects a scalar, found `{at}`"))
-                            .with_code("E0234")
-                            .with_span(args[0].span()),
-                    );
-                    return None;
+                if n != 1 {
+                    return self.builtin_arity_err(name, 1, 1, n, span);
+                }
+                if !atys[0].is_scalar() {
+                    return self.builtin_ty_err(name, "a scalar", &atys[0], args[0].span());
                 }
                 Ty::Float
             }
             Builtin::Strval => {
-                if !matches!(at, Ty::Int | Ty::Float | Ty::Bool | Ty::String) {
-                    self.diags.emit(
-                        Diagnostic::error(format!("`strval` expects a scalar, found `{at}`"))
-                            .with_code("E0234")
-                            .with_span(args[0].span()),
-                    );
-                    return None;
+                if n != 1 {
+                    return self.builtin_arity_err(name, 1, 1, n, span);
+                }
+                if !atys[0].is_scalar() {
+                    return self.builtin_ty_err(name, "a scalar", &atys[0], args[0].span());
                 }
                 Ty::String
             }
             Builtin::Abs => {
-                if !at.is_numeric() {
-                    self.diags.emit(
-                        Diagnostic::error(format!("`abs` expects `int` or `float`, found `{at}`"))
-                            .with_code("E0234")
-                            .with_span(args[0].span()),
-                    );
-                    return None;
+                if n != 1 {
+                    return self.builtin_arity_err(name, 1, 1, n, span);
                 }
-                at.clone()
+                if !atys[0].is_numeric() {
+                    return self.builtin_ty_err(name, "`int` or `float`", &atys[0], args[0].span());
+                }
+                atys[0].clone()
             }
             Builtin::Count => {
-                if !at.is_array() {
-                    self.diags.emit(
-                        Diagnostic::error(format!("`count` expects an array, found `{at}`"))
-                            .with_code("E0234")
-                            .with_span(args[0].span()),
-                    );
-                    return None;
+                if n != 1 {
+                    return self.builtin_arity_err(name, 1, 1, n, span);
+                }
+                if !atys[0].is_array() {
+                    return self.builtin_ty_err(name, "an array", &atys[0], args[0].span());
                 }
                 Ty::Int
+            }
+            Builtin::Strtoupper | Builtin::Strtolower => {
+                if n != 1 {
+                    return self.builtin_arity_err(name, 1, 1, n, span);
+                }
+                if atys[0] != Ty::String {
+                    return self.builtin_ty_err(name, "a `string`", &atys[0], args[0].span());
+                }
+                Ty::String
+            }
+            Builtin::Trim | Builtin::Ltrim | Builtin::Rtrim => {
+                if !(1..=2).contains(&n) {
+                    return self.builtin_arity_err(name, 1, 2, n, span);
+                }
+                for (i, ty) in atys.iter().enumerate() {
+                    if *ty != Ty::String {
+                        return self.builtin_ty_err(name, "`string` arguments", ty, args[i].span());
+                    }
+                }
+                Ty::String
+            }
+            Builtin::Substr => {
+                if !(2..=3).contains(&n) {
+                    return self.builtin_arity_err(name, 2, 3, n, span);
+                }
+                if atys[0] != Ty::String {
+                    return self.builtin_ty_err(name, "a `string`", &atys[0], args[0].span());
+                }
+                for (i, ty) in atys.iter().enumerate().skip(1) {
+                    if *ty != Ty::Int {
+                        return self.builtin_ty_err(
+                            name,
+                            "an `int` offset/length",
+                            ty,
+                            args[i].span(),
+                        );
+                    }
+                }
+                Ty::String
+            }
+            Builtin::StrRepeat => {
+                if n != 2 {
+                    return self.builtin_arity_err(name, 2, 2, n, span);
+                }
+                if atys[0] != Ty::String {
+                    return self.builtin_ty_err(name, "a `string`", &atys[0], args[0].span());
+                }
+                if atys[1] != Ty::Int {
+                    return self.builtin_ty_err(name, "an `int` count", &atys[1], args[1].span());
+                }
+                Ty::String
+            }
+            Builtin::StrReplace => {
+                if n != 3 {
+                    return self.builtin_arity_err(name, 3, 3, n, span);
+                }
+                for (i, ty) in atys.iter().enumerate() {
+                    if *ty != Ty::String {
+                        return self.builtin_ty_err(name, "`string` arguments", ty, args[i].span());
+                    }
+                }
+                Ty::String
+            }
+            Builtin::Implode => {
+                if !(1..=2).contains(&n) {
+                    return self.builtin_arity_err(name, 1, 2, n, span);
+                }
+                if n == 2 && atys[0] != Ty::String {
+                    return self.builtin_ty_err(
+                        name,
+                        "a `string` separator",
+                        &atys[0],
+                        args[0].span(),
+                    );
+                }
+                let arr_ty = if n == 1 { &atys[0] } else { &atys[1] };
+                let elem = match arr_ty {
+                    Ty::Array(e) => &**e,
+                    _ => {
+                        return self.builtin_ty_err(
+                            name,
+                            "an array of scalar values",
+                            arr_ty,
+                            args[n - 1].span(),
+                        )
+                    }
+                };
+                if !elem.is_scalar() {
+                    return self.builtin_ty_err(
+                        name,
+                        "an array of `string|int|float|bool` elements",
+                        elem,
+                        args[n - 1].span(),
+                    );
+                }
+                Ty::String
+            }
+            Builtin::Explode => {
+                if !(2..=3).contains(&n) {
+                    return self.builtin_arity_err(name, 2, 3, n, span);
+                }
+                for (i, ty) in atys.iter().enumerate().take(2) {
+                    if *ty != Ty::String {
+                        return self.builtin_ty_err(name, "`string` arguments", ty, args[i].span());
+                    }
+                }
+                if n == 3 && atys[2] != Ty::Int {
+                    return self.builtin_ty_err(name, "an `int` limit", &atys[2], args[2].span());
+                }
+                Ty::array(Ty::String)
             }
         };
 
@@ -1979,11 +2141,11 @@ impl Analyzer {
         Some(TExpr::Call {
             callee: Callee::Builtin {
                 kind,
-                arg_ty: at.clone(),
+                arg_tys: atys.clone(),
             },
             ret,
-            arg_tys: vec![at],
-            args: vec![arg],
+            arg_tys: atys,
+            args: targs,
             span,
         })
     }

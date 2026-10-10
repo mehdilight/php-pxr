@@ -24,6 +24,8 @@ pub enum Literal {
     Float(f64),
     Bool(bool),
     Str(String),
+    /// A null pointer (`ptr null`), e.g. "no charlist" for `trim`.
+    Null,
 }
 
 impl Literal {
@@ -33,6 +35,7 @@ impl Literal {
             Literal::Float(_) => Ty::Float,
             Literal::Bool(_) => Ty::Bool,
             Literal::Str(_) => Ty::String,
+            Literal::Null => Ty::Null,
         }
     }
 }
@@ -375,6 +378,7 @@ fn fmt_inst(inst: &Inst) -> String {
                 Literal::Float(f) => format_float(*f),
                 Literal::Bool(b) => b.to_string(),
                 Literal::Str(s) => format!("{s:?}"),
+                Literal::Null => "null".to_string(),
             };
             format!("%v{dst} = const {} {v}", lit.ty())
         }
