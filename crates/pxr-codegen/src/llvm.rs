@@ -109,6 +109,10 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     // Formatted printing builtins (M2): sprintf / printf.
     ("pxr_sprintf", "ptr", &["ptr", "ptr"]),
     ("pxr_printf", "i64", &["ptr", "ptr"]),
+    // Object runtime (M3.1).
+    ("pxr_object_new", "ptr", &["ptr", "i64"]),
+    ("pxr_object_get_bits", "i64", &["ptr", "i64"]),
+    ("pxr_object_set_bits", "void", &["ptr", "i64", "i64", "i64"]),
 ];
 
 pub fn llty(ty: &Ty) -> &'static str {
@@ -370,10 +374,10 @@ impl<'a> FnGen<'a> {
                     (Ty::Int, Ty::Bool) => format!("%v{dst} = trunc i64 %v{src} to i1"),
                     (Ty::Float, Ty::Int) => format!("%v{dst} = bitcast double %v{src} to i64"),
                     (Ty::Int, Ty::Float) => format!("%v{dst} = bitcast i64 %v{src} to double"),
-                    (Ty::String, Ty::Int) | (Ty::Array(_), Ty::Int) => {
+                    (Ty::String, Ty::Int) | (Ty::Array(_), Ty::Int) | (Ty::Named(_), Ty::Int) => {
                         format!("%v{dst} = ptrtoint ptr %v{src} to i64")
                     }
-                    (Ty::Int, Ty::String) | (Ty::Int, Ty::Array(_)) => {
+                    (Ty::Int, Ty::String) | (Ty::Int, Ty::Array(_)) | (Ty::Int, Ty::Named(_)) => {
                         format!("%v{dst} = inttoptr i64 %v{src} to ptr")
                     }
                     _ => format!("%v{dst} = bitcast i64 %v{src} to i64"),
@@ -396,12 +400,14 @@ impl<'a> FnGen<'a> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let head = match dst {
-                    Some(d) => format!("%v{d} = "),
-                    None => String::new(),
+                    Some(d) if *ret != Ty::Void => format!("%v{d} = "),
+                    _ => String::new(),
                 };
                 let line = format!("{head}call {} @{callee}({arglist})", llty(ret));
                 if let Some(d) = dst {
-                    self.set(*d, ret.clone());
+                    if *ret != Ty::Void {
+                        self.set(*d, ret.clone());
+                    }
                 }
                 self.line(&line);
             }

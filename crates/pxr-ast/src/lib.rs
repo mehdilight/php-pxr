@@ -40,6 +40,7 @@ pub enum Stmt {
         span: Span,
     },
     FnDecl(Box<FnDecl>),
+    ClassDecl(Box<ClassDecl>),
     Return(Option<Expr>, Span),
     If {
         cond: Expr,
@@ -114,6 +115,13 @@ pub enum LValue {
         index: Option<Box<Expr>>,
         span: Span,
     },
+    /// `$base->prop`.
+    Property {
+        base: Box<Expr>,
+        name: String,
+        name_span: Span,
+        span: Span,
+    },
 }
 
 impl LValue {
@@ -121,6 +129,7 @@ impl LValue {
         match self {
             LValue::Var { span, .. } => *span,
             LValue::Index { span, .. } => *span,
+            LValue::Property { span, .. } => *span,
         }
     }
 
@@ -129,6 +138,7 @@ impl LValue {
         match self {
             LValue::Var { name, .. } => name,
             LValue::Index { base, .. } => base.root_name(),
+            LValue::Property { name, .. } => name,
         }
     }
 }
@@ -148,6 +158,48 @@ pub struct Param {
     pub name: String,
     pub name_span: Span,
     pub ty: Option<TypeRef>,
+    pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Visibility {
+    Public,
+    Protected,
+    Private,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClassDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub members: Vec<ClassMember>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClassMember {
+    Property(PropertyDecl),
+    Method(MethodDecl),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropertyDecl {
+    pub visibility: Visibility,
+    pub ty: Option<TypeRef>,
+    pub name: String,
+    pub name_span: Span,
+    pub default: Option<Expr>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MethodDecl {
+    pub visibility: Visibility,
+    pub name: String,
+    pub name_span: Span,
+    pub params: Vec<Param>,
+    pub ret: Option<TypeRef>,
+    pub body: Vec<Stmt>,
     pub span: Span,
 }
 
@@ -291,6 +343,25 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
+    Property {
+        base: Box<Expr>,
+        name: String,
+        name_span: Span,
+        span: Span,
+    },
+    MethodCall {
+        base: Box<Expr>,
+        name: String,
+        name_span: Span,
+        args: Vec<Expr>,
+        span: Span,
+    },
+    New {
+        class_name: String,
+        class_span: Span,
+        args: Vec<Expr>,
+        span: Span,
+    },
     Paren(Box<Expr>, Span),
 }
 
@@ -329,7 +400,10 @@ impl Expr {
             | Expr::Index { span, .. }
             | Expr::ArrayLit { span, .. }
             | Expr::Match { span, .. }
-            | Expr::Call { span, .. } => *span,
+            | Expr::Call { span, .. }
+            | Expr::Property { span, .. }
+            | Expr::MethodCall { span, .. }
+            | Expr::New { span, .. } => *span,
         }
     }
 }

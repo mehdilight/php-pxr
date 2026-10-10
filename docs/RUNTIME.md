@@ -17,6 +17,7 @@ operations the backend emits.
 | `bool` | `int` in the ABI | `i1` (zero‑extended to `i32`/`i64` at calls) |
 | `string` | `pxr_str *` (length‑prefixed, NUL/binary‑safe) | `ptr` |
 | `array<T>` | opaque `void *` | `ptr` |
+| `ClassName` | `pxr_object *` | `ptr` |
 
 `bool` is `i1` inside generated code and is passed to the runtime as an `i32`
 (0/1).
@@ -158,7 +159,33 @@ long long pxr_array_has(void *a, long long ktag, long long ki, const char *ks); 
 long long pxr_array_count(void *a);
 long long pxr_array_val_bits_at(void *a, long long i);   /* foreach */
 void  *pxr_array_copy(void *a);                /* deep copy (value semantics) */
+
+/* objects — allocated in arena, properties indexed by slot */
+void      *pxr_object_new(const pxr_str *class_name, size_t num_props);
+long long  pxr_object_get_bits(void *obj, size_t prop_idx, const pxr_str *prop_name);
+void       pxr_object_set_bits(void *obj, size_t prop_idx, long long tag, long long bits);
 ```
+
+### Objects
+
+Objects are heap‑allocated structures allocated directly from the runtime bump
+arena:
+
+```c
+typedef struct {
+    const pxr_str *class_name;
+    size_t num_props;
+    int64_t *tags;
+    int64_t *bits;
+} pxr_object;
+```
+
+Properties are indexed statically by slot number ($0 \dots N-1$) determined at
+compile time. Property reads and writes operate on 64‑bit payloads and type tags
+via `pxr_object_get_bits` and `pxr_object_set_bits`, sharing the same bitcast
+encoding/decoding machinery as array elements. Null object dereferencing aborts
+with a PHP-faithful fatal error. Methods dispatch directly to link-time symbols
+mangled as `pxr$m$<class>$<method>` with `$this` prepended as the 0th parameter.
 
 Array values cross the ABI as a **type tag plus a 64‑bit payload**: `int` is the
 value itself, `bool` is zero‑extended, `float` is its IEEE‑754 bits

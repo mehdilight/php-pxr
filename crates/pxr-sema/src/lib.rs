@@ -275,6 +275,20 @@ pub enum TExpr {
         arg_tys: Vec<Ty>,
         span: Span,
     },
+    Property {
+        base: Box<TExpr>,
+        class_name: String,
+        prop_name: String,
+        prop_idx: u32,
+        ty: Ty,
+    },
+    New {
+        class_name: String,
+        num_props: u32,
+        prop_defaults: Vec<(u32, TExpr)>,
+        ctor: Option<(String, Vec<TExpr>, Vec<Ty>)>,
+        ty: Ty,
+    },
 }
 
 /// One arm of a typed `match`.
@@ -300,6 +314,8 @@ impl TExpr {
             TExpr::ArrayLit { ety, .. } => Ty::array(ety.clone()),
             TExpr::Index { ety, .. } => ety.clone(),
             TExpr::Call { ret, .. } => ret.clone(),
+            TExpr::Property { ty, .. } => ty.clone(),
+            TExpr::New { ty, .. } => ty.clone(),
         }
     }
 }
@@ -323,6 +339,13 @@ pub enum TTarget {
     Push {
         base: Box<TExpr>,
         elem_ty: Ty,
+    },
+    Property {
+        base: Box<TExpr>,
+        class_name: String,
+        prop_name: String,
+        prop_idx: u32,
+        ty: Ty,
     },
 }
 
@@ -424,10 +447,42 @@ pub struct TProgram {
 // Analyzer
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug)]
+pub struct ClassInfo {
+    pub name: String,
+    pub name_span: Span,
+    pub properties: Vec<PropertyInfo>,
+    pub prop_indices: HashMap<String, usize>,
+    pub methods: HashMap<String, MethodInfo>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PropertyInfo {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: Ty,
+    pub visibility: ast::Visibility,
+    pub default: Option<ast::Expr>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MethodInfo {
+    pub name: String,
+    pub name_span: Span,
+    pub mangled: String,
+    pub visibility: ast::Visibility,
+    pub params: Vec<Ty>,
+    pub param_names: Vec<String>,
+    pub ret: Ty,
+    pub ast_method: ast::MethodDecl,
+}
+
 pub struct Analyzer {
     diags: Diagnostics,
     /// lowercased name -> signature
     funcs: HashMap<String, Signature>,
+    /// lowercased name -> class info
+    classes: HashMap<String, ClassInfo>,
 }
 
 #[derive(Clone, Debug)]
@@ -450,6 +505,8 @@ struct FnCtx {
     loop_depth: u32,
     /// Enclosing switch nesting depth.
     switch_depth: u32,
+    /// Enclosing class (if currently inside a method).
+    current_class: Option<String>,
 }
 
 impl FnCtx {
@@ -461,6 +518,7 @@ impl FnCtx {
             is_main,
             loop_depth: 0,
             switch_depth: 0,
+            current_class: None,
         }
     }
 
@@ -496,6 +554,7 @@ pub fn analyze(program: &ast::Program) -> (Option<TProgram>, Diagnostics) {
     let mut a = Analyzer {
         diags: Diagnostics::new(),
         funcs: HashMap::new(),
+        classes: HashMap::new(),
     };
     let result = a.run(program);
     (result, a.diags)
@@ -503,9 +562,22 @@ pub fn analyze(program: &ast::Program) -> (Option<TProgram>, Diagnostics) {
 
 impl Analyzer {
     fn run(&mut self, program: &ast::Program) -> Option<TProgram> {
+        self.collect_classes(program);
         self.collect_signatures(program);
 
         let mut funcs = Vec::new();
+
+        // Analyze methods of classes
+        for class_key in self.classes.keys().cloned().collect::<Vec<_>>() {
+            let class = self.classes.get(&class_key).unwrap().clone();
+            for method in class.methods.values() {
+                if let Some(tf) = self.analyze_method(&class.name, method) {
+                    funcs.push(tf);
+                }
+            }
+        }
+
+        // Analyze user functions
         for item in &program.items {
             if let ast::Stmt::FnDecl(f) = item {
                 if let Some(tf) = self.analyze_function(f) {
@@ -518,7 +590,7 @@ impl Analyzer {
         let main_stmts: Vec<ast::Stmt> = program
             .items
             .iter()
-            .filter(|s| !matches!(s, ast::Stmt::FnDecl(_)))
+            .filter(|s| !matches!(s, ast::Stmt::FnDecl(_) | ast::Stmt::ClassDecl(_)))
             .cloned()
             .collect();
         let main = self.analyze_main(&main_stmts);
@@ -527,6 +599,197 @@ impl Analyzer {
             return None;
         }
         Some(TProgram { funcs, main: main? })
+    }
+
+    fn collect_classes(&mut self, program: &ast::Program) {
+        // Step 1: register all class names so forward references work
+        for item in &program.items {
+            let ast::Stmt::ClassDecl(c) = item else {
+                continue;
+            };
+            let key = c.name.to_ascii_lowercase();
+            if self.classes.contains_key(&key) {
+                self.diags.emit(
+                    Diagnostic::error(format!("class `{}` is already defined", c.name))
+                        .with_code("E0201")
+                        .with_span(c.name_span),
+                );
+                continue;
+            }
+            self.classes.insert(
+                key,
+                ClassInfo {
+                    name: c.name.clone(),
+                    name_span: c.name_span,
+                    properties: Vec::new(),
+                    prop_indices: HashMap::new(),
+                    methods: HashMap::new(),
+                },
+            );
+        }
+
+        // Step 2: resolve properties and methods
+        for item in &program.items {
+            let ast::Stmt::ClassDecl(c) = item else {
+                continue;
+            };
+            let key = c.name.to_ascii_lowercase();
+            let mut properties = Vec::new();
+            let mut prop_indices = HashMap::new();
+            let mut methods = HashMap::new();
+
+            for member in &c.members {
+                match member {
+                    ast::ClassMember::Property(p) => {
+                        if prop_indices.contains_key(&p.name) {
+                            self.diags.emit(
+                                Diagnostic::error(format!(
+                                    "property `${}` is already defined in class `{}`",
+                                    p.name, c.name
+                                ))
+                                .with_code("E0201")
+                                .with_span(p.name_span),
+                            );
+                            continue;
+                        }
+                        let ty = match &p.ty {
+                            Some(t) => self.resolve_type(t),
+                            None => {
+                                if let Some(def) = &p.default {
+                                    let mut dummy_ctx = FnCtx::new(Ty::Void, false);
+                                    if let Some(t_def) = self.infer(def, &mut dummy_ctx) {
+                                        t_def.ty()
+                                    } else {
+                                        Ty::Int
+                                    }
+                                } else {
+                                    self.diags.emit(
+                                        Diagnostic::error(format!(
+                                            "property `${}` needs an explicit type",
+                                            p.name
+                                        ))
+                                        .with_code("E0202")
+                                        .with_span(p.name_span)
+                                        .with_note("write e.g. `public int $x;`"),
+                                    );
+                                    Ty::Int
+                                }
+                            }
+                        };
+                        if ty == Ty::Void {
+                            self.diags.emit(
+                                Diagnostic::error("a property cannot have type `void`")
+                                    .with_code("E0203")
+                                    .with_span(p.span),
+                            );
+                        }
+                        let idx = properties.len();
+                        prop_indices.insert(p.name.clone(), idx);
+                        properties.push(PropertyInfo {
+                            name: p.name.clone(),
+                            name_span: p.name_span,
+                            ty,
+                            visibility: p.visibility,
+                            default: p.default.clone(),
+                        });
+                    }
+                    ast::ClassMember::Method(m) => {
+                        let mkey = m.name.to_ascii_lowercase();
+                        if methods.contains_key(&mkey) {
+                            self.diags.emit(
+                                Diagnostic::error(format!(
+                                    "method `{}` is already defined in class `{}`",
+                                    m.name, c.name
+                                ))
+                                .with_code("E0201")
+                                .with_span(m.name_span),
+                            );
+                            continue;
+                        }
+                        let mut params = Vec::new();
+                        let mut param_names = Vec::new();
+                        for param in &m.params {
+                            let pty = match &param.ty {
+                                Some(t) => self.resolve_type(t),
+                                None => {
+                                    self.diags.emit(
+                                        Diagnostic::error(format!(
+                                            "parameter `${}` needs an explicit type",
+                                            param.name
+                                        ))
+                                        .with_code("E0202")
+                                        .with_span(param.name_span),
+                                    );
+                                    Ty::Int
+                                }
+                            };
+                            if pty == Ty::Void {
+                                self.diags.emit(
+                                    Diagnostic::error("a parameter cannot have type `void`")
+                                        .with_code("E0203")
+                                        .with_span(param.span),
+                                );
+                            }
+                            params.push(pty);
+                            param_names.push(param.name.clone());
+                        }
+
+                        let ret = if mkey == "__construct" {
+                            if let Some(t) = &m.ret {
+                                let r = self.resolve_type(t);
+                                if r != Ty::Void {
+                                    self.diags.emit(
+                                        Diagnostic::error(
+                                            "constructor cannot declare a non-void return type",
+                                        )
+                                        .with_code("E0207")
+                                        .with_span(m.name_span),
+                                    );
+                                }
+                            }
+                            Ty::Void
+                        } else {
+                            match &m.ret {
+                                Some(t) => self.resolve_type(t),
+                                None => {
+                                    self.diags.emit(
+                                        Diagnostic::error(format!(
+                                            "method `{}` needs an explicit return type",
+                                            m.name
+                                        ))
+                                        .with_code("E0204")
+                                        .with_span(m.name_span)
+                                        .with_note("write e.g. `public function f(): int`"),
+                                    );
+                                    Ty::Int
+                                }
+                            }
+                        };
+
+                        let mangled = mangle_method(&c.name, &m.name);
+                        methods.insert(
+                            mkey,
+                            MethodInfo {
+                                name: m.name.clone(),
+                                name_span: m.name_span,
+                                mangled,
+                                visibility: m.visibility,
+                                params,
+                                param_names,
+                                ret,
+                                ast_method: m.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+
+            if let Some(info) = self.classes.get_mut(&key) {
+                info.properties = properties;
+                info.prop_indices = prop_indices;
+                info.methods = methods;
+            }
+        }
     }
 
     fn collect_signatures(&mut self, program: &ast::Program) {
@@ -625,14 +888,16 @@ impl Analyzer {
                 Ty::array(elem)
             }
             ast::TypeRef::Named(name) => {
-                self.diags.emit(
-                    Diagnostic::error(format!(
-                        "unknown type `{name}`; classes and user types are not implemented yet"
-                    ))
-                    .with_code("E0205")
-                    .with_span(t.span()),
-                );
-                Ty::Int
+                if let Some(c) = self.classes.get(&name.to_ascii_lowercase()) {
+                    Ty::Named(c.name.clone())
+                } else {
+                    self.diags.emit(
+                        Diagnostic::error(format!("unknown type `{name}`"))
+                            .with_code("E0205")
+                            .with_span(t.span()),
+                    );
+                    Ty::Int
+                }
             }
             ast::TypeRef::Span(_s) => Ty::Int,
         }
@@ -652,6 +917,45 @@ impl Analyzer {
             display: sig.display,
             params: sig.param_names.iter().cloned().zip(sig.params).collect(),
             ret: sig.ret,
+            slots: ctx.slots,
+            body,
+        })
+    }
+
+    fn analyze_method(&mut self, class_name: &str, method: &MethodInfo) -> Option<TFunc> {
+        let mut ctx = FnCtx::new(method.ret.clone(), false);
+        ctx.current_class = Some(class_name.to_string());
+        ctx.declare("this", Ty::Named(class_name.to_string()));
+        for (name, ty) in method.param_names.iter().zip(method.params.iter()) {
+            ctx.declare(name, ty.clone());
+        }
+        let body = self.analyze_stmts(&method.ast_method.body, &mut ctx);
+        if method.name != "__construct" && method.ret != Ty::Void {
+            let sig = Signature {
+                mangled: method.mangled.clone(),
+                display: format!("{class_name}::{}", method.name),
+                params: method.params.clone(),
+                param_names: method.param_names.clone(),
+                ret: method.ret.clone(),
+                span: method.name_span,
+            };
+            self.check_termination(&method.ast_method.body, &sig, method.name_span);
+        }
+
+        let mut all_params = vec![("this".to_string(), Ty::Named(class_name.to_string()))];
+        all_params.extend(
+            method
+                .param_names
+                .iter()
+                .cloned()
+                .zip(method.params.iter().cloned()),
+        );
+
+        Some(TFunc {
+            name: method.mangled.clone(),
+            display: format!("{class_name}::{}", method.name),
+            params: all_params,
+            ret: method.ret.clone(),
             slots: ctx.slots,
             body,
         })
@@ -762,6 +1066,14 @@ impl Analyzer {
                     Diagnostic::error("nested function declarations are not supported yet")
                         .with_code("E0207")
                         .with_span(f.span),
+                );
+                None
+            }
+            ast::Stmt::ClassDecl(c) => {
+                self.diags.emit(
+                    Diagnostic::error("nested class declarations are not supported yet")
+                        .with_code("E0207")
+                        .with_span(c.span),
                 );
                 None
             }
@@ -1065,6 +1377,14 @@ impl Analyzer {
 
         match target {
             ast::LValue::Var { name, .. } => {
+                if name == "this" {
+                    self.diags.emit(
+                        Diagnostic::error("cannot re-assign `$this`")
+                            .with_code("E0267")
+                            .with_span(span),
+                    );
+                    return None;
+                }
                 let annotated = annotation.map(|t| self.resolve_type(t));
                 let (slot, decl_ty) = match ctx.slot_of(name) {
                     Some(slot) => {
@@ -1146,6 +1466,104 @@ impl Analyzer {
                     value: val,
                 })
             }
+            ast::LValue::Property {
+                base,
+                name,
+                name_span,
+                ..
+            } => {
+                if annotation.is_some() {
+                    self.diags.emit(
+                        Diagnostic::error(
+                            "a property cannot carry an inline type annotation on assignment",
+                        )
+                        .with_code("E0251")
+                        .with_span(span),
+                    );
+                }
+                let base_expr = self.infer(base, ctx)?;
+                let base_ty = base_expr.ty();
+                let class_name = match &base_ty {
+                    Ty::Named(cn) => cn.clone(),
+                    other => {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "cannot access property on non-object of type `{other}`"
+                            ))
+                            .with_code("E0260")
+                            .with_span(base.span()),
+                        );
+                        return None;
+                    }
+                };
+
+                let class = match self.classes.get(&class_name.to_ascii_lowercase()) {
+                    Some(c) => c.clone(),
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error(format!("unknown class `{class_name}`"))
+                                .with_code("E0205")
+                                .with_span(base.span()),
+                        );
+                        return None;
+                    }
+                };
+
+                let prop_idx = match class.prop_indices.get(name) {
+                    Some(&idx) => idx,
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "class `{}` has no property `${name}`",
+                                class.name
+                            ))
+                            .with_code("E0261")
+                            .with_span(*name_span),
+                        );
+                        return None;
+                    }
+                };
+
+                let prop = &class.properties[prop_idx];
+                if prop.visibility == ast::Visibility::Private
+                    && ctx.current_class.as_deref().map(|s| s.to_ascii_lowercase())
+                        != Some(class.name.to_ascii_lowercase())
+                {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "cannot access private property {}::${name} from outside class",
+                            class.name
+                        ))
+                        .with_code("E0265")
+                        .with_span(*name_span),
+                    );
+                    return None;
+                }
+
+                if !val_ty.assignable_to(&prop.ty) {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "cannot assign value of type `{val_ty}` to property `{}::${name}` of type `{}`",
+                            class.name, prop.ty
+                        ))
+                        .with_code("E0212")
+                        .with_span(span),
+                    );
+                    return None;
+                }
+
+                Some(TStmt::Assign {
+                    target: TTarget::Property {
+                        base: Box::new(base_expr),
+                        class_name: class.name.clone(),
+                        prop_name: name.clone(),
+                        prop_idx: prop_idx as u32,
+                        ty: prop.ty.clone(),
+                    },
+                    ty: prop.ty.clone(),
+                    value: val,
+                })
+            }
         }
     }
 
@@ -1155,7 +1573,7 @@ impl Analyzer {
         let (elem, base) = match target {
             TTarget::Index { elem_ty, base, .. } => (elem_ty.clone(), base),
             TTarget::Push { elem_ty, base } => (elem_ty.clone(), base),
-            TTarget::Var { ty, .. } => return ty.clone(),
+            TTarget::Var { ty, .. } | TTarget::Property { ty, .. } => return ty.clone(),
         };
         if elem == Ty::Null {
             if let TExpr::Var { slot, .. } = &**base {
@@ -1233,6 +1651,14 @@ impl Analyzer {
     ) -> Option<(TTarget, Ty)> {
         match target {
             ast::LValue::Var { name, .. } => {
+                if name == "this" {
+                    self.diags.emit(
+                        Diagnostic::error("cannot re-assign `$this`")
+                            .with_code("E0267")
+                            .with_span(span),
+                    );
+                    return None;
+                }
                 let slot = match ctx.slot_of(name) {
                     Some(s) => s,
                     None => {
@@ -1259,7 +1685,7 @@ impl Analyzer {
                 let ty = match &t {
                     TTarget::Index { elem_ty, .. } => elem_ty.clone(),
                     TTarget::Push { elem_ty, .. } => elem_ty.clone(),
-                    TTarget::Var { ty, .. } => ty.clone(),
+                    TTarget::Var { ty, .. } | TTarget::Property { ty, .. } => ty.clone(),
                 };
                 if ty == Ty::Null {
                     self.diags.emit(
@@ -1272,6 +1698,83 @@ impl Analyzer {
                     return None;
                 }
                 Some((t, ty))
+            }
+            ast::LValue::Property {
+                base,
+                name,
+                name_span,
+                ..
+            } => {
+                let base_expr = self.infer(base, ctx)?;
+                let base_ty = base_expr.ty();
+                let class_name = match &base_ty {
+                    Ty::Named(cn) => cn.clone(),
+                    other => {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "cannot access property on non-object of type `{other}`"
+                            ))
+                            .with_code("E0260")
+                            .with_span(base.span()),
+                        );
+                        return None;
+                    }
+                };
+
+                let class = match self.classes.get(&class_name.to_ascii_lowercase()) {
+                    Some(c) => c.clone(),
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error(format!("unknown class `{class_name}`"))
+                                .with_code("E0205")
+                                .with_span(base.span()),
+                        );
+                        return None;
+                    }
+                };
+
+                let prop_idx = match class.prop_indices.get(name) {
+                    Some(&idx) => idx,
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "class `{}` has no property `${name}`",
+                                class.name
+                            ))
+                            .with_code("E0261")
+                            .with_span(*name_span),
+                        );
+                        return None;
+                    }
+                };
+
+                let prop = &class.properties[prop_idx];
+                if prop.visibility == ast::Visibility::Private
+                    && ctx.current_class.as_deref().map(|s| s.to_ascii_lowercase())
+                        != Some(class.name.to_ascii_lowercase())
+                {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "cannot access private property {}::${name} from outside class",
+                            class.name
+                        ))
+                        .with_code("E0265")
+                        .with_span(*name_span),
+                    );
+                    return None;
+                }
+
+                let ty = prop.ty.clone();
+                Some((
+                    TTarget::Property {
+                        base: Box::new(base_expr),
+                        class_name: class.name.clone(),
+                        prop_name: name.clone(),
+                        prop_idx: prop_idx as u32,
+                        ty: ty.clone(),
+                    },
+                    ty,
+                ))
             }
         }
     }
@@ -1421,25 +1924,35 @@ impl Analyzer {
                 None
             }
             ast::Expr::Paren(inner, _) => self.infer(inner, ctx),
-            ast::Expr::Var(name, span) => match ctx.slot_of(name) {
-                Some(slot) => {
-                    let ty = ctx.slot_ty(slot);
-                    Some(TExpr::Var {
-                        name: name.clone(),
-                        slot,
-                        ty,
-                    })
-                }
-                None => {
+            ast::Expr::Var(name, span) => {
+                if name == "this" && ctx.current_class.is_none() {
                     self.diags.emit(
-                        Diagnostic::error(format!("undefined variable `${name}`"))
-                            .with_code("E0220")
-                            .with_span(*span)
-                            .with_note("variables must be assigned before they are used"),
+                        Diagnostic::error("using `$this` when not in object context")
+                            .with_code("E0268")
+                            .with_span(*span),
                     );
-                    None
+                    return None;
                 }
-            },
+                match ctx.slot_of(name) {
+                    Some(slot) => {
+                        let ty = ctx.slot_ty(slot);
+                        Some(TExpr::Var {
+                            name: name.clone(),
+                            slot,
+                            ty,
+                        })
+                    }
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error(format!("undefined variable `${name}`"))
+                                .with_code("E0220")
+                                .with_span(*span)
+                                .with_note("variables must be assigned before they are used"),
+                        );
+                        None
+                    }
+                }
+            }
             ast::Expr::Unary { op, expr, span } => {
                 let operand = self.infer(expr, ctx)?;
                 let oty = operand.ty();
@@ -1524,6 +2037,310 @@ impl Analyzer {
                 arms,
                 span,
             } => self.infer_match(subject, arms, *span, ctx),
+            ast::Expr::Property {
+                base,
+                name,
+                name_span,
+                span: _,
+            } => {
+                let base_expr = self.infer(base, ctx)?;
+                let base_ty = base_expr.ty();
+                let class_name = match &base_ty {
+                    Ty::Named(cn) => cn.clone(),
+                    other => {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "cannot access property on non-object of type `{other}`"
+                            ))
+                            .with_code("E0260")
+                            .with_span(base.span()),
+                        );
+                        return None;
+                    }
+                };
+
+                let class = match self.classes.get(&class_name.to_ascii_lowercase()) {
+                    Some(c) => c.clone(),
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error(format!("unknown class `{class_name}`"))
+                                .with_code("E0205")
+                                .with_span(base.span()),
+                        );
+                        return None;
+                    }
+                };
+
+                let prop_idx = match class.prop_indices.get(name) {
+                    Some(&idx) => idx,
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "class `{}` has no property `${name}`",
+                                class.name
+                            ))
+                            .with_code("E0261")
+                            .with_span(*name_span),
+                        );
+                        return None;
+                    }
+                };
+
+                let prop = &class.properties[prop_idx];
+                if prop.visibility == ast::Visibility::Private
+                    && ctx.current_class.as_deref().map(|s| s.to_ascii_lowercase())
+                        != Some(class.name.to_ascii_lowercase())
+                {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "cannot access private property {}::${name} from outside class",
+                            class.name
+                        ))
+                        .with_code("E0265")
+                        .with_span(*name_span),
+                    );
+                    return None;
+                }
+
+                Some(TExpr::Property {
+                    base: Box::new(base_expr),
+                    class_name: class.name.clone(),
+                    prop_name: name.clone(),
+                    prop_idx: prop_idx as u32,
+                    ty: prop.ty.clone(),
+                })
+            }
+            ast::Expr::MethodCall {
+                base,
+                name,
+                name_span,
+                args,
+                span,
+            } => {
+                let base_expr = self.infer(base, ctx)?;
+                let base_ty = base_expr.ty();
+                let class_name = match &base_ty {
+                    Ty::Named(cn) => cn.clone(),
+                    other => {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "cannot call method on non-object of type `{other}`"
+                            ))
+                            .with_code("E0260")
+                            .with_span(base.span()),
+                        );
+                        return None;
+                    }
+                };
+
+                let class = match self.classes.get(&class_name.to_ascii_lowercase()) {
+                    Some(c) => c.clone(),
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error(format!("unknown class `{class_name}`"))
+                                .with_code("E0205")
+                                .with_span(base.span()),
+                        );
+                        return None;
+                    }
+                };
+
+                let method = match class.methods.get(&name.to_ascii_lowercase()) {
+                    Some(m) => m.clone(),
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "class `{}` has no method `{name}`",
+                                class.name
+                            ))
+                            .with_code("E0262")
+                            .with_span(*name_span),
+                        );
+                        return None;
+                    }
+                };
+
+                if method.visibility == ast::Visibility::Private
+                    && ctx.current_class.as_deref().map(|s| s.to_ascii_lowercase())
+                        != Some(class.name.to_ascii_lowercase())
+                {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "cannot call private method {}::{name} from outside class",
+                            class.name
+                        ))
+                        .with_code("E0265")
+                        .with_span(*name_span),
+                    );
+                    return None;
+                }
+
+                if args.len() != method.params.len() {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "method `{}::{name}` expects {} argument{}, found {}",
+                            class.name,
+                            method.params.len(),
+                            if method.params.len() == 1 { "" } else { "s" },
+                            args.len()
+                        ))
+                        .with_code("E0207")
+                        .with_span(*span),
+                    );
+                    return None;
+                }
+
+                let mut typed_args = vec![base_expr];
+                let mut actual_tys = vec![Ty::Named(class.name.clone())];
+                let mut formal_params = vec![Ty::Named(class.name.clone())];
+                formal_params.extend(method.params.iter().cloned());
+
+                for (arg, formal_ty) in args.iter().zip(method.params.iter()) {
+                    let t_arg = self.infer(arg, ctx)?;
+                    let aty = t_arg.ty();
+                    if !aty.assignable_to(formal_ty) {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "argument type mismatch in call to `{}::{name}`: expected `{formal_ty}`, found `{aty}`",
+                                class.name
+                            ))
+                            .with_code("E0208")
+                            .with_span(arg.span()),
+                        );
+                        return None;
+                    }
+                    actual_tys.push(aty);
+                    typed_args.push(t_arg);
+                }
+
+                Some(TExpr::Call {
+                    callee: Callee::User {
+                        mangled: method.mangled,
+                        name: format!("{}::{name}", class.name),
+                        params: formal_params,
+                    },
+                    ret: method.ret,
+                    args: typed_args,
+                    arg_tys: actual_tys,
+                    span: *span,
+                })
+            }
+            ast::Expr::New {
+                class_name,
+                class_span,
+                args,
+                span,
+            } => {
+                let class = match self.classes.get(&class_name.to_ascii_lowercase()) {
+                    Some(c) => c.clone(),
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error(format!("unknown class `{class_name}`"))
+                                .with_code("E0205")
+                                .with_span(*class_span),
+                        );
+                        return None;
+                    }
+                };
+
+                let ctor = class.methods.get("__construct").cloned();
+                let ctor_info = if let Some(ctor) = &ctor {
+                    if ctor.visibility == ast::Visibility::Private
+                        && ctx.current_class.as_deref().map(|s| s.to_ascii_lowercase())
+                            != Some(class.name.to_ascii_lowercase())
+                    {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "cannot call private constructor of class `{}` from outside class",
+                                class.name
+                            ))
+                            .with_code("E0265")
+                            .with_span(*span),
+                        );
+                        return None;
+                    }
+
+                    if args.len() != ctor.params.len() {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "constructor `{}::__construct` expects {} argument{}, found {}",
+                                class.name,
+                                ctor.params.len(),
+                                if ctor.params.len() == 1 { "" } else { "s" },
+                                args.len()
+                            ))
+                            .with_code("E0207")
+                            .with_span(*span),
+                        );
+                        return None;
+                    }
+
+                    let mut typed_args = Vec::new();
+                    let mut actual_tys = Vec::new();
+                    for (arg, formal_ty) in args.iter().zip(ctor.params.iter()) {
+                        let t_arg = self.infer(arg, ctx)?;
+                        let aty = t_arg.ty();
+                        if !aty.assignable_to(formal_ty) {
+                            self.diags.emit(
+                                Diagnostic::error(format!(
+                                    "argument type mismatch in call to `{}::__construct`: expected `{formal_ty}`, found `{aty}`",
+                                    class.name
+                                ))
+                                .with_code("E0208")
+                                .with_span(arg.span()),
+                            );
+                            return None;
+                        }
+                        actual_tys.push(aty);
+                        typed_args.push(t_arg);
+                    }
+                    Some((ctor.mangled.clone(), typed_args, actual_tys))
+                } else {
+                    if !args.is_empty() {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "class `{}` has no constructor and accepts 0 arguments, found {}",
+                                class.name,
+                                args.len()
+                            ))
+                            .with_code("E0207")
+                            .with_span(*span),
+                        );
+                        return None;
+                    }
+                    None
+                };
+
+                // Infer default expressions for properties
+                let mut prop_defaults = Vec::new();
+                for (idx, p) in class.properties.iter().enumerate() {
+                    if let Some(def_expr) = &p.default {
+                        let mut dummy_ctx = FnCtx::new(Ty::Void, false);
+                        if let Some(t_def) = self.infer(def_expr, &mut dummy_ctx) {
+                            if !t_def.ty().assignable_to(&p.ty) {
+                                self.diags.emit(
+                                    Diagnostic::error(format!(
+                                        "default value of property `{}::${}` is of type `{}`, expected `{}`",
+                                        class.name, p.name, t_def.ty(), p.ty
+                                    ))
+                                    .with_code("E0212")
+                                    .with_span(def_expr.span()),
+                                );
+                            } else {
+                                prop_defaults.push((idx as u32, t_def));
+                            }
+                        }
+                    }
+                }
+
+                Some(TExpr::New {
+                    class_name: class.name.clone(),
+                    num_props: class.properties.len() as u32,
+                    prop_defaults,
+                    ctor: ctor_info,
+                    ty: Ty::Named(class.name.clone()),
+                })
+            }
         }
     }
 
@@ -2468,7 +3285,12 @@ impl Analyzer {
                     return None;
                 }
                 if atys[0] != Ty::String {
-                    return self.builtin_ty_err(name, "a `string` format", &atys[0], args[0].span());
+                    return self.builtin_ty_err(
+                        name,
+                        "a `string` format",
+                        &atys[0],
+                        args[0].span(),
+                    );
                 }
                 for i in 1..n {
                     match &atys[i] {
@@ -2519,12 +3341,16 @@ fn numeric_result(l: &Ty, r: &Ty) -> Ty {
 
 /// Types that can be used in boolean context (`if`, `while`, `&&`, `||`, `!`).
 pub fn is_truthy(ty: &Ty) -> bool {
-    matches!(ty, Ty::Bool | Ty::Int | Ty::Float | Ty::String)
+    matches!(
+        ty,
+        Ty::Bool | Ty::Int | Ty::Float | Ty::String | Ty::Named(_)
+    )
 }
 
 /// Types that may be compared with `==` / `!=` (and `switch` case matching).
 fn comparable_eq(a: &Ty, b: &Ty) -> bool {
-    (a.is_numeric() && b.is_numeric()) || (a == b && matches!(a, Ty::String | Ty::Bool))
+    (a.is_numeric() && b.is_numeric())
+        || (a == b && matches!(a, Ty::String | Ty::Bool | Ty::Named(_)))
 }
 
 /// Does this statement provably end with a `return` on all paths?
@@ -2553,6 +3379,14 @@ fn stmt_terminates(stmt: &ast::Stmt) -> bool {
 
 pub fn mangle_fn(name: &str) -> String {
     format!("pxr$fn${}", name.to_ascii_lowercase())
+}
+
+pub fn mangle_method(class: &str, method: &str) -> String {
+    format!(
+        "pxr$m${}${}",
+        class.to_ascii_lowercase(),
+        method.to_ascii_lowercase()
+    )
 }
 
 #[cfg(test)]
@@ -2623,5 +3457,95 @@ mod tests {
     fn concat_ok_with_numbers() {
         let (_, d) = run("<?php echo \"n=\" . 42;");
         assert!(!d.has_errors(), "{:#?}", d.items());
+    }
+
+    #[test]
+    fn valid_class_and_object_usage() {
+        let (prog, d) = run("<?php
+            class Point {
+                public int $x;
+                public int $y;
+
+                public function __construct(int $x, int $y) {
+                    $this->x = $x;
+                    $this->y = $y;
+                }
+
+                public function sum(): int {
+                    return $this->x + $this->y;
+                }
+            }
+            $p = new Point(10, 20);
+            $p->x = 15;
+            echo $p->sum();
+        ");
+        assert!(!d.has_errors(), "{:#?}", d.items());
+        assert!(prog.is_some());
+    }
+
+    #[test]
+    fn reject_private_member_access() {
+        let (_, d) = run("<?php
+            class Secret {
+                private int $val;
+                public function __construct(int $v) { $this->val = $v; }
+                private function hidden(): int { return $this->val; }
+            }
+            $s = new Secret(42);
+            echo $s->val;
+        ");
+        assert!(d.has_errors());
+        assert!(d.items().iter().any(|x| x.code == Some("E0265")));
+
+        let (_, d2) = run("<?php
+            class Secret {
+                private function hidden(): int { return 42; }
+            }
+            $s = new Secret();
+            echo $s->hidden();
+        ");
+        assert!(d2.has_errors());
+        assert!(d2.items().iter().any(|x| x.code == Some("E0265")));
+    }
+
+    #[test]
+    fn reject_assigning_to_this() {
+        let (_, d) = run("<?php
+            class Foo {
+                public function test(): void {
+                    $this = 1;
+                }
+            }
+        ");
+        assert!(d.has_errors());
+        assert!(d.items().iter().any(|x| x.code == Some("E0267")));
+    }
+
+    #[test]
+    fn reject_this_outside_class() {
+        let (_, d) = run("<?php
+            echo $this->x;
+        ");
+        assert!(d.has_errors());
+        assert!(d.items().iter().any(|x| x.code == Some("E0268")));
+    }
+
+    #[test]
+    fn reject_unknown_property_and_method() {
+        let (_, d) = run("<?php
+            class A { public int $x; }
+            $a = new A();
+            echo $a->nonexistent;
+        ");
+        assert!(d.has_errors());
+        assert!(d.items().iter().any(|x| x.code == Some("E0261")));
+
+        let (_, d2) = run("<?php
+            class A { public int $x; }
+            $a = new A();
+            $a->nope();
+        ");
+        assert!(d2.has_errors());
+        assert!(d2.items().iter().any(|x| x.code == Some("E0262")));
     }
 }

@@ -27,6 +27,7 @@ type known at compile time (scalars, or a homogeneous array).
 | `bool` | boolean | `i1` |
 | `void` | no value (return types only) | — |
 | `array<T>` | ordered map with values of type `T` (`int`/`string` keys) | opaque `ptr` |
+| `ClassName` | reference to class instance (`Ty::Named`) | opaque `ptr` |
 
 The only implicit coercion is the lossless widening **`int` → `float`**. All other
 mismatches are compile errors.
@@ -35,7 +36,12 @@ mismatches are compile errors.
 
 ```
 program   := topstmt*
-topstmt   := fn | stmt
+topstmt   := class_decl | fn | stmt
+class_decl:= 'class' NAME '{' member* '}'
+member    := prop_decl | method_decl
+prop_decl := visibility type VARIABLE ('=' expr)? ';'
+method_decl := visibility 'function' NAME '(' params? ')' (':' type)? block
+visibility:= 'public' | 'protected' | 'private'
 fn        := 'function' NAME '(' params? ')' (':' type)? block
 params    := param (',' param)*
 param     := type VARIABLE
@@ -66,6 +72,7 @@ for_expr  := lvalue '=' expr                     // also allows '+=', ++, -- ...
 
 lvalue    := VARIABLE
            | lvalue '[' expr? ']'                // index / append
+           | postfix_expr '->' NAME              // property access
 
 expr      := ternary
 ternary   := coalesce ('?' expr? ':' expr)?      // right-associative
@@ -81,9 +88,14 @@ shifts    := concat (('<<' | '>>') concat)*
 concat    := additive ('.' additive)*
 additive  := multiplicative (('+' | '-') multiplicative)*
 multiplicative := unary (('*' | '/' | '%') unary)*
-unary     := ('!' | '-' | '~') unary | primary
+unary     := ('!' | '-' | '~') unary | postfix
+postfix   := postfix '->' NAME '(' (expr (',' expr)*)? ')'  // method call
+           | postfix '->' NAME                              // property access
+           | postfix '[' expr ']' | postfix '[' ']'
+           | primary
 primary   := INT | FLOAT | STRING | INTERP_STRING | 'true' | 'false' | 'null'
-           | VARIABLE | primary '[' expr ']' | primary '[' ']'
+           | VARIABLE
+           | 'new' NAME ('(' (expr (',' expr)*)? ')')?
            | '[' (array_item (',' array_item)*)? ','? ']'
            | 'array' '(' ... ')'
            | VARIABLE '(' (expr (',' expr)*)? ')' | NAME '(' (expr (',' expr)*)? ')'
@@ -352,4 +364,9 @@ are `W020x`.
 | `E0255` | `match` arm condition type differs from the subject |
 | `E0256` | `match` requires a `default` arm |
 | `E0257` | `**` (power) not implemented |
+| `E0261` | Unknown property |
+| `E0262` | Unknown method |
+| `E0265` | Cannot access private member |
+| `E0267` | Cannot re-assign `$this` |
+| `E0268` | Cannot use `$this` outside object context |
 | `W0202` | `return` with a value at top level is ignored |

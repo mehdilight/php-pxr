@@ -439,6 +439,50 @@ impl Lowerer {
                 arg_tys,
                 ..
             } => self.lower_call(callee, ret, args, arg_tys),
+            TExpr::Property {
+                base, prop_idx, ty, ..
+            } => {
+                let obj = self.lower_expr(base);
+                let p_idx = self.emit_const(Literal::Int(*prop_idx as i64));
+                let bits = self.rt_call("pxr_object_get_bits", vec![obj, p_idx], Ty::Int);
+                self.decode_bits(bits, ty)
+            }
+            TExpr::New {
+                class_name,
+                num_props,
+                prop_defaults,
+                ctor,
+                ty,
+            } => {
+                let name_val = self.emit_const(Literal::Str(class_name.as_bytes().to_vec()));
+                let num_props_val = self.emit_const(Literal::Int(*num_props as i64));
+                let obj = self.rt_call("pxr_object_new", vec![name_val, num_props_val], ty.clone());
+                for (slot_idx, def_expr) in prop_defaults {
+                    let s_idx = self.emit_const(Literal::Int(*slot_idx as i64));
+                    let def_val = self.lower_expr(def_expr);
+                    let def_ty = def_expr.ty();
+                    let vtag = self.emit_const(Literal::Int(Self::tag_of(&def_ty)));
+                    let bits = self.encode_bits(def_val, &def_ty);
+                    self.rt_call(
+                        "pxr_object_set_bits",
+                        vec![obj, s_idx, vtag, bits],
+                        Ty::Void,
+                    );
+                }
+                if let Some((ctor_mangled, ctor_args, _)) = ctor {
+                    let mut args = vec![obj];
+                    for arg in ctor_args {
+                        args.push(self.lower_expr(arg));
+                    }
+                    self.emit(Inst::Call {
+                        dst: None,
+                        callee: ctor_mangled.clone(),
+                        args,
+                        ret: Ty::Void,
+                    });
+                }
+                obj
+            }
         }
     }
 
@@ -989,6 +1033,7 @@ impl Lowerer {
             Ty::Bool => 3,
             Ty::String => 4,
             Ty::Array(_) => 5,
+            Ty::Named(_) => 6,
             _ => 0,
         }
     }
@@ -1189,6 +1234,23 @@ impl Lowerer {
                 let bits = self.encode_bits(v, &ty);
                 self.array_push(arr, vtag, bits);
             }
+            TTarget::Property {
+                base,
+                prop_idx,
+                ty: _,
+                ..
+            } => {
+                let obj = self.lower_expr(base);
+                let p_idx = self.emit_const(Literal::Int(*prop_idx as i64));
+                let vtag = self.emit_const(Literal::Int(Self::tag_of(&ty)));
+                let v = self.maybe_copy_array(v, &ty);
+                let bits = self.encode_bits(v, &ty);
+                self.rt_call(
+                    "pxr_object_set_bits",
+                    vec![obj, p_idx, vtag, bits],
+                    Ty::Void,
+                );
+            }
         }
     }
 
@@ -1218,6 +1280,18 @@ impl Lowerer {
                 (v, ty)
             }
             TTarget::Push { .. } => (self.emit_const(Literal::Int(0)), ty),
+            TTarget::Property {
+                base,
+                prop_idx,
+                ty: _,
+                ..
+            } => {
+                let obj = self.lower_expr(base);
+                let p_idx = self.emit_const(Literal::Int(*prop_idx as i64));
+                let bits = self.rt_call("pxr_object_get_bits", vec![obj, p_idx], Ty::Int);
+                let v = self.decode_bits(bits, &ty);
+                (v, ty)
+            }
         }
     }
 
@@ -1327,8 +1401,8 @@ impl Lowerer {
 
     fn lower_coalesce_assign(&mut self, target: &TTarget, ty: &Ty, value: &TExpr) {
         match target {
-            TTarget::Var { .. } => {
-                // PXR variables are always set; `??=` is a no-op.
+            TTarget::Var { .. } | TTarget::Property { .. } => {
+                // PXR variables and properties are always set; `??=` is a no-op.
             }
             TTarget::Index {
                 base,
@@ -1635,14 +1709,18 @@ impl Lowerer {
 
     /// Emit a one-shot runtime call and return its result value.
     fn rt_call(&mut self, callee: &str, args: Vec<Value>, ret: Ty) -> Value {
-        let dst = self.fresh();
+        let dst = if ret == Ty::Void {
+            None
+        } else {
+            Some(self.fresh())
+        };
         self.emit(Inst::Call {
-            dst: Some(dst),
+            dst,
             callee: callee.into(),
             args,
             ret,
         });
-        dst
+        dst.unwrap_or(0)
     }
 
     fn lower_builtin(

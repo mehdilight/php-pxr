@@ -189,6 +189,9 @@ impl Parser {
                 Ok(Some(Stmt::Print(e, start.merge(semi.span))))
             }
             TokenKind::Function => self.parse_fn().map(|f| Some(Stmt::FnDecl(Box::new(f)))),
+            TokenKind::Class => self
+                .parse_class()
+                .map(|c| Some(Stmt::ClassDecl(Box::new(c)))),
             TokenKind::Return => {
                 self.advance();
                 let value = if self.at(&TokenKind::Semicolon) {
@@ -365,6 +368,155 @@ impl Parser {
         })
     }
 
+    fn parse_class(&mut self) -> Result<ClassDecl, ()> {
+        let start = self.advance().span; // `class`
+        let name_tok = self.expect_ident("class name")?;
+        let name = match name_tok.kind {
+            TokenKind::Ident(n) => n,
+            _ => unreachable!(),
+        };
+        let name_span = name_tok.span;
+        self.expect(&TokenKind::LBrace, "`{` after class name")?;
+        let mut members = Vec::new();
+        while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
+            let before = self.pos;
+            match self.parse_class_member() {
+                Ok(m) => members.push(m),
+                Err(()) => self.recover(),
+            }
+            if self.pos == before {
+                self.advance();
+            }
+        }
+        let close = self.expect(&TokenKind::RBrace, "`}` after class body")?;
+        Ok(ClassDecl {
+            name,
+            name_span,
+            members,
+            span: start.merge(close.span),
+        })
+    }
+
+    fn parse_class_member(&mut self) -> Result<ClassMember, ()> {
+        let start = self.peek().span;
+        let (vis, has_vis) = match self.peek().kind {
+            TokenKind::Public => {
+                self.advance();
+                (Visibility::Public, true)
+            }
+            TokenKind::Protected => {
+                self.advance();
+                (Visibility::Protected, true)
+            }
+            TokenKind::Private => {
+                self.advance();
+                (Visibility::Private, true)
+            }
+            _ => (Visibility::Public, false),
+        };
+
+        if self.at(&TokenKind::Function) {
+            let m = self.parse_method(start, vis)?;
+            return Ok(ClassMember::Method(m));
+        }
+
+        if !has_vis {
+            let span = self.peek().span;
+            self.error(
+                span,
+                "expected visibility (`public`, `protected`, or `private`) or `function`",
+            );
+            return Err(());
+        }
+
+        // Property declaration:
+        // Optional type, then $var, then optional = expr, then ;
+        let ty = if !matches!(self.peek().kind, TokenKind::Variable(_)) && self.is_type_start() {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        let vt = self.expect_variable("property name")?;
+        let name = match vt.kind {
+            TokenKind::Variable(n) => n,
+            _ => unreachable!(),
+        };
+        let name_span = vt.span;
+
+        let default = if self.eat(&TokenKind::Assign) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        let semi = self.expect(&TokenKind::Semicolon, "`;` after property declaration")?;
+        Ok(ClassMember::Property(PropertyDecl {
+            visibility: vis,
+            ty,
+            name,
+            name_span,
+            default,
+            span: start.merge(semi.span),
+        }))
+    }
+
+    fn parse_method(&mut self, start: Span, visibility: Visibility) -> Result<MethodDecl, ()> {
+        self.expect(&TokenKind::Function, "`function`")?;
+        let name_tok = self.expect_ident("method name")?;
+        let name = match name_tok.kind {
+            TokenKind::Ident(n) => n,
+            _ => unreachable!(),
+        };
+        let name_span = name_tok.span;
+
+        self.expect(&TokenKind::LParen, "`(` after method name")?;
+        let mut params = Vec::new();
+        if !self.at(&TokenKind::RParen) {
+            loop {
+                let p_start = self.peek().span;
+                let ty = if self.is_type_start() {
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                let vt = self.expect_variable("parameter name")?;
+                let pname = match vt.kind {
+                    TokenKind::Variable(n) => n,
+                    _ => unreachable!(),
+                };
+                params.push(Param {
+                    name: pname,
+                    name_span: vt.span,
+                    ty,
+                    span: p_start.merge(vt.span),
+                });
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::RParen, "`)` after parameter list")?;
+
+        let ret = if self.eat(&TokenKind::Colon) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        let body = self.parse_block()?;
+        let end = self.peek().span;
+        Ok(MethodDecl {
+            visibility,
+            name,
+            name_span,
+            params,
+            ret,
+            body,
+            span: start.merge(end),
+        })
+    }
+
     fn is_type_start(&self) -> bool {
         matches!(
             self.peek().kind,
@@ -523,11 +675,22 @@ impl Parser {
                     span,
                 })
             }
+            Expr::Property {
+                base,
+                name,
+                name_span,
+                span,
+            } => Ok(LValue::Property {
+                base,
+                name,
+                name_span,
+                span,
+            }),
             other => {
                 let span = other.span();
                 self.error(
                     span,
-                    "the left-hand side of an assignment must be a variable or array element",
+                    "the left-hand side of an assignment must be a variable, array element, or property",
                 );
                 Err(())
             }
@@ -787,23 +950,63 @@ impl Parser {
         }
     }
 
-    /// A primary expression followed by any number of `[...]` index accesses.
+    /// A primary expression followed by any number of `[...]` index accesses and `->` member accesses.
     fn parse_postfix(&mut self) -> Result<Expr, ()> {
         let mut base = self.parse_primary()?;
-        while self.at(&TokenKind::LBracket) {
-            self.advance();
-            let index = if self.at(&TokenKind::RBracket) {
-                None
+        loop {
+            if self.at(&TokenKind::LBracket) {
+                self.advance();
+                let index = if self.at(&TokenKind::RBracket) {
+                    None
+                } else {
+                    Some(Box::new(self.parse_expr()?))
+                };
+                let close = self.expect(&TokenKind::RBracket, "`]` after index")?;
+                let span = base.span().merge(close.span);
+                base = Expr::Index {
+                    base: Box::new(base),
+                    index,
+                    span,
+                };
+            } else if self.at(&TokenKind::Arrow) {
+                self.advance();
+                let name_tok = self.expect_ident("property or method name after `->`")?;
+                let name = match name_tok.kind {
+                    TokenKind::Ident(n) => n,
+                    _ => unreachable!(),
+                };
+                let name_span = name_tok.span;
+                if self.eat(&TokenKind::LParen) {
+                    let mut args = Vec::new();
+                    if !self.at(&TokenKind::RParen) {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if !self.eat(&TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    let close = self.expect(&TokenKind::RParen, "`)` after method arguments")?;
+                    let span = base.span().merge(close.span);
+                    base = Expr::MethodCall {
+                        base: Box::new(base),
+                        name,
+                        name_span,
+                        args,
+                        span,
+                    };
+                } else {
+                    let span = base.span().merge(name_span);
+                    base = Expr::Property {
+                        base: Box::new(base),
+                        name,
+                        name_span,
+                        span,
+                    };
+                }
             } else {
-                Some(Box::new(self.parse_expr()?))
-            };
-            let close = self.expect(&TokenKind::RBracket, "`]` after index")?;
-            let span = base.span().merge(close.span);
-            base = Expr::Index {
-                base: Box::new(base),
-                index,
-                span,
-            };
+                break;
+            }
         }
         Ok(base)
     }
@@ -843,6 +1046,37 @@ impl Parser {
             TokenKind::Variable(name) => {
                 self.advance();
                 Ok(Expr::Var(name, span))
+            }
+            TokenKind::New => {
+                self.advance();
+                let class_tok = self.expect_ident("class name after `new`")?;
+                let class_name = match class_tok.kind {
+                    TokenKind::Ident(n) => n,
+                    _ => unreachable!(),
+                };
+                let class_span = class_tok.span;
+                let (args, end_span) = if self.eat(&TokenKind::LParen) {
+                    let mut args = Vec::new();
+                    if !self.at(&TokenKind::RParen) {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if !self.eat(&TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    let close =
+                        self.expect(&TokenKind::RParen, "`)` after constructor arguments")?;
+                    (args, close.span)
+                } else {
+                    (Vec::new(), class_span)
+                };
+                Ok(Expr::New {
+                    class_name,
+                    class_span,
+                    args,
+                    span: span.merge(end_span),
+                })
             }
             TokenKind::LBracket => {
                 self.parse_array_literal(TokenKind::LBracket, TokenKind::RBracket)
@@ -1006,6 +1240,7 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::Switch { span, .. }
         | Stmt::Block(_, span) => *span,
         Stmt::FnDecl(f) => f.span,
+        Stmt::ClassDecl(c) => c.span,
         Stmt::Empty => Span::synthetic(),
     }
 }
@@ -1028,7 +1263,7 @@ fn set_stmt_span(s: &mut Stmt, span: Span) {
         | Stmt::Foreach { span: sp, .. }
         | Stmt::Switch { span: sp, .. }
         | Stmt::Block(_, sp) => *sp = span,
-        Stmt::FnDecl(_) | Stmt::Empty => {}
+        Stmt::FnDecl(_) | Stmt::ClassDecl(_) | Stmt::Empty => {}
     }
 }
 
@@ -1152,5 +1387,69 @@ mod tests {
     fn reports_multiple_errors() {
         let (_, diags) = parse("<?php echo ; echo ;");
         assert!(diags.error_count() >= 1);
+    }
+
+    #[test]
+    fn class_declaration_and_objects() {
+        let p = ok("<?php
+            class Counter {
+                public int $val;
+                private string $name = \"test\";
+
+                public function __construct(int $initial) {
+                    $this->val = $initial;
+                }
+
+                public function inc(): int {
+                    $this->val += 1;
+                    return $this->val;
+                }
+            }
+            $c = new Counter(10);
+            $c->inc();
+            echo $c->val;
+        ");
+        assert_eq!(p.items.len(), 4);
+        match &p.items[0] {
+            Stmt::ClassDecl(c) => {
+                assert_eq!(c.name, "Counter");
+                assert_eq!(c.members.len(), 4);
+                match &c.members[0] {
+                    ClassMember::Property(prop) => {
+                        assert_eq!(prop.name, "val");
+                        assert_eq!(prop.visibility, Visibility::Public);
+                        assert_eq!(prop.ty, Some(TypeRef::Int));
+                        assert!(prop.default.is_none());
+                    }
+                    _ => panic!("expected property"),
+                }
+                match &c.members[1] {
+                    ClassMember::Property(prop) => {
+                        assert_eq!(prop.name, "name");
+                        assert_eq!(prop.visibility, Visibility::Private);
+                        assert_eq!(prop.ty, Some(TypeRef::String));
+                        assert!(prop.default.is_some());
+                    }
+                    _ => panic!("expected property"),
+                }
+                match &c.members[2] {
+                    ClassMember::Method(m) => {
+                        assert_eq!(m.name, "__construct");
+                        assert_eq!(m.params.len(), 1);
+                        assert_eq!(m.visibility, Visibility::Public);
+                    }
+                    _ => panic!("expected method"),
+                }
+                match &c.members[3] {
+                    ClassMember::Method(m) => {
+                        assert_eq!(m.name, "inc");
+                        assert_eq!(m.visibility, Visibility::Public);
+                        assert_eq!(m.ret, Some(TypeRef::Int));
+                    }
+                    _ => panic!("expected method"),
+                }
+            }
+            _ => panic!("expected class decl"),
+        }
     }
 }

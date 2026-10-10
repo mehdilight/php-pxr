@@ -286,14 +286,42 @@ concatenation are byte-exact — matching PHP.
 **Acceptance.** A string‑heavy program (e.g. word count) compiles and matches PHP —
 the word‑count block at the end of `examples/compat.php` does exactly this. ✅
 
-## ⛔ M3 — User types & modules
+## 🚧 M3 — User types & modules
 
-* `class`, `struct`, methods, visibility, constructors, static members.
+* `class`, properties, methods, constructors, visibility (`public`, `protected`, `private`), `$this`, method chaining, instantiation (`new`).
+* Single inheritance (`extends`), method overriding, `parent::`, `instanceof`.
+* Interfaces, abstract classes, static properties and methods.
 * `namespace`/`use`, a compile‑time module/include resolver.
-* Interfaces and (single) inheritance with method dispatch (static where
-  provable).
 
-**Acceptance.** A small object‑oriented program compiles and runs.
+**Delivered (M3.1: classes, properties, methods, constructors & visibility slice).**
+
+* `class` declarations with typed properties, optional default values, methods,
+  and explicit visibility modifiers (`public`, `protected`, `private`).
+* Instantiation with `new ClassName(...)` and `new ClassName`, invoking
+  `__construct` when defined, with arity and argument type validation.
+* Property access (`$obj->prop`), property mutation (`$obj->prop = val`,
+  `$obj->prop += val`, etc.), and method calls (`$obj->method(...)`) with full
+  chaining support (`$a->b()->c`).
+* Implicit `$this` binding within methods with static type `Ty::Named(class_name)`.
+  Reassigning `$this` is rejected with `E0267`, and accessing `$this` outside an
+  object context is rejected with `E0268`.
+* Strict visibility enforcement at compile time: private properties and methods
+  are inaccessible outside the declaring class (`E0265`).
+* Object representation in runtime:
+  `pxr_object { const pxr_str *class_name; size_t num_props; int64_t *tags; int64_t *bits; }`
+  allocated in the bump arena, with $O(1)$ statically-indexed property slots
+  supporting scalars, strings, arrays, and nested object references via bitcast packing.
+  Null dereference causes PHP-faithful fatal error.
+* Method dispatch is lowered directly to `TExpr::Call` with mangled link-time
+  names (`pxr$m$<class>$<method>`) and `$this` prepended as the first parameter.
+* Diagnostics added: unknown class (`E0205`), unknown property (`E0261`),
+  unknown method (`E0262`), private member access violation (`E0265`),
+  reassigning `$this` (`E0267`), using `$this` outside object context (`E0268`),
+  and constructor arity mismatch (`E0207`).
+* Tests: +4 CLI integration tests (`classes_and_objects_match_php`,
+  `class_visibility_private_rejected`, `class_assign_this_rejected`,
+  `class_type_errors_are_loud`) and unit tests — 55 CLI tests total;
+  `examples/objects.php` added and verified byte-for-byte identical to PHP 8.4.
 
 ## ⛔ M4 — Gradual migration
 

@@ -921,7 +921,8 @@ fn sprintf_missing_args_is_fatal() {
     let r = run_ok(&["run", f.to_str().unwrap()]);
     assert_eq!(r.code, 255, "stderr: {}", r.stderr);
     assert!(
-        r.stderr.contains("ArgumentCountError: 3 arguments are required, 2 given"),
+        r.stderr
+            .contains("ArgumentCountError: 3 arguments are required, 2 given"),
         "stderr: {}",
         r.stderr
     );
@@ -937,7 +938,8 @@ fn sprintf_unknown_specifier_is_fatal() {
     let r = run_ok(&["run", f.to_str().unwrap()]);
     assert_eq!(r.code, 255, "stderr: {}", r.stderr);
     assert!(
-        r.stderr.contains("ValueError: Unknown format specifier \"q\""),
+        r.stderr
+            .contains("ValueError: Unknown format specifier \"q\""),
         "stderr: {}",
         r.stderr
     );
@@ -1330,4 +1332,93 @@ fn quicksort_example_runs() {
     let r = run_ok(&["run", file]);
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "1 2 3 4 5 6 7 8 9 10 \n");
+}
+
+/// The milestone-3.1 acceptance test: classes, properties, methods, instantiation,
+/// $this, and encapsulation match PHP 8.4 byte-for-byte.
+#[test]
+fn classes_and_objects_match_php() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let have_php = Command::new("php")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !have_php {
+        eprintln!("skipping: no php interpreter");
+        return;
+    }
+    let file = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/objects.php");
+    let r = run_ok(&["run", file]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let php = Command::new("php").arg(file).output().unwrap();
+    assert_eq!(
+        r.stdout,
+        String::from_utf8_lossy(&php.stdout),
+        "PXR and PHP output differ on examples/objects.php"
+    );
+}
+
+#[test]
+fn class_visibility_private_rejected() {
+    let src = r#"<?php
+        class Secret {
+            private int $val = 42;
+        }
+        $s = new Secret();
+        echo $s->val;
+    "#;
+    let file = temp_php("private_prop_rejected", src);
+    let r = run_ok(&["check", file.to_str().unwrap()]);
+    assert_ne!(r.code, 0);
+    assert!(r.stderr.contains("E0265") || r.stdout.contains("E0265"));
+}
+
+#[test]
+fn class_assign_this_rejected() {
+    let src = r#"<?php
+        class Foo {
+            public function test(): void {
+                $this = 10;
+            }
+        }
+    "#;
+    let file = temp_php("assign_this_rejected", src);
+    let r = run_ok(&["check", file.to_str().unwrap()]);
+    assert_ne!(r.code, 0);
+    assert!(r.stderr.contains("E0267") || r.stdout.contains("E0267"));
+}
+
+#[test]
+fn class_type_errors_are_loud() {
+    // 1. Unknown class
+    let src1 = r#"<?php $x = new NonExistentClass();"#;
+    let f1 = temp_php("unknown_class", src1);
+    let r1 = run_ok(&["check", f1.to_str().unwrap()]);
+    assert_ne!(r1.code, 0);
+    assert!(r1.stderr.contains("E0205") || r1.stdout.contains("E0205"));
+
+    // 2. Unknown property
+    let src2 = r#"<?php class A { public int $x; } $a = new A(); echo $a->nope;"#;
+    let f2 = temp_php("unknown_prop", src2);
+    let r2 = run_ok(&["check", f2.to_str().unwrap()]);
+    assert_ne!(r2.code, 0);
+    assert!(r2.stderr.contains("E0261") || r2.stdout.contains("E0261"));
+
+    // 3. Unknown method
+    let src3 = r#"<?php class B { public int $x; } $b = new B(); $b->nope();"#;
+    let f3 = temp_php("unknown_method", src3);
+    let r3 = run_ok(&["check", f3.to_str().unwrap()]);
+    assert_ne!(r3.code, 0);
+    assert!(r3.stderr.contains("E0262") || r3.stdout.contains("E0262"));
+
+    // 4. Constructor arity mismatch
+    let src4 = r#"<?php class C { public function __construct(int $a) {} } $c = new C();"#;
+    let f4 = temp_php("ctor_arity", src4);
+    let r4 = run_ok(&["check", f4.to_str().unwrap()]);
+    assert_ne!(r4.code, 0);
+    assert!(r4.stderr.contains("E0207") || r4.stdout.contains("E0207"));
 }

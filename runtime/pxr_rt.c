@@ -1982,3 +1982,60 @@ long long pxr_printf(const pxr_str *fmt, void *args) {
     }
     return s ? (long long)s->len : 0;
 }
+
+/*
+ * ===========================================================================
+ * Object runtime (M3.1): instantiation and property storage.
+ * ===========================================================================
+ */
+
+typedef struct {
+    const pxr_str *class_name;
+    size_t num_props;
+    int64_t *tags;
+    int64_t *bits;
+} pxr_object;
+
+void *pxr_object_new(const pxr_str *name, long long num_props) {
+    pxr_object *obj = (pxr_object *)pxr_arena_alloc(sizeof(pxr_object));
+    obj->class_name = name;
+    obj->num_props = (size_t)num_props;
+    if (num_props > 0) {
+        obj->tags = (int64_t *)pxr_arena_alloc(sizeof(int64_t) * (size_t)num_props);
+        obj->bits = (int64_t *)pxr_arena_alloc(sizeof(int64_t) * (size_t)num_props);
+        memset(obj->tags, 0, sizeof(int64_t) * (size_t)num_props);
+        memset(obj->bits, 0, sizeof(int64_t) * (size_t)num_props);
+    } else {
+        obj->tags = NULL;
+        obj->bits = NULL;
+    }
+    return obj;
+}
+
+long long pxr_object_get_bits(void *p, long long prop_idx) {
+    if (!p) {
+        fprintf(stderr, "Fatal error: Uncaught Error: Attempt to read property on null\n");
+        exit(255);
+    }
+    pxr_object *obj = (pxr_object *)p;
+    if (prop_idx < 0 || (size_t)prop_idx >= obj->num_props) {
+        fprintf(stderr, "Fatal error: property index %lld out of bounds\n", prop_idx);
+        exit(255);
+    }
+    return obj->bits[prop_idx];
+}
+
+void pxr_object_set_bits(void *p, long long prop_idx, long long tag, long long bits) {
+    if (!p) {
+        fprintf(stderr, "Fatal error: Uncaught Error: Attempt to assign property on null\n");
+        exit(255);
+    }
+    pxr_object *obj = (pxr_object *)p;
+    if (prop_idx < 0 || (size_t)prop_idx >= obj->num_props) {
+        fprintf(stderr, "Fatal error: property index %lld out of bounds\n", prop_idx);
+        exit(255);
+    }
+    obj->tags[prop_idx] = tag;
+    obj->bits[prop_idx] = bits;
+}
+

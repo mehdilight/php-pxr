@@ -42,6 +42,7 @@ and whose output the test suite asserts is byte‑identical.
 | `echo true` → `1`, `echo false` → *(nothing)*; `.` on `bool` → `"1"`/`""` | |
 | Integral floats print without a decimal point (`1.0` → `"1"`) | |
 | Function names case‑insensitive; variable names case‑sensitive | |
+| **Classes and objects** | `class`, typed properties with defaults, methods, constructors (`__construct`), visibility (`public`, `protected`, `private`), `$this`, method chaining, instantiation (`new`) |
 
 ## Remaining observable differences
 
@@ -81,7 +82,7 @@ behavioural divergence.
 | Leading‑zero octal literal (`0755`) | **Warning** `W0001`, read as decimal |
 | Functions that return `string|false` / `int|false` (`strpos`, `strstr`, `base64_decode`, `hex2bin`, `substr_compare`, …) | Not yet — needs a union / `false` value type; only the never-failing encoders above are provided |
 | `number_format` | Not yet |
-| Classes, interfaces, traits, enums, namespaces, closures | Not yet |
+| Class inheritance (`extends`), interfaces, traits, enums, namespaces, closures | Not yet |
 | `include`/`require`, `global`, `static`, references `&` | Not yet |
 | Exceptions, generators, attributes | Not yet |
 

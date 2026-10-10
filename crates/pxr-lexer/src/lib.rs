@@ -61,6 +61,11 @@ pub enum TokenKind {
     True,
     False,
     Null,
+    Class,
+    New,
+    Public,
+    Private,
+    Protected,
 
     // Type keywords.
     KwInt,
@@ -172,6 +177,11 @@ impl TokenKind {
             TokenKind::True => "true",
             TokenKind::False => "false",
             TokenKind::Null => "null",
+            TokenKind::Class => "class",
+            TokenKind::New => "new",
+            TokenKind::Public => "public",
+            TokenKind::Private => "private",
+            TokenKind::Protected => "protected",
             TokenKind::KwInt => "int",
             TokenKind::KwFloat => "float",
             TokenKind::KwString => "string",
@@ -980,6 +990,11 @@ fn keyword(word: &str) -> Option<TokenKind> {
         "true" => TokenKind::True,
         "false" => TokenKind::False,
         "null" => TokenKind::Null,
+        "class" => TokenKind::Class,
+        "new" => TokenKind::New,
+        "public" => TokenKind::Public,
+        "private" => TokenKind::Private,
+        "protected" => TokenKind::Protected,
         "int" => TokenKind::KwInt,
         "float" => TokenKind::KwFloat,
         "string" => TokenKind::KwString,
@@ -1112,5 +1127,37 @@ mod tests {
                 "expected E0008 for {src}"
             );
         }
+    }
+
+    #[test]
+    fn class_keywords() {
+        let k =
+            kinds("class Point { public int $x; private string $y; protected $z; new Point(); }");
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Class,
+                TokenKind::Ident("Point".into()),
+                TokenKind::LBrace,
+                TokenKind::Public,
+                TokenKind::KwInt,
+                TokenKind::Variable("x".into()),
+                TokenKind::Semicolon,
+                TokenKind::Private,
+                TokenKind::KwString,
+                TokenKind::Variable("y".into()),
+                TokenKind::Semicolon,
+                TokenKind::Protected,
+                TokenKind::Variable("z".into()),
+                TokenKind::Semicolon,
+                TokenKind::New,
+                TokenKind::Ident("Point".into()),
+                TokenKind::LParen,
+                TokenKind::RParen,
+                TokenKind::Semicolon,
+                TokenKind::RBrace,
+                TokenKind::Eof,
+            ]
+        );
     }
 }
