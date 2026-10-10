@@ -1,0 +1,19 @@
+[package]
+name = "pxr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PXR - PHP Extended Runtime compiler CLI"
+
+[[bin]]
+name = "pxr"
+path = "src/main.rs"
+
+[dependencies]
+pxr-ast.workspace = true
+pxr-codegen.workspace = true
+pxr-diag.workspace = true
+pxr-driver.workspace = true
+pxr-lexer.workspace = true
+pxr-opt.workspace = true
+pxr-parser.workspace = true

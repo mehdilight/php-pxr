@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+# PXR build artifacts
+*.pxro
+*.ll
+*.o
+*.a
+/dist
+.DS_Store
+# Upstream PHP source used only as a reference while designing PXR.
+# It is a large external checkout and is intentionally not vendored.
+/references

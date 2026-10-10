@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pxr-types",
+    "crates/pxr-diag",
+    "crates/pxr-lexer",
+    "crates/pxr-ast",
+    "crates/pxr-parser",
+    "crates/pxr-sema",
+    "crates/pxr-ir",
+    "crates/pxr-opt",
+    "crates/pxr-codegen",
+    "crates/pxr-driver",
+    "crates/pxr",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/pxr-lang/php-extended-runtime"
+description = "PXR - PHP Extended Runtime: a native compiler for the PXR language (a typed superset of PHP)"
+
+[workspace.dependencies]
+pxr-types = { path = "crates/pxr-types" }
+pxr-diag = { path = "crates/pxr-diag" }
+pxr-lexer = { path = "crates/pxr-lexer" }
+pxr-ast = { path = "crates/pxr-ast" }
+pxr-parser = { path = "crates/pxr-parser" }
+pxr-sema = { path = "crates/pxr-sema" }
+pxr-ir = { path = "crates/pxr-ir" }
+pxr-opt = { path = "crates/pxr-opt" }
+pxr-codegen = { path = "crates/pxr-codegen" }
+pxr-driver = { path = "crates/pxr-driver" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

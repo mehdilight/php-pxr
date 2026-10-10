@@ -1,0 +1,11 @@
+[package]
+name = "pxr-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PXR recursive-descent parser"
+
+[dependencies]
+pxr-ast.workspace = true
+pxr-diag.workspace = true
+pxr-lexer.workspace = true

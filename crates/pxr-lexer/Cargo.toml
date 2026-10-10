@@ -1,0 +1,9 @@
+[package]
+name = "pxr-lexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PXR lexer: turns .php source bytes into tokens"
+
+[dependencies]
+pxr-diag.workspace = true

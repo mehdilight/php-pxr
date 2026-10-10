@@ -1,0 +1,16 @@
+[package]
+name = "pxr-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PXR compilation driver: orchestrates the pipeline and the LLVM toolchain"
+
+[dependencies]
+pxr-codegen.workspace = true
+pxr-diag.workspace = true
+pxr-ir.workspace = true
+pxr-lexer.workspace = true
+pxr-opt.workspace = true
+pxr-parser.workspace = true
+pxr-sema.workspace = true
+pxr-types.workspace = true

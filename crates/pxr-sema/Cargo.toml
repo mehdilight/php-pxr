@@ -1,0 +1,14 @@
+[package]
+name = "pxr-sema"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PXR semantic analysis and static type checking"
+
+[dependencies]
+pxr-ast.workspace = true
+pxr-diag.workspace = true
+pxr-types.workspace = true
+
+[dev-dependencies]
+pxr-parser.workspace = true

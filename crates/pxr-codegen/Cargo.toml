@@ -1,0 +1,11 @@
+[package]
+name = "pxr-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PXR code generation: typed AST -> IR -> LLVM IR"
+
+[dependencies]
+pxr-ir.workspace = true
+pxr-sema.workspace = true
+pxr-types.workspace = true

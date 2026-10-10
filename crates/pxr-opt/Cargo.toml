@@ -1,0 +1,10 @@
+[package]
+name = "pxr-opt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PXR IR optimizer (constant folding, dead code elimination, CFG cleanup)"
+
+[dependencies]
+pxr-ir.workspace = true
+pxr-types.workspace = true

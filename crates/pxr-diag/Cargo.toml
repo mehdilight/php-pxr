@@ -1,0 +1,8 @@
+[package]
+name = "pxr-diag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PXR source spans, diagnostics and error rendering"
+
+[dependencies]
