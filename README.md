@@ -178,9 +178,10 @@ automatically when no C compiler is available.
 Tracked honestly in [`docs/ROADMAP.md`](docs/ROADMAP.md). The larger items:
 keyed `foreach`, `echo` of arrays, nested array assignment, `null`/nullable
 types, integer‑overflow → `float` promotion, classes/objects, generics,
-ownership & borrowing, string interpolation, exceptions, modules/`include`,
-C interop (`extern`), concurrency, and the `mixed`/dynamic escape hatch for
-gradual migration.
+ownership & borrowing, the complex string‑interpolation forms (`"$a[0]"`,
+`"{$expr}"`, `"${name}"`, `"$obj->p"`; the simple `"$name"` / `"{$name}"` work),
+exceptions, modules/`include`, C interop (`extern`), concurrency, and the
+`mixed`/dynamic escape hatch for gradual migration.
 
 ## License
 

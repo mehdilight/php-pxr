@@ -251,3 +251,13 @@ echo "scount=" . substr_count("hello world", "o") . "," .
     substr_count("aaaa", "aa") . "," .
     substr_count("hello", "l", -2) . "," .
     substr_count("hello", "l", 0, -2) . "\n";
+
+// --- milestone 2: double-quoted string interpolation -----------------------
+
+$iname = "world";
+$in = 7;
+$ipf = 1.5;
+$ib = true;
+echo "interp=$iname/$in/$ipf/$ib\n";
+echo "interp2=a{$iname}b{$in}c\n";
+echo "interp3=[$] [\$in] [$in.] [$$in]\n";

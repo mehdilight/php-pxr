@@ -120,7 +120,8 @@ numeric-aware (`"10" < "9"` = false, `"1" == "01"` = true, `===` stays byte
 equality, `switch` follows), floats stringify exactly like PHP (`zend_gcvt`
 precision 14: `1e15` → `"1.0E+15"`, `1e-5` → `"1.0E-5"`, `-0.0` → `"-0"`),
 `/` and `%` by zero raise PHP's fatal `DivisionByZeroError`, and double-quoted
-interpolation is rejected at compile time as `E0008`. Strings became **owned
+interpolation was (at that point) rejected at compile time as `E0008`, pending
+the M2.interpolation slice. Strings became **owned
 byte strings** (`pxr_str { len, data[] }`, still a single `ptr` in the ABI), so
 embedded NULs are first-class: `strlen("a\0b")` is `3`, equality/ordering and
 concatenation are byte-exact — matching PHP.
@@ -128,7 +129,8 @@ concatenation are byte-exact — matching PHP.
 ## 🚧 M2 — Strings & standard library
 
 * Owned string type (length + data, embedded NUL safe) — **done** in the M1.x
-  fidelity round; string interpolation remains.
+  fidelity round; simple double‑quoted interpolation (`"$name"` / `"{$name}"`)
+  also done (M2.interpolation slice); the richer PHP forms remain rejected.
 * A real standard library (sorted by module) reachable via `use`, compiled from
   PXR sources or intrinsic.
 * `sprintf`, `explode`/`implode`, `str_replace`, `substr`, `str_*`, `array_*`.
@@ -215,6 +217,28 @@ concatenation are byte-exact — matching PHP.
 * Tests: +7 CLI tests (merge, slice/pad/fill/key-exists, `str_pad`/`substr_count`,
   three fatal cases, mixed-element rejection) — 43 CLI tests total;
   `examples/compat.php` extended (still byte‑identical to PHP 8.4).
+
+**Delivered (M2.interpolation slice).**
+
+* Double‑quoted interpolation of the simple forms `"$name"` and `"{$name}"`. The
+  lexer gains a `TokenKind::InterpStr(Vec<StrPart>)` token (`Lit` runs + `Var`
+  references); the parser desugars it into a left‑associative `"" . …`
+  concatenation, so no sema/IR/codegen change was needed and the value is
+  string‑converted exactly as PHP's echo/`.` conversion is.
+* PHP‑exact literal‑`$` rule: `$` not followed by a name start stays a literal
+  `$`, so `"$"`, `"$1"`, `"$ "`, `"foo$"` and `"$$x"` (→ `"$"` + `$x`) all match
+  byte‑for‑byte; `\$` is an escaped dollar (already handled). A double‑quoted
+  string with no actual variable folds back to a plain byte‑string token, so all
+  existing string paths are untouched.
+* The forms PXR cannot yet expand are **loud `E0008` errors** rather than being
+  silently mis‑lexed: simple array access `"$a[0]"` / `"$a[$k]"`, property access
+  `"$obj->p"`, complex `"{$expr}"` (only `"{$name}"` is accepted) and the
+  deprecated `"${name}"`. Interpolating a value with no string conversion (an
+  array) is a loud `E0223` type error, never PHP's `"Array"`‑plus‑warning.
+* Tests: +2 CLI tests (`string_interpolation_matches_php`,
+  `array_interpolation_is_a_loud_type_error`) and +2 lexer unit tests — 45 CLI
+  tests total; `examples/compat.php` extended (still byte‑identical to PHP 8.4);
+  the old `E0008`-on-any-`$` behaviour and its test were retired.
 
 **Acceptance.** A string‑heavy program (e.g. word count) compiles and matches PHP —
 the word‑count block at the end of `examples/compat.php` does exactly this. ✅

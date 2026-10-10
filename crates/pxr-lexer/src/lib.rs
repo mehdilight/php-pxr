@@ -8,10 +8,21 @@
 //! * `<?php` opening tags are accepted and skipped; files without a tag are
 //!   lexed as bare code so that PXR fragments are convenient to test.
 //! * `#!` shebang lines are skipped.
-//! * Double-quoted string interpolation is **not** implemented yet; a warning
-//!   is emitted and the text is kept literal rather than silently mis-compiled.
+//! * Double-quoted string interpolation supports the simple `$name` and
+//!   `{$name}` forms. The more complex forms PHP also allows (`$a[0]`,
+//!   `$a[k]`, `{$a[0]}`, `$obj->p`, the deprecated `${name}`) are rejected with
+//!   a diagnostic (`E0008`) rather than being silently mis-lexed.
 
 use pxr_diag::{Diagnostic, Diagnostics, Span};
+
+/// One piece of an interpolated double-quoted string.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StrPart {
+    /// A run of literal bytes (escapes already applied).
+    Lit(Vec<u8>),
+    /// A `$name` / `{$name}` variable reference.
+    Var(String),
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TokenKind {
@@ -23,6 +34,10 @@ pub enum TokenKind {
     /// Raw bytes: PHP strings are byte strings, so a literal may hold invalid
     /// UTF-8 (e.g. `"\xA9"` is the single byte `0xA9`).
     Str(Vec<u8>),
+    /// A double-quoted string that contains at least one `$name` / `{$name}`
+    /// interpolation. Plain strings (including ones where every `$` is literal)
+    /// stay [`TokenKind::Str`] so downstream code is unchanged.
+    InterpStr(Vec<StrPart>),
 
     // Keywords.
     Function,
@@ -127,6 +142,7 @@ impl TokenKind {
             TokenKind::Int(v) => format!("integer `{v}`"),
             TokenKind::Float(v) => format!("float `{v}`"),
             TokenKind::Str(_) => "string literal".to_string(),
+            TokenKind::InterpStr(_) => "interpolated string literal".to_string(),
             TokenKind::Eof => "end of file".to_string(),
             other => format!("`{}`", other.symbol()),
         }
@@ -730,7 +746,48 @@ impl<'a> Lexer<'a> {
 
     fn read_string(&mut self, quote: u8, start: usize) -> TokenKind {
         self.pos += 1; // opening quote
-        let mut out: Vec<u8> = Vec::new();
+        if quote == b'\'' {
+            // Single quotes only recognize `\\` and `\'`; no interpolation.
+            let mut out: Vec<u8> = Vec::new();
+            loop {
+                match self.peek() {
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error("unterminated string literal")
+                                .with_code("E0007")
+                                .with_span(Span::new(start, self.pos)),
+                        );
+                        break;
+                    }
+                    Some(b'\'') => {
+                        self.pos += 1;
+                        break;
+                    }
+                    Some(b'\\') => {
+                        self.pos += 1;
+                        match self.bump() {
+                            Some(b'\\') => out.push(b'\\'),
+                            Some(b'\'') => out.push(b'\''),
+                            Some(other) => {
+                                out.push(b'\\');
+                                out.push(other);
+                            }
+                            None => break,
+                        }
+                    }
+                    Some(b) => {
+                        out.push(b);
+                        self.pos += 1;
+                    }
+                }
+            }
+            return TokenKind::Str(out);
+        }
+
+        // Double-quoted: escapes plus `$name` / `{$name}` interpolation.
+        let mut parts: Vec<StrPart> = Vec::new();
+        let mut cur: Vec<u8> = Vec::new();
+        let mut has_var = false;
         loop {
             match self.peek() {
                 None => {
@@ -741,77 +798,141 @@ impl<'a> Lexer<'a> {
                     );
                     break;
                 }
-                Some(b) if b == quote => {
+                Some(b'"') => {
                     self.pos += 1;
                     break;
                 }
                 Some(b'\\') => {
-                    let esc_start = self.pos;
                     self.pos += 1;
                     let Some(e) = self.bump() else { break };
-                    if quote == b'\'' {
-                        // Single quotes only recognize `\\` and `\'`.
-                        match e {
-                            b'\\' => out.push(b'\\'),
-                            b'\'' => out.push(b'\''),
-                            other => {
-                                out.push(b'\\');
-                                out.push(other);
+                    match e {
+                        b'n' => cur.push(b'\n'),
+                        b't' => cur.push(b'\t'),
+                        b'r' => cur.push(b'\r'),
+                        b'v' => cur.push(0x0b),
+                        b'f' => cur.push(0x0c),
+                        b'e' => cur.push(0x1b),
+                        b'0' => cur.push(0),
+                        b'\\' => cur.push(b'\\'),
+                        b'"' => cur.push(b'"'),
+                        b'$' => cur.push(b'$'),
+                        b'x' | b'X' => {
+                            let h1 = self.peek().filter(u8::is_ascii_hexdigit);
+                            let h2 = h1
+                                .and_then(|_| self.peek_at(1))
+                                .filter(u8::is_ascii_hexdigit);
+                            if let (Some(h1), Some(h2)) = (h1, h2) {
+                                self.pos += 2;
+                                let hex = [h1, h2];
+                                let s = std::str::from_utf8(&hex).unwrap();
+                                cur.push(u8::from_str_radix(s, 16).unwrap());
+                            } else {
+                                cur.push(b'\\');
+                                cur.push(e);
                             }
                         }
-                    } else {
-                        match e {
-                            b'n' => out.push(b'\n'),
-                            b't' => out.push(b'\t'),
-                            b'r' => out.push(b'\r'),
-                            b'v' => out.push(0x0b),
-                            b'f' => out.push(0x0c),
-                            b'e' => out.push(0x1b),
-                            b'0' => out.push(0),
-                            b'\\' => out.push(b'\\'),
-                            b'"' => out.push(b'"'),
-                            b'$' => out.push(b'$'),
-                            b'x' | b'X' => {
-                                let h1 = self.peek().filter(u8::is_ascii_hexdigit);
-                                let h2 = h1
-                                    .and_then(|_| self.peek_at(1))
-                                    .filter(u8::is_ascii_hexdigit);
-                                if let (Some(h1), Some(h2)) = (h1, h2) {
-                                    self.pos += 2;
-                                    let hex = [h1, h2];
-                                    let s = std::str::from_utf8(&hex).unwrap();
-                                    out.push(u8::from_str_radix(s, 16).unwrap());
-                                } else {
-                                    out.push(b'\\');
-                                    out.push(e);
-                                }
-                            }
-                            other => {
-                                out.push(b'\\');
-                                out.push(other);
-                            }
+                        other => {
+                            cur.push(b'\\');
+                            cur.push(other);
                         }
                     }
-                    let _ = esc_start;
                 }
-                Some(b'$') if quote == b'"' => {
-                    self.diags.emit(
-                        Diagnostic::error(
-                            "double-quoted string interpolation is not implemented yet; write a concatenation (`\"a\" . $x`) instead",
-                        )
-                        .with_code("E0008")
-                        .with_span(Span::new(self.pos, self.pos + 1)),
-                    );
-                    out.push(b'$');
-                    self.pos += 1;
+                Some(b'$') => match self.peek_at(1) {
+                    Some(b'{') => {
+                        // Deprecated `${name}` / `${expr}` syntax.
+                        self.diags.emit(
+                            Diagnostic::error(
+                                "`${...}` string interpolation is not implemented yet; write `{$name}` instead",
+                            )
+                            .with_code("E0008")
+                            .with_span(Span::new(self.pos, self.pos + 2)),
+                        );
+                        cur.push(b'$');
+                        self.pos += 1;
+                    }
+                    Some(n) if is_ident_start(n) => {
+                        self.pos += 1; // consume `$`
+                        let name = self.read_ident_body();
+                        if !cur.is_empty() {
+                            parts.push(StrPart::Lit(std::mem::take(&mut cur)));
+                        }
+                        has_var = true;
+                        parts.push(StrPart::Var(name));
+                        // PHP's "simple" syntax also allows `$a[0]` / `$a[$k]`
+                        // and `$obj->prop`; reject these rather than mis-lex.
+                        if self.peek() == Some(b'[') {
+                            self.diags.emit(
+                                Diagnostic::error(
+                                    "array interpolation (`$a[...]`) is not implemented yet; write a concatenation instead",
+                                )
+                                .with_code("E0008")
+                                .with_span(Span::new(self.pos, self.pos + 1)),
+                            );
+                        } else if self.peek() == Some(b'-') && self.peek_at(1) == Some(b'>') {
+                            self.diags.emit(
+                                Diagnostic::error(
+                                    "property interpolation (`$obj->prop`) is not implemented yet; write a concatenation instead",
+                                )
+                                .with_code("E0008")
+                                .with_span(Span::new(self.pos, self.pos + 2)),
+                            );
+                        }
+                    }
+                    _ => {
+                        // `$` not followed by a name start is a literal `$`
+                        // (`"$"`, `"$1"`, `"$$x"`), matching PHP.
+                        cur.push(b'$');
+                        self.pos += 1;
+                    }
+                },
+                Some(b'{') if self.peek_at(1) == Some(b'$') => {
+                    // `{$name}` (simple) is supported; anything more complex is
+                    // rejected so it is never silently treated as literal.
+                    let save = self.pos;
+                    self.pos += 2; // `{` `$`
+                    let name = self.read_ident_body();
+                    if !name.is_empty() && self.peek() == Some(b'}') {
+                        self.pos += 1;
+                        if !cur.is_empty() {
+                            parts.push(StrPart::Lit(std::mem::take(&mut cur)));
+                        }
+                        has_var = true;
+                        parts.push(StrPart::Var(name));
+                    } else {
+                        self.pos = save;
+                        self.diags.emit(
+                            Diagnostic::error(
+                                "complex string interpolation (`{$...}`) is not implemented yet; only `{$name}` is supported",
+                            )
+                            .with_code("E0008")
+                            .with_span(Span::new(self.pos, self.pos + 1)),
+                        );
+                        cur.push(b'{');
+                        self.pos += 1;
+                    }
                 }
                 Some(b) => {
-                    out.push(b);
+                    cur.push(b);
                     self.pos += 1;
                 }
             }
         }
-        TokenKind::Str(out)
+
+        if !cur.is_empty() {
+            parts.push(StrPart::Lit(cur));
+        }
+        if has_var {
+            TokenKind::InterpStr(parts)
+        } else {
+            // No interpolation: fold back into a plain byte string.
+            let mut buf = Vec::new();
+            for p in parts {
+                if let StrPart::Lit(b) = p {
+                    buf.extend_from_slice(&b);
+                }
+            }
+            TokenKind::Str(buf)
+        }
     }
 
     fn read_while(&mut self, pred: impl Fn(u8) -> bool) -> String {
@@ -945,9 +1066,51 @@ mod tests {
     }
 
     #[test]
-    fn interpolation_is_rejected() {
-        let (_, diags) = lex(r#""hi $name""#);
-        assert!(diags.has_errors());
-        assert!(diags.items().iter().any(|d| d.code == Some("E0008")));
+    fn interpolation_simple_variable() {
+        let k = kinds(r#""hi $name""#);
+        assert_eq!(
+            k[0],
+            TokenKind::InterpStr(vec![
+                StrPart::Lit(b"hi ".to_vec()),
+                StrPart::Var("name".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn interpolation_braced_variable() {
+        let k = kinds(r#""a{$x}b""#);
+        assert_eq!(
+            k[0],
+            TokenKind::InterpStr(vec![
+                StrPart::Lit(b"a".to_vec()),
+                StrPart::Var("x".into()),
+                StrPart::Lit(b"b".to_vec()),
+            ])
+        );
+        // Escaped dollar and literal dollars that are not followed by a name
+        // start stay part of the literal text (no interpolation token).
+        assert_eq!(kinds(r#""\$x""#)[0], TokenKind::Str(b"$x".to_vec()));
+        assert_eq!(kinds(r#""$1 $ ""#)[0], TokenKind::Str(b"$1 $ ".to_vec()));
+        assert_eq!(kinds(r#""foo$""#)[0], TokenKind::Str(b"foo$".to_vec()));
+    }
+
+    #[test]
+    fn interpolation_complex_forms_are_rejected() {
+        for src in [
+            r#""$a[0]""#,
+            r#""$a[k]""#,
+            r#""$a[$j]""#,
+            r#""{$a[0]}""#,
+            r#""$obj->prop""#,
+            r#""${x}""#,
+        ] {
+            let (_, diags) = lex(src);
+            assert!(diags.has_errors(), "expected a diagnostic for {src}");
+            assert!(
+                diags.items().iter().any(|d| d.code == Some("E0008")),
+                "expected E0008 for {src}"
+            );
+        }
     }
 }

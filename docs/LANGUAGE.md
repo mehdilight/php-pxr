@@ -82,7 +82,7 @@ concat    := additive ('.' additive)*
 additive  := multiplicative (('+' | '-') multiplicative)*
 multiplicative := unary (('*' | '/' | '%') unary)*
 unary     := ('!' | '-' | '~') unary | primary
-primary   := INT | FLOAT | STRING | 'true' | 'false' | 'null'
+primary   := INT | FLOAT | STRING | INTERP_STRING | 'true' | 'false' | 'null'
            | VARIABLE | primary '[' expr ']' | primary '[' ']'
            | '[' (array_item (',' array_item)*)? ','? ']'
            | 'array' '(' ... ')'
@@ -138,6 +138,13 @@ Arithmetic `+ - * /` require numeric operands; `%` requires two `int`s.
 
 Concatenation `.` accepts `string`, and also `int`/`float`/`bool`, which are
 converted to their string form.
+
+A double‑quoted string may interpolate a variable with `"$name"` or `"{$name}"`;
+this is syntactic sugar for `"" . $name`, so the value is string‑converted like
+any other `.` operand. A `$` that is not followed by a name start is an ordinary
+`$` (`"$1"`, `"foo$"`, `"$$x"` behave as in PHP). PHP's richer interpolation
+forms — `"$a[0]"`, `"$a[$k]"`, `"{$a[0]}"`, `"$obj->p"` and the deprecated
+`"${name}"` — are not implemented and are rejected with `E0008`.
 
 Equality:
 
@@ -286,7 +293,7 @@ are `W020x`.
 | `E0006` | Integer literal out of range |
 | `E0007` | Unterminated string literal |
 | `W0001` | Leading‑zero octal treated as decimal |
-| `E0008` | Double‑quoted string interpolation not implemented |
+| `E0008` | Unsupported double‑quoted interpolation form (`$a[...]`, `{$expr}`, `$obj->p`, `${...}`) |
 | `E0100` | Syntax error (with the unexpected token described) |
 | `E0201` | Duplicate function definition |
 | `E0202` | Parameter needs an explicit type |

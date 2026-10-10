@@ -342,13 +342,21 @@ fn negative_shift_is_a_fatal_error() {
 }
 
 #[test]
-fn interpolation_is_rejected_at_compile_time() {
-    // PXR cannot yet expand `"$x"`. Rather than silently emitting the literal
-    // (which would diverge from PHP), it is a hard compile error.
-    let f = temp_php("interp", "<?php $x = 1; echo \"hi $x\";");
-    let r = run_ok(&["check", f.to_str().unwrap()]);
-    assert_eq!(r.code, 1);
-    assert!(r.stderr.contains("E0008"), "stderr: {}", r.stderr);
+fn unsupported_interpolation_forms_are_rejected() {
+    // Simple `$x` / `{$x}` interpolation works, but PHP's array, property and
+    // `${...}` forms cannot be expanded yet. Rather than silently emitting the
+    // literal (which would diverge from PHP), each is a hard compile error.
+    for (name, src) in [
+        ("iarr", "<?php $a = [1]; echo \"$a[0]\";"),
+        ("iprop", "<?php $o = 1; echo \"$o->p\";"),
+        ("icplx", "<?php $a = [1]; echo \"{$a[0]}\";"),
+        ("idoll", "<?php $x = 1; echo \"${x}\";"),
+    ] {
+        let f = temp_php(name, src);
+        let r = run_ok(&["check", f.to_str().unwrap()]);
+        assert_eq!(r.code, 1, "src {src}: {}", r.stderr);
+        assert!(r.stderr.contains("E0008"), "src {src}: {}", r.stderr);
+    }
 }
 
 #[test]
@@ -777,6 +785,51 @@ echo (strlen("\x00\x01\xFE\xFF") === 4 ? "len4ok" : "len4bad") . "\n";
     let r = run_ok(&["run", f.to_str().unwrap()]);
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "lenok\nrevok\nlen4ok\n");
+}
+
+/// Double-quoted interpolation for `$name` / `{$name}`, including the cases
+/// PHP treats as literal `$` (`"$"`, `"$1"`, `"foo$"`, `"$$x"`), escaped
+/// dollars, and the string conversion of int/float/bool values.
+#[test]
+fn string_interpolation_matches_php() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let src = r#"<?php
+$x = 5;
+$y = "Y";
+$f = 3.5;
+$b = true;
+echo "simple:[$x] mixed:[a$x b] two:[$x$y]\n";
+echo "braced:[{$x}] adj:[{$x}{$y}]\n";
+echo "float:[$f] bool:[$b]\n";
+echo "dollar:[$] d1:[$1] ds:[$ ] fooend:[foo$]\n";
+echo "esc:[\$x] thenlit:[$x.] brace:[a{b] plus:[$x+1]\n";
+echo "dollarvar:[$$x]\n";
+echo "empty:[]\n";
+"#;
+    let f = temp_php("interp_ok", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let expected = "simple:[5] mixed:[a5 b] two:[5Y]\n\
+                    braced:[5] adj:[5Y]\n\
+                    float:[3.5] bool:[1]\n\
+                    dollar:[$] d1:[$1] ds:[$ ] fooend:[foo$]\n\
+                    esc:[$x] thenlit:[5.] brace:[a{b] plus:[5+1]\n\
+                    dollarvar:[$5]\n\
+                    empty:[]\n";
+    assert_eq!(r.stdout, expected);
+}
+
+/// Interpolating a value with no string conversion (an array) is a loud type
+/// error, never PHP's `"Array"` warning-and-continue.
+#[test]
+fn array_interpolation_is_a_loud_type_error() {
+    let f = temp_php("interp_arr", "<?php $a = [1, 2]; echo \"arr: $a\";");
+    let r = run_ok(&["check", f.to_str().unwrap()]);
+    assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("E0223"), "stderr: {}", r.stderr);
 }
 
 #[test]

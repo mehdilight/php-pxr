@@ -27,6 +27,7 @@ and whose output the test suite asserts is byte‑identical.
 | Bitwise `& | ^ ~`, shifts `<< >>` | PHP rules: count ≥ 64 → `0` (or `-1` for `>>` of a negative); negative count is a fatal `ArithmeticError` |
 | `++` / `--`, compound assignment `+=` etc. | as *statements* only (see below) |
 | String literals with escapes; hex / binary / `0o` octal / `_`‑separated ints | |
+| **Double‑quoted interpolation** `"$name"`, `"{$name}"` | equivalent to `"" . $name`; `$` not followed by a name start stays literal (`"$"`, `"$1"`, `"foo$"`, `"$$x"`); the array, property and `${...}` forms are rejected (see below) |
 | Infrastructure: typed params, return types, recursion | types are **required** (see below) |
 | Arrays `[...]` / `array(...)` | ordered maps, `int`/`string` keys, insertion order |
 | **Array value semantics** | assignment, function arguments, returns and `foreach` all operate on copies (copy‑on‑write, realised as an eager deep copy) |
@@ -64,7 +65,7 @@ behavioural divergence.
 | Untyped parameters / missing return type | **Error** `E0202`, `E0204` — PXR requires types |
 | Bare `array` type hint | **Error** — write the element type, `array<T>` (a PXR extension) |
 | A variable changing type (`$x = 1; $x = "s";`) | **Error** — a variable has one static type |
-| Double‑quoted interpolation `"$x"` | **Error** `E0008` — write `"a" . $x` |
+| Complex interpolation: `"$a[0]"`, `"$a[$k]"`, `"{$a[0]}"`, `"$obj->p"`, `"${name}"` | **Error** `E0008` — simple `"$name"` / `"{$name}"` work; write these as a concatenation instead |
 | `null`, nullable types | **Error** `E0209` |
 | Assignment as an expression (`$a = $b = 1`, `f($x++)`) | **Error** — `++`/`--`/`=` are statement‑only |
 | Keyed `foreach ($a as $k => $v)` | **Error** `E0242` |
@@ -112,6 +113,18 @@ ordering compare all bytes, and concatenation preserves them. Escapes follow PHP
 byte value of the sequence is what matters, so `"\x80"` is a one‑byte string.
 This holds for *any* byte: `\xHH` for `HH ≥ 0x80` produces that raw byte, not a
 Unicode replacement character (a regression test guards this).
+
+**Interpolation.** A double‑quoted string interpolates `$name` and `{$name}` and
+desugars to a `"" . …` concatenation, so the value is string‑converted exactly as
+PHP's echo/concat conversion is (`5` → `"5"`, `3.5` → `"3.5"`, `true` → `"1"`,
+`false` → `""`). A `$` that is not followed by a name start is a literal `$`, as
+in PHP: `"$"`, `"$1"`, `"$ "`, `"foo$"` and `"$$x"` (→ `"$"` then `$x`) all match
+byte‑for‑byte. `\$` is an escaped dollar. PHP's remaining interpolation forms are
+rejected loudly rather than mis‑lexed: simple array access `"$a[0]"`/`"$a[$k]"`,
+property access `"$obj->p"`, complex `"{$expr}"` (only `"{$name}"` is accepted),
+and the deprecated `"${name}"` are all **Errors** `E0008`. Interpolating a value
+with no string conversion (an array) is a loud type error (`E0223`), never PHP's
+`"Array"`-plus-warning.
 
 **String builtins.** `strtoupper`/`strtolower` map bytes only (ASCII `a–z`/`A–Z`),
 exactly like PHP's locale-independent conversion: `"héllo"` → `"héllo"`. `trim`
@@ -171,8 +184,8 @@ unifies with any element type. See the "Not implemented yet" table.
 direct read yields the zero value; `??` / `??=` detect absence correctly.
 
 **Fail loud, never silent.** Because classes, `null`, keyed `foreach`, nested
-assignment, interpolation, etc. are not implemented, using them is a compile
-error with a specific code — never a silently different program.
+assignment, the complex interpolation forms, etc. are not implemented, using them
+is a compile error with a specific code — never a silently different program.
 
 ## Runtime independence
 

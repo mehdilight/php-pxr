@@ -8,7 +8,7 @@
 
 use pxr_ast::*;
 use pxr_diag::{Diagnostic, Diagnostics, Span};
-use pxr_lexer::{Token, TokenKind};
+use pxr_lexer::{StrPart, Token, TokenKind};
 
 pub struct Parser {
     toks: Vec<Token>,
@@ -824,6 +824,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::StrLit(s, span))
             }
+            TokenKind::InterpStr(parts) => {
+                self.advance();
+                Ok(interpolated_string(parts, span))
+            }
             TokenKind::True => {
                 self.advance();
                 Ok(Expr::BoolLit(true, span))
@@ -1056,6 +1060,28 @@ fn bin_op(k: &TokenKind) -> Option<(BinOp, u8)> {
         TokenKind::Percent => (BinOp::Mod, 11),
         _ => return None,
     })
+}
+
+/// Desugar a `"a$x b"`-style literal into a left-associative concatenation.
+///
+/// The chain always begins from an empty string literal so the expression is
+/// string-typed and the first dynamic part undergoes exactly the same
+/// conversion as PHP's `"$x"` (e.g. `true` -> `"1"`, `5` -> `"5"`).
+fn interpolated_string(parts: Vec<StrPart>, span: Span) -> Expr {
+    let mut acc = Expr::StrLit(Vec::new(), span);
+    for part in parts {
+        let rhs = match part {
+            StrPart::Lit(bytes) => Expr::StrLit(bytes, span),
+            StrPart::Var(name) => Expr::Var(name, span),
+        };
+        acc = Expr::Binary {
+            op: BinOp::Concat,
+            lhs: Box::new(acc),
+            rhs: Box::new(rhs),
+            span,
+        };
+    }
+    acc
 }
 
 #[cfg(test)]
