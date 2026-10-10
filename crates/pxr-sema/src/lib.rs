@@ -53,6 +53,21 @@ pub enum Builtin {
     Implode,
     /// `explode($separator, $str[, $limit])` → `array<string>`.
     Explode,
+    /// `str_contains($haystack, $needle): bool` and friends (case-sensitive).
+    StrContains,
+    StrStartsWith,
+    StrEndsWith,
+    /// ASCII-only, byte-oriented case helpers.
+    Strrev,
+    Ucfirst,
+    Lcfirst,
+    Ucwords,
+    /// `str_split($str[, $length])` → `array<string>`.
+    StrSplit,
+    /// `array_values($array)` — reindexed, keys dropped.
+    ArrayValues,
+    /// `array_reverse($array[, $preserve_keys])`.
+    ArrayReverse,
 }
 
 impl Builtin {
@@ -74,6 +89,16 @@ impl Builtin {
             "str_replace" => Builtin::StrReplace,
             "implode" => Builtin::Implode,
             "explode" => Builtin::Explode,
+            "str_contains" => Builtin::StrContains,
+            "str_starts_with" => Builtin::StrStartsWith,
+            "str_ends_with" => Builtin::StrEndsWith,
+            "strrev" => Builtin::Strrev,
+            "ucfirst" => Builtin::Ucfirst,
+            "lcfirst" => Builtin::Lcfirst,
+            "ucwords" => Builtin::Ucwords,
+            "str_split" => Builtin::StrSplit,
+            "array_values" => Builtin::ArrayValues,
+            "array_reverse" => Builtin::ArrayReverse,
             _ => return None,
         })
     }
@@ -96,6 +121,16 @@ impl Builtin {
             Builtin::StrReplace => "str_replace",
             Builtin::Implode => "implode",
             Builtin::Explode => "explode",
+            Builtin::StrContains => "str_contains",
+            Builtin::StrStartsWith => "str_starts_with",
+            Builtin::StrEndsWith => "str_ends_with",
+            Builtin::Strrev => "strrev",
+            Builtin::Ucfirst => "ucfirst",
+            Builtin::Lcfirst => "lcfirst",
+            Builtin::Ucwords => "ucwords",
+            Builtin::StrSplit => "str_split",
+            Builtin::ArrayValues => "array_values",
+            Builtin::ArrayReverse => "array_reverse",
         }
     }
 }
@@ -120,7 +155,8 @@ pub enum Callee {
 pub enum TExpr {
     Int(i64),
     Float(f64),
-    Str(String),
+    /// Raw byte-string literal (PHP strings are byte strings).
+    Str(Vec<u8>),
     Bool(bool),
     Var {
         name: String,
@@ -2133,6 +2169,59 @@ impl Analyzer {
                     return self.builtin_ty_err(name, "an `int` limit", &atys[2], args[2].span());
                 }
                 Ty::array(Ty::String)
+            }
+            Builtin::StrContains | Builtin::StrStartsWith | Builtin::StrEndsWith => {
+                if n != 2 {
+                    return self.builtin_arity_err(name, 2, 2, n, span);
+                }
+                for (i, ty) in atys.iter().enumerate() {
+                    if *ty != Ty::String {
+                        return self.builtin_ty_err(name, "`string` arguments", ty, args[i].span());
+                    }
+                }
+                Ty::Bool
+            }
+            Builtin::Strrev | Builtin::Ucfirst | Builtin::Lcfirst | Builtin::Ucwords => {
+                if n != 1 {
+                    return self.builtin_arity_err(name, 1, 1, n, span);
+                }
+                if atys[0] != Ty::String {
+                    return self.builtin_ty_err(name, "a `string`", &atys[0], args[0].span());
+                }
+                Ty::String
+            }
+            Builtin::StrSplit => {
+                if !(1..=2).contains(&n) {
+                    return self.builtin_arity_err(name, 1, 2, n, span);
+                }
+                if atys[0] != Ty::String {
+                    return self.builtin_ty_err(name, "a `string`", &atys[0], args[0].span());
+                }
+                if n == 2 && atys[1] != Ty::Int {
+                    return self.builtin_ty_err(name, "an `int` length", &atys[1], args[1].span());
+                }
+                Ty::array(Ty::String)
+            }
+            Builtin::ArrayValues => {
+                if n != 1 {
+                    return self.builtin_arity_err(name, 1, 1, n, span);
+                }
+                if !atys[0].is_array() {
+                    return self.builtin_ty_err(name, "an array", &atys[0], args[0].span());
+                }
+                atys[0].clone()
+            }
+            Builtin::ArrayReverse => {
+                if !(1..=2).contains(&n) {
+                    return self.builtin_arity_err(name, 1, 2, n, span);
+                }
+                if !atys[0].is_array() {
+                    return self.builtin_ty_err(name, "an array", &atys[0], args[0].span());
+                }
+                if n == 2 && atys[1] != Ty::Bool {
+                    return self.builtin_ty_err(name, "a `bool` flag", &atys[1], args[1].span());
+                }
+                atys[0].clone()
             }
         };
 

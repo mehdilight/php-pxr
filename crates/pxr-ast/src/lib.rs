@@ -246,7 +246,7 @@ impl BinOp {
 pub enum Expr {
     IntLit(i64, Span),
     FloatLit(f64, Span),
-    StrLit(String, Span),
+    StrLit(Vec<u8>, Span),
     BoolLit(bool, Span),
     NullLit(Span),
     Var(String, Span),

@@ -67,6 +67,19 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     ("pxr_str_replace", "ptr", &["ptr", "ptr", "ptr"]),
     ("pxr_implode", "ptr", &["ptr", "ptr"]),
     ("pxr_explode", "ptr", &["ptr", "ptr", "i64"]),
+    // More string builtins (M2). Predicates return i64 0/1, narrowed with
+    // `IntToBool` at the call site.
+    ("pxr_str_contains", "i64", &["ptr", "ptr"]),
+    ("pxr_str_starts_with", "i64", &["ptr", "ptr"]),
+    ("pxr_str_ends_with", "i64", &["ptr", "ptr"]),
+    ("pxr_strrev", "ptr", &["ptr"]),
+    ("pxr_ucfirst", "ptr", &["ptr"]),
+    ("pxr_lcfirst", "ptr", &["ptr"]),
+    ("pxr_ucwords", "ptr", &["ptr"]),
+    ("pxr_str_split", "ptr", &["ptr", "i64"]),
+    // Array transforms (M2). Both deep-copy nested arrays (value semantics).
+    ("pxr_array_values", "ptr", &["ptr"]),
+    ("pxr_array_reverse", "ptr", &["ptr", "i64"]),
 ];
 
 pub fn llty(ty: &Ty) -> &'static str {
@@ -106,8 +119,8 @@ pub fn emit_llvm(module: &Module, opts: &LlvmOptions) -> String {
     out.push('\n');
 
     // String constant pool.
-    let mut pool: Vec<String> = Vec::new();
-    let mut pool_idx: HashMap<String, usize> = HashMap::new();
+    let mut pool: Vec<Vec<u8>> = Vec::new();
+    let mut pool_idx: HashMap<Vec<u8>, usize> = HashMap::new();
     for f in &module.functions {
         for inst in &f.body {
             if let Inst::Const {
@@ -123,7 +136,7 @@ pub fn emit_llvm(module: &Module, opts: &LlvmOptions) -> String {
         }
     }
     for (i, s) in pool.iter().enumerate() {
-        let bytes = s.as_bytes();
+        let bytes = s.as_slice();
         let escaped = escape_bytes(bytes);
         let n = bytes.len() + 1;
         // A `pxr_str` (runtime): `{ size_t len; char data[]; }`. The constant
@@ -155,7 +168,7 @@ pub fn emit_llvm(module: &Module, opts: &LlvmOptions) -> String {
     out
 }
 
-fn emit_function(out: &mut String, f: &Function, pool: &HashMap<String, usize>) {
+fn emit_function(out: &mut String, f: &Function, pool: &HashMap<Vec<u8>, usize>) {
     let mut g = FnGen {
         f,
         pool,
@@ -170,7 +183,7 @@ fn emit_function(out: &mut String, f: &Function, pool: &HashMap<String, usize>) 
 
 struct FnGen<'a> {
     f: &'a Function,
-    pool: &'a HashMap<String, usize>,
+    pool: &'a HashMap<Vec<u8>, usize>,
     map: HashMap<Value, Ty>,
     next: Value,
     /// True for the synthesized program entry point, whose LLVM signature must

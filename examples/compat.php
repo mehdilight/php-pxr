@@ -182,3 +182,30 @@ foreach ($words as $w) {
     }
 }
 echo "words=" . count($words) . " longest=" . strtoupper($longest) . "\n";
+
+// --- milestone 2: string predicates, case helpers, array transforms --------
+
+echo "pred=" . (str_contains("hello world", "wor") ? "1" : "0") .
+    (str_starts_with("hello", "he") ? "1" : "0") .
+    (str_ends_with("hello", "lo") ? "1" : "0") .
+    (str_contains("hello", "") ? "1" : "0") .
+    (str_contains("hello", "xyz") ? "1" : "0") . "\n";
+echo "case=" . ucfirst("hello") . " " . lcfirst("World") . " " . ucwords("the quick fox") . "\n";
+echo "srev=" . strrev("abcde") . " [" . strrev("") . "]\n";
+
+$bytes = str_split("abcdef", 2);
+echo "split=" . implode("|", $bytes) . " n=" . count($bytes) . "\n";
+$single = str_split("xyz");
+echo "split1=" . implode("|", $single) . "\n";
+
+$vals = array_values(["x" => 10, "y" => 20, "z" => 30]);
+echo "vals=" . $vals[0] . "," . $vals[2] . " n=" . count($vals) . "\n";
+$revl = array_reverse([1, 2, 3, 4]);
+echo "revl=" . implode(",", $revl) . "\n";
+$revk = array_reverse(["a" => 1, "b" => 2, "c" => 3]);
+echo "revk=" . $revk["a"] . $revk["c"] . "\n";
+$revp = array_reverse([1, 2, 3], true);
+echo "revp=" . $revp[2] . $revp[0] . "\n";
+
+// High `\xHH` escapes are raw bytes, not UTF-8 replacement characters.
+echo "byte=" . strlen("\xA9\xC3") . " " . (strrev("\xA9\xC3") === "\xC3\xA9" ? "ok" : "bad") . "\n";

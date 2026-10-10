@@ -23,7 +23,9 @@ pub enum Literal {
     Int(i64),
     Float(f64),
     Bool(bool),
-    Str(String),
+    /// Raw byte-string literal (PHP strings are byte strings, so this may hold
+    /// bytes that are not valid UTF-8).
+    Str(Vec<u8>),
     /// A null pointer (`ptr null`), e.g. "no charlist" for `trim`.
     Null,
 }
@@ -369,6 +371,27 @@ impl Function {
     }
 }
 
+/// Render a byte-string literal for the textual IR dump, escaping non-printable
+/// and non-ASCII bytes so the output is unambiguous and valid text.
+fn fmt_bytes_lit(s: &[u8]) -> String {
+    let mut t = String::from("\"");
+    for &b in s {
+        match b {
+            b'"' => t.push_str("\\\""),
+            b'\\' => t.push_str("\\\\"),
+            b'\n' => t.push_str("\\n"),
+            b'\t' => t.push_str("\\t"),
+            b'\r' => t.push_str("\\r"),
+            0x20..=0x7e => t.push(b as char),
+            _ => {
+                let _ = write!(t, "\\x{b:02X}");
+            }
+        }
+    }
+    t.push('"');
+    t
+}
+
 fn fmt_inst(inst: &Inst) -> String {
     match inst {
         Inst::Label(l) => format!("bb{l}:"),
@@ -377,7 +400,7 @@ fn fmt_inst(inst: &Inst) -> String {
                 Literal::Int(i) => i.to_string(),
                 Literal::Float(f) => format_float(*f),
                 Literal::Bool(b) => b.to_string(),
-                Literal::Str(s) => format!("{s:?}"),
+                Literal::Str(s) => fmt_bytes_lit(s),
                 Literal::Null => "null".to_string(),
             };
             format!("%v{dst} = const {} {v}", lit.ty())

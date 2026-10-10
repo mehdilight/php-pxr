@@ -1001,3 +1001,160 @@ long long pxr_array_val_tag_at(void *p, long long i) {
     }
     return a->ents[(size_t)i].vt;
 }
+
+/* ------------------------------- more string builtins (M2) -----------------
+ *
+ * Byte-exact against PHP 8.4. Case helpers operate on ASCII bytes only, like
+ * PHP's locale-independent `toupper`/`tolower`.
+ */
+
+long long pxr_str_contains(const pxr_str *h, const pxr_str *n) {
+    if (n->len == 0) {
+        return 1; /* the empty needle is found everywhere */
+    }
+    if (n->len > h->len) {
+        return 0;
+    }
+    for (size_t i = 0; i + n->len <= h->len; i++) {
+        if (memcmp(h->data + i, n->data, n->len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+long long pxr_str_starts_with(const pxr_str *h, const pxr_str *n) {
+    return n->len <= h->len && memcmp(h->data, n->data, n->len) == 0;
+}
+
+long long pxr_str_ends_with(const pxr_str *h, const pxr_str *n) {
+    return n->len <= h->len &&
+           memcmp(h->data + (h->len - n->len), n->data, n->len) == 0;
+}
+
+/* PHP `strrev` reverses *bytes* (not characters), so multi-byte sequences are
+ * reordered byte-wise. */
+pxr_str *pxr_strrev(const pxr_str *s) {
+    pxr_str *out = pxr_str_alloc(s->len);
+    for (size_t i = 0; i < s->len; i++) {
+        out->data[i] = s->data[s->len - 1 - i];
+    }
+    return out;
+}
+
+pxr_str *pxr_ucfirst(const pxr_str *s) {
+    pxr_str *out = pxr_str_alloc(s->len);
+    memcpy(out->data, s->data, s->len);
+    if (s->len) {
+        unsigned char c = (unsigned char)out->data[0];
+        if (c >= 'a' && c <= 'z') {
+            out->data[0] = (char)(c - 32);
+        }
+    }
+    return out;
+}
+
+pxr_str *pxr_lcfirst(const pxr_str *s) {
+    pxr_str *out = pxr_str_alloc(s->len);
+    memcpy(out->data, s->data, s->len);
+    if (s->len) {
+        unsigned char c = (unsigned char)out->data[0];
+        if (c >= 'A' && c <= 'Z') {
+            out->data[0] = (char)(c + 32);
+        }
+    }
+    return out;
+}
+
+/* PHP `ucwords` default delimiters: the ASCII whitespace set. Only the first
+ * byte of each word is uppercased; the rest is untouched. */
+static int pxr_ucwords_space(unsigned char c) {
+    switch (c) {
+        case ' ':
+        case '\t':
+        case '\n':
+        case '\r':
+        case '\f':
+        case '\v':
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+pxr_str *pxr_ucwords(const pxr_str *s) {
+    pxr_str *out = pxr_str_alloc(s->len);
+    memcpy(out->data, s->data, s->len);
+    int at_start = 1;
+    for (size_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (at_start && c >= 'a' && c <= 'z') {
+            out->data[i] = (char)(c - 32);
+        }
+        at_start = pxr_ucwords_space(c);
+    }
+    return out;
+}
+
+/* PHP `str_split`: split into chunks of at most `length` bytes. An empty string
+ * yields an empty array (PHP 8.2+); `length < 1` is a fatal ValueError. */
+void *pxr_str_split(const pxr_str *s, long long length) {
+    if (length < 1) {
+        fprintf(stderr,
+                "Fatal error: Uncaught ValueError: str_split(): Argument #2 "
+                "($length) must be greater than 0\n");
+        exit(255);
+    }
+    pxr_array *out = (pxr_array *)pxr_array_new();
+    for (size_t i = 0; i < s->len;) {
+        size_t n = (size_t)length;
+        if (n > s->len - i) {
+            n = s->len - i;
+        }
+        pxr_explode_push(out, s->data + i, n);
+        i += n;
+    }
+    return out;
+}
+
+/* `array_values`: drop keys, keep insertion order, reindex 0..n-1. Nested
+ * arrays are deep-copied so value semantics hold. */
+void *pxr_array_values(void *p) {
+    pxr_array *s = (pxr_array *)p;
+    pxr_array *d = (pxr_array *)pxr_array_new();
+    for (size_t i = 0; i < s->len; i++) {
+        int64_t bits = s->ents[i].bits;
+        if (s->ents[i].vt == PXR_TAG_ARR && bits) {
+            bits = (int64_t)(intptr_t)pxr_array_copy((void *)(intptr_t)bits);
+        }
+        pxr_array_push(d, s->ents[i].vt, bits);
+    }
+    return d;
+}
+
+/* `array_reverse`: reverse insertion order. With `preserve_keys` false
+ * (PHP default) string keys are kept and integer keys are renumbered from 0 in
+ * the new order; true keeps every key. */
+void *pxr_array_reverse(void *p, long long preserve_keys) {
+    pxr_array *s = (pxr_array *)p;
+    pxr_array *d = (pxr_array *)pxr_array_new();
+    for (size_t i = s->len; i-- > 0;) {
+        pxr_ent *e = &s->ents[i];
+        int64_t bits = e->bits;
+        if (e->vt == PXR_TAG_ARR && bits) {
+            bits = (int64_t)(intptr_t)pxr_array_copy((void *)(intptr_t)bits);
+        }
+        if (preserve_keys) {
+            if (e->ks != NULL) {
+                pxr_array_set(d, PXR_TAG_STR, 0, e->ks, e->vt, bits);
+            } else {
+                pxr_array_set(d, PXR_TAG_INT, e->ki, NULL, e->vt, bits);
+            }
+        } else if (e->ks != NULL) {
+            pxr_array_set(d, PXR_TAG_STR, 0, e->ks, e->vt, bits);
+        } else {
+            pxr_array_push(d, e->vt, bits);
+        }
+    }
+    return d;
+}

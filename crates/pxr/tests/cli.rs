@@ -643,6 +643,143 @@ fn explode_empty_separator_is_fatal() {
 }
 
 #[test]
+fn string_predicates_and_case_match_php() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let src = r#"<?php
+echo (str_contains("hello world", "wor") ? "T" : "F");
+echo (str_contains("hello", "xyz") ? "T" : "F");
+echo (str_contains("hello", "") ? "T" : "F");
+echo (str_contains("", "a") ? "T" : "F");
+echo (str_contains("a\0b", "\0") ? "T" : "F") . "\n";
+echo (str_starts_with("hello", "he") ? "T" : "F");
+echo (str_starts_with("hello", "") ? "T" : "F");
+echo (str_starts_with("he", "hello") ? "T" : "F") . "\n";
+echo (str_ends_with("hello", "lo") ? "T" : "F");
+echo (str_ends_with("a\0b", "\0b") ? "T" : "F") . "\n";
+echo strrev("hello") . "|" . strrev("") . "|" . strrev("ab") . "\n";
+echo (strrev("a\0b") === "b\0a" ? "revnul ok" : "revnul bad") . "\n";
+echo ucfirst("hello world") . "|" . ucfirst("") . "|" . lcfirst("Hello World") . "\n";
+echo ucwords("hello world foo") . "|" . ucwords("  a  b  ") . "|" . ucwords("foo-bar baz") . "\n";
+echo (ucfirst("h\xC3\xA9llo") === "H\xC3\xA9llo" ? "ucfnb ok" : "ucfnb bad") . "\n";
+"#;
+    let f = temp_php("m2pred", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let expected = "\
+TFTFT
+TTF
+TT
+olleh||ba
+revnul ok
+Hello world||hello World
+Hello World Foo|  A  B  |Foo-bar Baz
+ucfnb ok
+";
+    assert_eq!(r.stdout, expected);
+}
+
+#[test]
+fn str_split_matches_php() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let src = r#"<?php
+$p = str_split("abcdef");
+echo implode("|", $p) . " n=" . count($p) . "\n";
+$p = str_split("abcdef", 2);
+echo implode("|", $p) . "\n";
+$p = str_split("abcdef", 4);
+echo implode("|", $p) . "\n";
+$p = str_split("abcdef", 10);
+echo implode("|", $p) . "\n";
+$p = str_split("");
+echo "empty n=" . count($p) . "\n";
+"#;
+    let f = temp_php("m2split", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "a|b|c|d|e|f n=6\nab|cd|ef\nabcd|ef\nabcdef\nempty n=0\n"
+    );
+}
+
+#[test]
+fn array_values_reverse_match_php() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let src = r#"<?php
+$v1 = array_values([10, 20, 30]);
+echo $v1[0] . "," . $v1[1] . "," . $v1[2] . " n=" . count($v1) . "\n";
+$v2 = array_values(["a" => 1, "b" => 2]);
+echo $v2[0] . "," . $v2[1] . "\n";
+$v3 = array_values([]);
+echo "empty n=" . count($v3) . "\n";
+$r1 = array_reverse([10, 20, 30]);
+echo $r1[0] . "," . $r1[1] . "," . $r1[2] . "\n";
+$r2 = array_reverse(["a" => 1, "b" => 2, "c" => 3]);
+echo $r2["a"] . "," . $r2["c"] . " n=" . count($r2) . "\n";
+$r3 = array_reverse([5 => "x", 9 => "y"]);
+echo $r3[0] . "," . $r3[1] . "\n";
+$r4 = array_reverse([1, 2, 3], true);
+echo $r4[0] . "," . $r4[1] . "," . $r4[2] . "\n";
+"#;
+    let f = temp_php("m2arr", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "10,20,30 n=3\n1,2\nempty n=0\n30,20,10\n1,3 n=3\ny,x\n1,2,3\n"
+    );
+}
+
+#[test]
+fn str_split_nonpositive_length_is_fatal() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let f = temp_php(
+        "sszero",
+        "<?php $p = str_split(\"abc\", 0); echo count($p);",
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 255, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("str_split(): Argument #2 ($length) must be greater than 0"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+/// Regression: string literals are byte strings, so `\xHH` for `HH >= 0x80`
+/// must produce that raw byte, not a UTF-8 replacement character. The lexer
+/// used to run the literal through `String::from_utf8_lossy`.
+#[test]
+fn string_literal_high_bytes_are_raw() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let src = r#"<?php
+echo (strlen("\xA9\xC3") === 2 ? "lenok" : "lenbad") . "\n";
+echo (strrev("\xA9\xC3") === "\xC3\xA9" ? "revok" : "revbad") . "\n";
+echo (strlen("\x00\x01\xFE\xFF") === 4 ? "len4ok" : "len4bad") . "\n";
+"#;
+    let f = temp_php("bytes", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "lenok\nrevok\nlen4ok\n");
+}
+
+#[test]
 fn control_flow_breadth() {
     if !have_cc() {
         eprintln!("skipping: no C compiler");

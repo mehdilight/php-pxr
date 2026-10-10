@@ -246,6 +246,16 @@ subjects are compared with loose/strict equality respectively.
 | `str_replace(string, string, string): string` | replace | non-overlapping, no rescan; array form rejected (`E0234`) |
 | `implode(string, array<string\|int\|float\|bool>): string` | join with glue | 1-arg form `implode(array)` uses `""`; elements `(string)`-coerced |
 | `explode(string, string[, int]): string[]` | split into `array<string>` | `0` limit ≡ `1`; negative drops trailing pieces; empty separator fatal `ValueError` |
+| `str_contains(string, string): bool` | substring test | case-sensitive; empty needle is always found |
+| `str_starts_with(string, string): bool` | prefix test | empty prefix always true |
+| `str_ends_with(string, string): bool` | suffix test | empty suffix always true |
+| `strrev(string): string` | reverse | byte-wise, so multi-byte sequences are reordered like PHP |
+| `ucfirst(string): string` | uppercase first byte | ASCII only, like PHP's locale-independent `toupper` |
+| `lcfirst(string): string` | lowercase first byte | ASCII only |
+| `ucwords(string): string` | uppercase each word | ASCII; default whitespace delimiters `" \t\n\r\f\v"` |
+| `str_split(string[, int]): string[]` | split into byte chunks | default length `1`; empty string → `[]`; length `< 1` fatal `ValueError` |
+| `array_values(array<T>): array<T>` | values with keys dropped | reindexed `0..n-1` |
+| `array_reverse(array<T>[, bool]): array<T>` | reverse order | default renumbers integer keys, preserves string keys; `true` preserves all keys |
 
 ## Scoping
 

@@ -243,7 +243,11 @@ fn eval_bin(
             Some(Float(v))
         }
         BinOp::Concat => match (a, b) {
-            (Str(x), Str(y)) => Some(Str(format!("{x}{y}"))),
+            (Str(x), Str(y)) => {
+                let mut v = x.clone();
+                v.extend_from_slice(y);
+                Some(Str(v))
+            }
             _ => None,
         },
         BinOp::Eq | BinOp::NotEq => {

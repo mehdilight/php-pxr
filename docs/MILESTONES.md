@@ -157,6 +157,28 @@ concatenation are byte-exact — matching PHP.
   tests total; `examples/compat.php` extended and still asserted byte‑identical
   to PHP against PHP 8.4.
 
+**Delivered (M2.predicates & array transforms slice).**
+
+* `str_contains`, `str_starts_with`, `str_ends_with` — case-sensitive,
+  NUL-safe, empty needle/prefix/suffix always true. Return `bool` (narrowed from
+  the runtime's `i64` via `IntToBool`).
+* `strrev` (byte-wise), `ucfirst`/`lcfirst` (ASCII first byte only), `ucwords`
+  (default whitespace delimiters) — all match PHP's locale-independent helpers.
+* `str_split` — `array<string>` of at-most-`length` byte chunks (default `1`),
+  `""` → `[]` (PHP 8.2+), `length < 1` → fatal `ValueError` (exit 255).
+* `array_values`, `array_reverse` — value→array transforms; both deep-copy nested
+  arrays (value semantics). `array_reverse` renumbers integer keys and keeps
+  string keys by default (optionally keeps all keys).
+* **Bug fix (byte-string literals).** `\xHH` escapes for `HH ≥ 0x80` were passing
+  through `String::from_utf8_lossy`, turning every high byte into a UTF‑8
+  replacement character. String-literal payloads are now raw bytes
+  (`Vec<u8>`) end to end (lexer → AST → sema → IR → LLVM pool), so `"\x80"` really
+  is a one-byte string, as the docs already claimed. Guarded by a lexer unit test
+  and the `string_literal_high_bytes_are_raw` CLI test.
+* Tests: +5 CLI tests (predicates/case, `str_split`, array transforms,
+  `str_split` fatal, raw bytes) and +1 lexer test — 36 CLI tests total;
+  `examples/compat.php` extended (still byte‑identical to PHP).
+
 **Acceptance.** A string‑heavy program (e.g. word count) compiles and matches PHP —
 the word‑count block at the end of `examples/compat.php` does exactly this. ✅
 

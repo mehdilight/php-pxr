@@ -32,7 +32,8 @@ and whose output the test suite asserts is byte‑identical.
 | **Array value semantics** | assignment, function arguments, returns and `foreach` all operate on copies (copy‑on‑write, realised as an eager deep copy) |
 | **Array key unification** | a canonical decimal‑integer string key *is* the integer key: `$a["1"]` ≡ `$a[1]` (`"01"`, `"1.5"`, `"+1"`, `" 1"` stay strings) |
 | `count`, `strlen`, `intval`, `floatval`, `strval`, `abs` | |
-| **String builtins** `strtoupper`, `strtolower`, `trim`/`ltrim`/`rtrim`, `substr`, `str_repeat`, `str_replace`, `implode`, `explode` | byte-exact vs PHP, embedded NULs safe; see notes below |
+| **String builtins** `strtoupper`, `strtolower`, `trim`/`ltrim`/`rtrim`, `substr`, `str_repeat`, `str_replace`, `implode`, `explode`, `str_contains`, `str_starts_with`, `str_ends_with`, `strrev`, `ucfirst`, `lcfirst`, `ucwords`, `str_split` | byte-exact vs PHP, embedded NULs safe; see notes below |
+| **Array transforms** `array_values`, `array_reverse` | byte-exact vs PHP; deep-copy nested arrays (value semantics) |
 | Division `/` is always `float`; `%` is integer remainder | a zero divisor is a fatal `DivisionByZeroError` (exit 255), exactly as in PHP — not IEEE infinity |
 | **Float stringification** (`echo`, `.`, `strval`) | PHP's `zend_gcvt` with precision 14: `0.1+0.2` → `"0.3"`, `1e15` → `"1.0E+15"`, `1e-5` → `"1.0E-5"`, `1.0` → `"1"`, `-0.0` → `"-0"`, `INF`/`-INF`/`NAN` | |
 | `echo true` → `1`, `echo false` → *(nothing)*; `.` on `bool` → `"1"`/`""` | |
@@ -108,6 +109,8 @@ so embedded `\0` bytes are first‑class. `strlen("a\0b")` is `3`, `===`/`!==` a
 ordering compare all bytes, and concatenation preserves them. Escapes follow PHP
 (`\n \t \r \v \f \e \\ \" \$ \0 \xHH`; single quotes only `\\` and `\'`); the
 byte value of the sequence is what matters, so `"\x80"` is a one‑byte string.
+This holds for *any* byte: `\xHH` for `HH ≥ 0x80` produces that raw byte, not a
+Unicode replacement character (a regression test guards this).
 
 **String builtins.** `strtoupper`/`strtolower` map bytes only (ASCII `a–z`/`A–Z`),
 exactly like PHP's locale-independent conversion: `"héllo"` → `"héllo"`. `trim`
@@ -123,8 +126,20 @@ scalar elements like PHP (`1.5` → `"1.5"`, `true` → `"1"`, `false` → `""`)
 arrays of arrays are an **Error** `E0234`. `explode` supports positive limits
 (remainder is the final piece), `0` (treated as `1`) and negative limits
 (dropping trailing pieces exactly like PHP), returns `array<string>`, and an
-empty separator raises PHP's fatal `ValueError` (exit 255). All of these are
-verified byte‑for‑byte against PHP 8.4, including embedded-NUL cases.
+empty separator raises PHP's fatal `ValueError` (exit 255).
+
+`str_contains`/`str_starts_with`/`str_ends_with` are case-sensitive and
+NUL-safe; the empty needle/prefix/suffix is always found. `strrev` reverses
+*bytes* (`"héllo"` becomes `"oll\xA9\xC3h"`). `ucfirst`/`lcfirst`/`ucwords`
+change only the relevant byte and only for ASCII letters, like PHP's
+locale-independent helpers; `ucwords` splits on the default whitespace
+delimiters `" \t\n\r\f\v"`. `str_split` chunks into at-most-`length` byte pieces
+(default `1`), returns `[]` for `""` (PHP 8.2+ semantics), and a `length < 1`
+raises PHP's fatal `ValueError` (exit 255). `array_values` drops keys and
+reindexes; `array_reverse` reverses order, renumbering integer keys and keeping
+string keys (or keeping all keys when the second argument is `true`). Both
+deep-copy nested arrays so value semantics hold. All of these are verified
+byte‑for‑byte against PHP 8.4, including embedded-NUL cases.
 
 **Missing array keys.** PHP warns and yields `null`. PXR has no `null` yet, so a
 direct read yields the zero value; `??` / `??=` detect absence correctly.

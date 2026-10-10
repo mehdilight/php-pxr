@@ -148,8 +148,8 @@ impl Lowerer {
             Ty::Int => Literal::Int(0),
             Ty::Float => Literal::Float(0.0),
             Ty::Bool => Literal::Bool(false),
-            Ty::String => Literal::Str(String::new()),
-            _ => Literal::Str(String::new()),
+            Ty::String => Literal::Str(Vec::new()),
+            _ => Literal::Str(Vec::new()),
         };
         self.emit_prelude(Inst::Const { dst, lit });
         dst
@@ -1118,7 +1118,7 @@ impl Lowerer {
         match kty {
             Ty::Int => {
                 let ktag = self.emit_const(Literal::Int(1));
-                let kstr = self.emit_const(Literal::Str(String::new()));
+                let kstr = self.emit_const(Literal::Str(Vec::new()));
                 (ktag, kv, kstr)
             }
             Ty::String => {
@@ -1703,7 +1703,7 @@ impl Lowerer {
             StrReplace => self.rt_call("pxr_str_replace", vec![a[0], a[1], a[2]], Ty::String),
             Implode => {
                 let glue = if argc == 1 {
-                    self.emit_const(Literal::Str(String::new()))
+                    self.emit_const(Literal::Str(Vec::new()))
                 } else {
                     a[0]
                 };
@@ -1721,6 +1721,41 @@ impl Lowerer {
                     vec![a[0], a[1], limit],
                     Ty::array(Ty::String),
                 )
+            }
+            StrContains | StrStartsWith | StrEndsWith => {
+                let f = match kind {
+                    StrContains => "pxr_str_contains",
+                    StrStartsWith => "pxr_str_starts_with",
+                    _ => "pxr_str_ends_with",
+                };
+                let v = self.rt_call(f, vec![a[0], a[1]], Ty::Int);
+                self.to_bool(v, &Ty::Int)
+            }
+            Strrev => self.rt_call("pxr_strrev", vec![a[0]], Ty::String),
+            Ucfirst => self.rt_call("pxr_ucfirst", vec![a[0]], Ty::String),
+            Lcfirst => self.rt_call("pxr_lcfirst", vec![a[0]], Ty::String),
+            Ucwords => self.rt_call("pxr_ucwords", vec![a[0]], Ty::String),
+            StrSplit => {
+                let len = if argc == 2 {
+                    a[1]
+                } else {
+                    self.emit_const(Literal::Int(1))
+                };
+                self.rt_call("pxr_str_split", vec![a[0], len], Ty::array(Ty::String))
+            }
+            ArrayValues => {
+                let ret = arg_tys[0].clone();
+                self.rt_call("pxr_array_values", vec![a[0]], ret)
+            }
+            ArrayReverse => {
+                // The runtime flag is an i64, so widen a `bool` argument.
+                let flag = if argc == 2 {
+                    self.cast(a[1], &Ty::Bool, &Ty::Int)
+                } else {
+                    self.emit_const(Literal::Int(0))
+                };
+                let ret = arg_tys[0].clone();
+                self.rt_call("pxr_array_reverse", vec![a[0], flag], ret)
             }
         }
     }

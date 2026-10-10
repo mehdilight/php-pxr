@@ -20,7 +20,9 @@ pub enum TokenKind {
     Variable(String),
     Int(i64),
     Float(f64),
-    Str(String),
+    /// Raw bytes: PHP strings are byte strings, so a literal may hold invalid
+    /// UTF-8 (e.g. `"\xA9"` is the single byte `0xA9`).
+    Str(Vec<u8>),
 
     // Keywords.
     Function,
@@ -809,7 +811,7 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
-        TokenKind::Str(String::from_utf8_lossy(&out).into_owned())
+        TokenKind::Str(out)
     }
 
     fn read_while(&mut self, pred: impl Fn(u8) -> bool) -> String {
@@ -913,9 +915,19 @@ mod tests {
     #[test]
     fn strings_and_escapes() {
         let k = kinds(r#""a\nb""#);
-        assert_eq!(k[0], TokenKind::Str("a\nb".to_string()));
+        assert_eq!(k[0], TokenKind::Str(b"a\nb".to_vec()));
         let k = kinds(r"'it\'s'");
-        assert_eq!(k[0], TokenKind::Str("it's".to_string()));
+        assert_eq!(k[0], TokenKind::Str(b"it's".to_vec()));
+    }
+
+    #[test]
+    fn string_hex_escapes_are_raw_bytes() {
+        // `\xHH` must yield the raw byte even when it is not valid UTF-8; the
+        // payload is a byte string, not a Rust `String`.
+        let k = kinds(r#""\xA9\xC3""#);
+        assert_eq!(k[0], TokenKind::Str(vec![0xA9, 0xC3]));
+        let k = kinds(r#""\x00\x01\xFE\xFF""#);
+        assert_eq!(k[0], TokenKind::Str(vec![0x00, 0x01, 0xFE, 0xFF]));
     }
 
     #[test]

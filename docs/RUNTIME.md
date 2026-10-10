@@ -98,6 +98,18 @@ pxr_str *pxr_str_replace(const pxr_str *search, const pxr_str *replace,
 pxr_str *pxr_implode(const pxr_str *glue, void *a);      /* (string) each scalar element */
 void    *pxr_explode(const pxr_str *sep, const pxr_str *s, long long limit);
        /* -> new array<string>; empty sep -> fatal ValueError */
+long long pxr_str_contains(const pxr_str *h, const pxr_str *n);   /* 0/1 */
+long long pxr_str_starts_with(const pxr_str *h, const pxr_str *n);
+long long pxr_str_ends_with(const pxr_str *h, const pxr_str *n);
+pxr_str *pxr_strrev(const pxr_str *s);                /* byte-wise reverse */
+pxr_str *pxr_ucfirst(const pxr_str *s);               /* ASCII first byte only */
+pxr_str *pxr_lcfirst(const pxr_str *s);
+pxr_str *pxr_ucwords(const pxr_str *s);               /* default whitespace delimiters */
+void    *pxr_str_split(const pxr_str *s, long long length);
+       /* -> array<string>; length<1 -> fatal ValueError; "" -> [] */
+void    *pxr_array_values(void *a);                   /* reindexed, keys dropped */
+void    *pxr_array_reverse(void *a, long long preserve_keys);
+       /* int keys renumbered unless preserve_keys; deep-copies nested arrays */
 long long pxr_array_val_tag_at(void *a, long long i);    /* element tag by index */
 
 /* math */
