@@ -66,6 +66,9 @@ pub enum TokenKind {
     Public,
     Private,
     Protected,
+    Extends,
+    Instanceof,
+    Parent,
 
     // Type keywords.
     KwInt,
@@ -182,6 +185,9 @@ impl TokenKind {
             TokenKind::Public => "public",
             TokenKind::Private => "private",
             TokenKind::Protected => "protected",
+            TokenKind::Extends => "extends",
+            TokenKind::Instanceof => "instanceof",
+            TokenKind::Parent => "parent",
             TokenKind::KwInt => "int",
             TokenKind::KwFloat => "float",
             TokenKind::KwString => "string",
@@ -995,6 +1001,9 @@ fn keyword(word: &str) -> Option<TokenKind> {
         "public" => TokenKind::Public,
         "private" => TokenKind::Private,
         "protected" => TokenKind::Protected,
+        "extends" => TokenKind::Extends,
+        "instanceof" => TokenKind::Instanceof,
+        "parent" => TokenKind::Parent,
         "int" => TokenKind::KwInt,
         "float" => TokenKind::KwFloat,
         "string" => TokenKind::KwString,
@@ -1152,6 +1161,33 @@ mod tests {
                 TokenKind::Semicolon,
                 TokenKind::New,
                 TokenKind::Ident("Point".into()),
+                TokenKind::LParen,
+                TokenKind::RParen,
+                TokenKind::Semicolon,
+                TokenKind::RBrace,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn inheritance_keywords() {
+        let k = kinds("class Dog extends Animal { $x instanceof Animal; parent::foo(); }");
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Class,
+                TokenKind::Ident("Dog".into()),
+                TokenKind::Extends,
+                TokenKind::Ident("Animal".into()),
+                TokenKind::LBrace,
+                TokenKind::Variable("x".into()),
+                TokenKind::Instanceof,
+                TokenKind::Ident("Animal".into()),
+                TokenKind::Semicolon,
+                TokenKind::Parent,
+                TokenKind::DoubleColon,
+                TokenKind::Ident("foo".into()),
                 TokenKind::LParen,
                 TokenKind::RParen,
                 TokenKind::Semicolon,

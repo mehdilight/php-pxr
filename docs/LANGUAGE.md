@@ -364,9 +364,26 @@ are `W020x`.
 | `E0255` | `match` arm condition type differs from the subject |
 | `E0256` | `match` requires a `default` arm |
 | `E0257` | `**` (power) not implemented |
+| `E0260` | Operand of `instanceof` is not an object |
 | `E0261` | Unknown property |
 | `E0262` | Unknown method |
-| `E0265` | Cannot access private member |
+| `E0265` | Cannot access private or protected member / narrowing visibility |
 | `E0267` | Cannot re-assign `$this` |
-| `E0268` | Cannot use `$this` outside object context |
+| `E0268` | Cannot use `$this` outside object context / property type mismatch |
 | `W0202` | `return` with a value at top level is ignored |
+
+## Classes, Inheritance & Polymorphism
+
+* **Class declaration**: `class Name [extends ParentName] { ... }`
+* **Properties**: `public|protected|private Type $name [= default];`
+* **Methods**: `public|protected|private function name(Type $arg): RetType { ... }`
+* **Constructor**: `public|protected|private function __construct(...) { ... }`
+  * If omitted, subclasses inherit parent constructors.
+  * Static dispatch via `parent::__construct(...)` and `parent::method(...)`.
+* **Polymorphism**:
+  * Subclass instances are assignable to parent class variables, parameters, and return types.
+  * Virtual method calls dispatch to the subclass implementation at runtime via synthesized jump tables (`pxr$disp$<root>$<method>`).
+* **`instanceof` operator**:
+  * `$obj instanceof ClassName` returns `bool`, traversing the parent hierarchy at runtime.
+  * Left operand must be an object type (`E0260`).
+

@@ -19,8 +19,43 @@ pub fn lower_program(prog: &TProgram) -> Module {
     for f in &prog.funcs {
         m.function(lower_func(f));
     }
-    m.function(lower_func(&prog.main));
+    m.function(lower_main(&prog.main, &prog.class_registrations));
     m
+}
+
+fn lower_main(tf: &TFunc, class_registrations: &[(u32, u32)]) -> Function {
+    let params: Vec<Ty> = tf.params.iter().map(|(_, t)| t.clone()).collect();
+    let mut lw = Lowerer::new(Function::new(
+        tf.name.clone(),
+        tf.display.clone(),
+        params,
+        tf.ret.clone(),
+    ));
+
+    for ty in tf.slots.iter() {
+        let slot = lw.f.alloc_slot(ty.clone());
+        lw.emit_prelude(Inst::SlotAlloc {
+            slot,
+            ty: ty.clone(),
+        });
+    }
+    for (i, (_, ty)) in tf.params.iter().enumerate() {
+        lw.emit_prelude(Inst::SlotSet {
+            slot: i as Slot,
+            src: i as Value,
+            ty: ty.clone(),
+        });
+    }
+
+    for (cid, pid) in class_registrations {
+        let cid_val = lw.emit_const(Literal::Int(*cid as i64));
+        let pid_val = lw.emit_const(Literal::Int(*pid as i64));
+        lw.rt_call("pxr_class_register", vec![cid_val, pid_val], Ty::Void);
+    }
+
+    lw.lower_stmts(&tf.body);
+    lw.finish();
+    lw.into_function()
 }
 
 fn lower_func(tf: &TFunc) -> Function {
@@ -448,15 +483,21 @@ impl Lowerer {
                 self.decode_bits(bits, ty)
             }
             TExpr::New {
+                class_id,
                 class_name,
                 num_props,
                 prop_defaults,
                 ctor,
                 ty,
             } => {
+                let cid_val = self.emit_const(Literal::Int(*class_id as i64));
                 let name_val = self.emit_const(Literal::Str(class_name.as_bytes().to_vec()));
                 let num_props_val = self.emit_const(Literal::Int(*num_props as i64));
-                let obj = self.rt_call("pxr_object_new", vec![name_val, num_props_val], ty.clone());
+                let obj = self.rt_call(
+                    "pxr_object_new",
+                    vec![cid_val, name_val, num_props_val],
+                    ty.clone(),
+                );
                 for (slot_idx, def_expr) in prop_defaults {
                     let s_idx = self.emit_const(Literal::Int(*slot_idx as i64));
                     let def_val = self.lower_expr(def_expr);
@@ -482,6 +523,16 @@ impl Lowerer {
                     });
                 }
                 obj
+            }
+            TExpr::Instanceof {
+                expr,
+                target_class_id,
+                target_class_name: _,
+            } => {
+                let obj = self.lower_expr(expr);
+                let target_cid = self.emit_const(Literal::Int(*target_class_id as i64));
+                let res = self.rt_call("pxr_instanceof", vec![obj, target_cid], Ty::Int);
+                self.to_bool(res, &Ty::Int)
             }
         }
     }

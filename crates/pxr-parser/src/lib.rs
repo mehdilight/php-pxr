@@ -376,7 +376,18 @@ impl Parser {
             _ => unreachable!(),
         };
         let name_span = name_tok.span;
-        self.expect(&TokenKind::LBrace, "`{` after class name")?;
+        let mut extends = None;
+        let mut extends_span = None;
+        if self.eat(&TokenKind::Extends) {
+            let parent_tok = self.expect_ident("parent class name after `extends`")?;
+            let parent_name = match parent_tok.kind {
+                TokenKind::Ident(n) => n,
+                _ => unreachable!(),
+            };
+            extends = Some(parent_name);
+            extends_span = Some(parent_tok.span);
+        }
+        self.expect(&TokenKind::LBrace, "`{` after class header")?;
         let mut members = Vec::new();
         while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
             let before = self.pos;
@@ -392,6 +403,8 @@ impl Parser {
         Ok(ClassDecl {
             name,
             name_span,
+            extends,
+            extends_span,
             members,
             span: start.merge(close.span),
         })
@@ -889,6 +902,22 @@ impl Parser {
     fn parse_binary(&mut self, min_prec: u8) -> Result<Expr, ()> {
         let mut lhs = self.parse_unary()?;
         loop {
+            if 7 >= min_prec && self.at(&TokenKind::Instanceof) {
+                self.advance();
+                let class_tok = self.expect_ident("class name after `instanceof`")?;
+                let class_name = match class_tok.kind {
+                    TokenKind::Ident(n) => n,
+                    _ => unreachable!(),
+                };
+                let span = lhs.span().merge(class_tok.span);
+                lhs = Expr::Instanceof {
+                    expr: Box::new(lhs),
+                    class_name,
+                    class_span: class_tok.span,
+                    span,
+                };
+                continue;
+            }
             let (op, prec) = match bin_op(&self.peek().kind) {
                 Some(v) => v,
                 None => break,
@@ -1085,6 +1114,33 @@ impl Parser {
                 self.parse_array_literal(TokenKind::LParen, TokenKind::RParen)
             }
             TokenKind::Match => self.parse_match(),
+            TokenKind::Parent => {
+                self.advance();
+                self.expect(&TokenKind::DoubleColon, "`::` after `parent`")?;
+                let method_tok = self.expect_ident("method name after `parent::`")?;
+                let method = match method_tok.kind {
+                    TokenKind::Ident(n) => n,
+                    _ => unreachable!(),
+                };
+                let method_span = method_tok.span;
+                self.expect(&TokenKind::LParen, "`(` after `parent::method`")?;
+                let mut args = Vec::new();
+                if !self.at(&TokenKind::RParen) {
+                    loop {
+                        args.push(self.parse_expr()?);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                let close = self.expect(&TokenKind::RParen, "`)` after arguments")?;
+                Ok(Expr::ParentMethodCall {
+                    method,
+                    method_span,
+                    args,
+                    span: span.merge(close.span),
+                })
+            }
             TokenKind::Ident(name) => {
                 self.advance();
                 if self.at(&TokenKind::LParen) {
@@ -1445,6 +1501,34 @@ mod tests {
                         assert_eq!(m.name, "inc");
                         assert_eq!(m.visibility, Visibility::Public);
                         assert_eq!(m.ret, Some(TypeRef::Int));
+                    }
+                    _ => panic!("expected method"),
+                }
+            }
+            _ => panic!("expected class decl"),
+        }
+    }
+
+    #[test]
+    fn class_inheritance_and_instanceof() {
+        let p = ok("<?php
+            class Dog extends Animal {
+                public function speak(): string {
+                    return parent::speak() . \" woof\";
+                }
+            }
+            $d = new Dog();
+            $ok = $d instanceof Animal;
+        ");
+        assert_eq!(p.items.len(), 3);
+        match &p.items[0] {
+            Stmt::ClassDecl(c) => {
+                assert_eq!(c.name, "Dog");
+                assert_eq!(c.extends, Some("Animal".into()));
+                match &c.members[0] {
+                    ClassMember::Method(m) => {
+                        assert_eq!(m.name, "speak");
+                        assert_eq!(m.body.len(), 1);
                     }
                     _ => panic!("expected method"),
                 }

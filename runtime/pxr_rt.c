@@ -1985,19 +1985,29 @@ long long pxr_printf(const pxr_str *fmt, void *args) {
 
 /*
  * ===========================================================================
- * Object runtime (M3.1): instantiation and property storage.
+ * Object runtime (M3.1, M3.2): instantiation, properties, inheritance, instanceof.
  * ===========================================================================
  */
 
 typedef struct {
+    int64_t class_id;
     const pxr_str *class_name;
     size_t num_props;
     int64_t *tags;
     int64_t *bits;
 } pxr_object;
 
-void *pxr_object_new(const pxr_str *name, long long num_props) {
+static int64_t pxr_parent_table[4096];
+
+void pxr_class_register(long long class_id, long long parent_id) {
+    if (class_id >= 0 && class_id < 4096) {
+        pxr_parent_table[class_id] = (int64_t)parent_id;
+    }
+}
+
+void *pxr_object_new(long long class_id, const pxr_str *name, long long num_props) {
     pxr_object *obj = (pxr_object *)pxr_arena_alloc(sizeof(pxr_object));
+    obj->class_id = (int64_t)class_id;
     obj->class_name = name;
     obj->num_props = (size_t)num_props;
     if (num_props > 0) {
@@ -2010,6 +2020,32 @@ void *pxr_object_new(const pxr_str *name, long long num_props) {
         obj->bits = NULL;
     }
     return obj;
+}
+
+long long pxr_object_get_class_id(void *p) {
+    if (!p) {
+        return 0;
+    }
+    pxr_object *obj = (pxr_object *)p;
+    return (long long)obj->class_id;
+}
+
+long long pxr_instanceof(void *p, long long target_class_id) {
+    if (!p) {
+        return 0;
+    }
+    pxr_object *obj = (pxr_object *)p;
+    int64_t cid = obj->class_id;
+    while (cid > 0) {
+        if (cid == (int64_t)target_class_id) {
+            return 1;
+        }
+        if (cid >= 4096) {
+            break;
+        }
+        cid = pxr_parent_table[cid];
+    }
+    return 0;
 }
 
 long long pxr_object_get_bits(void *p, long long prop_idx) {
@@ -2038,4 +2074,5 @@ void pxr_object_set_bits(void *p, long long prop_idx, long long tag, long long b
     obj->tags[prop_idx] = tag;
     obj->bits[prop_idx] = bits;
 }
+
 

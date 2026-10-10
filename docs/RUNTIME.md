@@ -160,19 +160,23 @@ long long pxr_array_count(void *a);
 long long pxr_array_val_bits_at(void *a, long long i);   /* foreach */
 void  *pxr_array_copy(void *a);                /* deep copy (value semantics) */
 
-/* objects — allocated in arena, properties indexed by slot */
-void      *pxr_object_new(const pxr_str *class_name, size_t num_props);
-long long  pxr_object_get_bits(void *obj, size_t prop_idx, const pxr_str *prop_name);
-void       pxr_object_set_bits(void *obj, size_t prop_idx, long long tag, long long bits);
+/* objects — allocated in arena, properties indexed by slot, inheritance */
+void      *pxr_object_new(long long class_id, const pxr_str *class_name, long long num_props);
+long long  pxr_object_get_bits(void *obj, long long prop_idx);
+void       pxr_object_set_bits(void *obj, long long prop_idx, long long tag, long long bits);
+void       pxr_class_register(long long class_id, long long parent_id);
+long long  pxr_object_get_class_id(void *obj);
+long long  pxr_instanceof(void *obj, long long target_class_id);
 ```
 
-### Objects
+### Objects and Inheritance
 
 Objects are heap‑allocated structures allocated directly from the runtime bump
 arena:
 
 ```c
 typedef struct {
+    int64_t class_id;
     const pxr_str *class_name;
     size_t num_props;
     int64_t *tags;
@@ -181,11 +185,18 @@ typedef struct {
 ```
 
 Properties are indexed statically by slot number ($0 \dots N-1$) determined at
-compile time. Property reads and writes operate on 64‑bit payloads and type tags
-via `pxr_object_get_bits` and `pxr_object_set_bits`, sharing the same bitcast
+compile time; inherited parent properties retain identical slots in subclasses.
+Property reads and writes operate on 64‑bit payloads and type tags via
+`pxr_object_get_bits` and `pxr_object_set_bits`, sharing the same bitcast
 encoding/decoding machinery as array elements. Null object dereferencing aborts
-with a PHP-faithful fatal error. Methods dispatch directly to link-time symbols
-mangled as `pxr$m$<class>$<method>` with `$this` prepended as the 0th parameter.
+with a PHP-faithful fatal error.
+
+Inheritance relationships are registered at startup via `pxr_class_register(class_id, parent_id)`.
+Method dispatch lowered directly to concrete symbols `pxr$m$<class>$<method>` when
+no overrides exist, and to jump-table dispatchers `pxr$disp$<root>$<method>` checking
+`pxr_object_get_class_id` when dynamic overrides exist in the class hierarchy.
+The `instanceof` operator calls `pxr_instanceof(obj, target_class_id)` traversing the
+runtime parent table.
 
 Array values cross the ABI as a **type tag plus a 64‑bit payload**: `int` is the
 value itself, `bool` is zero‑extended, `float` is its IEEE‑754 bits

@@ -323,6 +323,28 @@ the word‑count block at the end of `examples/compat.php` does exactly this. �
   `class_type_errors_are_loud`) and unit tests — 55 CLI tests total;
   `examples/objects.php` added and verified byte-for-byte identical to PHP 8.4.
 
+**Delivered (M3.2: single inheritance, method overriding, parent::, and instanceof slice).**
+
+* Single inheritance with `class Child extends Parent`: inherits public and protected properties and methods; parent properties retain identical slot indices in child.
+* Topological class sort and hierarchy validation: rejects self-inheritance (`E0201`), circular inheritance (`E0205`), and extending unknown classes (`E0205`).
+* Method overriding compatibility rules:
+  * Visibility cannot be narrowed from public to protected/private, or from protected to private (`E0265`).
+  * Parameter count (`E0207`), parameter types (`E0208`), and return types (`E0208`) must match the inherited method.
+* Constructor inheritance & `parent::`:
+  * Child inherits parent `__construct` if none declared.
+  * Child constructors and methods can invoke `parent::__construct(...)` or `parent::method(...)` (static dispatch to parent).
+* Polymorphic dynamic method dispatch:
+  * Synthesizes jump-table dispatchers (`pxr$disp$<root>$<method>`) when overrides exist in a class hierarchy, inspecting runtime `class_id` with zero overhead for non-overridden methods.
+* `instanceof`:
+  * Evaluates `$obj instanceof ClassName` as `bool`, walking the runtime parent hierarchy table; non-object operands rejected at compile time with `E0260`.
+* Runtime updates in `pxr_rt.c`:
+  * `pxr_object` stores `int64_t class_id`.
+  * `pxr_class_register` populates runtime parent table at startup in `main`.
+  * `pxr_object_get_class_id` and `pxr_instanceof`.
+* Tests: +3 CLI integration tests (`inheritance_and_polymorphism_match_php`,
+  `instanceof_hierarchy_matches_php`, `inheritance_diagnostics_rejected`) — 58 CLI tests total;
+  `examples/inheritance.php` added and verified 100% byte-for-byte identical to PHP 8.4.
+
 ## ⛔ M4 — Gradual migration
 
 * An opt‑in dynamic `mixed` type with runtime tags, and `is_*` narrowing.

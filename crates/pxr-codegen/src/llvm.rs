@@ -109,10 +109,13 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     // Formatted printing builtins (M2): sprintf / printf.
     ("pxr_sprintf", "ptr", &["ptr", "ptr"]),
     ("pxr_printf", "i64", &["ptr", "ptr"]),
-    // Object runtime (M3.1).
-    ("pxr_object_new", "ptr", &["ptr", "i64"]),
+    // Object runtime (M3.1, M3.2).
+    ("pxr_object_new", "ptr", &["i64", "ptr", "i64"]),
     ("pxr_object_get_bits", "i64", &["ptr", "i64"]),
     ("pxr_object_set_bits", "void", &["ptr", "i64", "i64", "i64"]),
+    ("pxr_class_register", "void", &["i64", "i64"]),
+    ("pxr_object_get_class_id", "i64", &["ptr"]),
+    ("pxr_instanceof", "i64", &["ptr", "i64"]),
 ];
 
 pub fn llty(ty: &Ty) -> &'static str {

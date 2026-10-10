@@ -213,9 +213,15 @@ unifies with any element type. See the "Not implemented yet" table.
 **Missing array keys.** PHP warns and yields `null`. PXR has no `null` yet, so a
 direct read yields the zero value; `??` / `??=` detect absence correctly.
 
-**Fail loud, never silent.** Because classes, `null`, keyed `foreach`, nested
-assignment, the complex interpolation forms, etc. are not implemented, using them
-is a compile error with a specific code — never a silently different program.
+**Classes, inheritance & polymorphism.** Single inheritance (`extends`), method
+overriding, `parent::__construct` / `parent::method`, member visibility (`public`,
+`protected`, `private`), and `instanceof` are fully supported with 100% byte-for-byte
+output fidelity to PHP 8.4. Polymorphic method calls dynamically dispatch to subclass
+overrides via runtime class tags.
+
+**Fail loud, never silent.** Features not yet implemented (such as interfaces,
+abstract classes, `null`, keyed `foreach`, nested array assignment, complex interpolation forms)
+produce a compile error with a specific code — never a silently different program.
 
 ## Runtime independence
 

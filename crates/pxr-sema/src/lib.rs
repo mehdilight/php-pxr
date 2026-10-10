@@ -283,11 +283,17 @@ pub enum TExpr {
         ty: Ty,
     },
     New {
+        class_id: u32,
         class_name: String,
         num_props: u32,
         prop_defaults: Vec<(u32, TExpr)>,
         ctor: Option<(String, Vec<TExpr>, Vec<Ty>)>,
         ty: Ty,
+    },
+    Instanceof {
+        expr: Box<TExpr>,
+        target_class_id: u32,
+        target_class_name: String,
     },
 }
 
@@ -316,6 +322,7 @@ impl TExpr {
             TExpr::Call { ret, .. } => ret.clone(),
             TExpr::Property { ty, .. } => ty.clone(),
             TExpr::New { ty, .. } => ty.clone(),
+            TExpr::Instanceof { .. } => Ty::Bool,
         }
     }
 }
@@ -441,6 +448,7 @@ pub struct TProgram {
     pub funcs: Vec<TFunc>,
     /// The synthesized entry point running top-level statements.
     pub main: TFunc,
+    pub class_registrations: Vec<(u32, u32)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -449,8 +457,11 @@ pub struct TProgram {
 
 #[derive(Clone, Debug)]
 pub struct ClassInfo {
+    pub class_id: u32,
     pub name: String,
     pub name_span: Span,
+    pub parent: Option<String>,
+    pub parent_span: Option<Span>,
     pub properties: Vec<PropertyInfo>,
     pub prop_indices: HashMap<String, usize>,
     pub methods: HashMap<String, MethodInfo>,
@@ -458,6 +469,7 @@ pub struct ClassInfo {
 
 #[derive(Clone, Debug)]
 pub struct PropertyInfo {
+    pub declaring_class: String,
     pub name: String,
     pub name_span: Span,
     pub ty: Ty,
@@ -467,6 +479,7 @@ pub struct PropertyInfo {
 
 #[derive(Clone, Debug)]
 pub struct MethodInfo {
+    pub declaring_class: String,
     pub name: String,
     pub name_span: Span,
     pub mangled: String,
@@ -561,18 +574,302 @@ pub fn analyze(program: &ast::Program) -> (Option<TProgram>, Diagnostics) {
 }
 
 impl Analyzer {
+    pub fn is_subclass_of(&self, child: &str, parent: &str) -> bool {
+        let mut curr = child.to_ascii_lowercase();
+        let target = parent.to_ascii_lowercase();
+        while let Some(c) = self.classes.get(&curr) {
+            if let Some(p) = &c.parent {
+                if *p == target {
+                    return true;
+                }
+                curr = p.clone();
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
+    pub fn is_assignable(&self, from: &Ty, to: &Ty) -> bool {
+        if from == to {
+            return true;
+        }
+        match (from, to) {
+            (Ty::Int, Ty::Float) => true,
+            (Ty::Array(e), Ty::Array(t)) => matches!(**e, Ty::Null) || self.is_assignable(e, t),
+            (Ty::Named(child), Ty::Named(parent)) => self.is_subclass_of(child, parent),
+            _ => false,
+        }
+    }
+
+    fn check_member_visibility(
+        &mut self,
+        declaring_class: &str,
+        vis: ast::Visibility,
+        span: Span,
+        ctx: &FnCtx,
+    ) -> bool {
+        match vis {
+            ast::Visibility::Public => true,
+            ast::Visibility::Protected => {
+                let Some(current) = &ctx.current_class else {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "cannot access protected member of class `{declaring_class}` outside class context"
+                        ))
+                        .with_code("E0265")
+                        .with_span(span),
+                    );
+                    return false;
+                };
+                if current.eq_ignore_ascii_case(declaring_class)
+                    || self.is_subclass_of(current, declaring_class)
+                    || self.is_subclass_of(declaring_class, current)
+                {
+                    true
+                } else {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "cannot access protected member of class `{declaring_class}` from class `{current}`"
+                        ))
+                        .with_code("E0265")
+                        .with_span(span),
+                    );
+                    false
+                }
+            }
+            ast::Visibility::Private => {
+                let Some(current) = &ctx.current_class else {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "cannot access private member of class `{declaring_class}` outside class context"
+                        ))
+                        .with_code("E0265")
+                        .with_span(span),
+                    );
+                    return false;
+                };
+                if current.eq_ignore_ascii_case(declaring_class) {
+                    true
+                } else {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "cannot access private member of class `{declaring_class}` from class `{current}`"
+                        ))
+                        .with_code("E0265")
+                        .with_span(span),
+                    );
+                    false
+                }
+            }
+        }
+    }
+
+    fn method_has_overrides(&self, root_class: &str, method_name: &str) -> bool {
+        let mkey = method_name.to_ascii_lowercase();
+        let root_info = match self.classes.get(&root_class.to_ascii_lowercase()) {
+            Some(c) => c,
+            None => return false,
+        };
+        let root_mangled = match root_info.methods.get(&mkey) {
+            Some(m) => &m.mangled,
+            None => return false,
+        };
+        for class in self.classes.values() {
+            if self.is_subclass_of(&class.name, root_class) {
+                if let Some(sub_m) = class.methods.get(&mkey) {
+                    if sub_m.mangled != *root_mangled {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn synthesize_dispatcher(&self, root_class: &ClassInfo, method: &MethodInfo) -> TFunc {
+        let mkey = method.name.to_ascii_lowercase();
+        let disp_mangled = mangle_dispatcher(&root_class.name, &method.name);
+        let disp_display = format!("{}::{}$dispatch", root_class.name, method.name);
+
+        let mut slots = vec![Ty::Named(root_class.name.clone())];
+        let mut param_vars = Vec::new();
+        let mut param_tys = vec![("$this".to_string(), Ty::Named(root_class.name.clone()))];
+        for (i, pty) in method.params.iter().enumerate() {
+            slots.push(pty.clone());
+            let pname = format!("$arg{i}");
+            param_tys.push((pname.clone(), pty.clone()));
+            param_vars.push(TExpr::Var {
+                name: pname,
+                slot: (i + 1) as u32,
+                ty: pty.clone(),
+            });
+        }
+        let cid_slot = slots.len() as u32;
+        slots.push(Ty::Int); // $cid
+
+        let get_cid = TExpr::Call {
+            callee: Callee::User {
+                mangled: "pxr_object_get_class_id".to_string(),
+                name: "pxr_object_get_class_id".to_string(),
+                params: vec![Ty::Named(root_class.name.clone())],
+            },
+            ret: Ty::Int,
+            args: vec![TExpr::Var {
+                name: "$this".to_string(),
+                slot: 0,
+                ty: Ty::Named(root_class.name.clone()),
+            }],
+            arg_tys: vec![Ty::Named(root_class.name.clone())],
+            span: Span::synthetic(),
+        };
+        let init_cid = TStmt::Assign {
+            target: TTarget::Var {
+                name: "$cid".to_string(),
+                slot: cid_slot,
+                ty: Ty::Int,
+            },
+            ty: Ty::Int,
+            value: get_cid,
+        };
+
+        let mut groups: HashMap<String, Vec<u32>> = HashMap::new();
+        for sub in self.classes.values() {
+            if self.is_subclass_of(&sub.name, &root_class.name) {
+                if let Some(sub_m) = sub.methods.get(&mkey) {
+                    if sub_m.mangled != method.mangled {
+                        groups.entry(sub_m.mangled.clone()).or_default().push(sub.class_id);
+                    }
+                }
+            }
+        }
+
+        let mut body = vec![init_cid];
+
+        let make_call = |target_mangled: &str| -> TExpr {
+            let mut call_args = vec![TExpr::Var {
+                name: "$this".to_string(),
+                slot: 0,
+                ty: Ty::Named(root_class.name.clone()),
+            }];
+            call_args.extend(param_vars.clone());
+            let mut p = vec![Ty::Named(root_class.name.clone())];
+            p.extend(method.params.clone());
+            TExpr::Call {
+                callee: Callee::User {
+                    mangled: target_mangled.to_string(),
+                    name: target_mangled.to_string(),
+                    params: p.clone(),
+                },
+                ret: method.ret.clone(),
+                args: call_args,
+                arg_tys: p,
+                span: Span::synthetic(),
+            }
+        };
+
+        let make_return_stmts = |target_mangled: &str| -> Vec<TStmt> {
+            let call = make_call(target_mangled);
+            if method.ret == Ty::Void {
+                vec![
+                    TStmt::Expr(call),
+                    TStmt::Return {
+                        value: None,
+                        ret: Ty::Void,
+                    },
+                ]
+            } else {
+                vec![TStmt::Return {
+                    value: Some(call),
+                    ret: method.ret.clone(),
+                }]
+            }
+        };
+
+        for (target_mangled, ids) in groups {
+            let mut cond = TExpr::Bin {
+                op: TBinOp::Eq,
+                lhs: Box::new(TExpr::Var {
+                    name: "$cid".to_string(),
+                    slot: cid_slot,
+                    ty: Ty::Int,
+                }),
+                rhs: Box::new(TExpr::Int(ids[0] as i64)),
+                lhs_ty: Ty::Int,
+                rhs_ty: Ty::Int,
+                ty: Ty::Bool,
+            };
+            for id in &ids[1..] {
+                let eq = TExpr::Bin {
+                    op: TBinOp::Eq,
+                    lhs: Box::new(TExpr::Var {
+                        name: "$cid".to_string(),
+                        slot: cid_slot,
+                        ty: Ty::Int,
+                    }),
+                    rhs: Box::new(TExpr::Int(*id as i64)),
+                    lhs_ty: Ty::Int,
+                    rhs_ty: Ty::Int,
+                    ty: Ty::Bool,
+                };
+                cond = TExpr::Bin {
+                    op: TBinOp::Or,
+                    lhs: Box::new(cond),
+                    rhs: Box::new(eq),
+                    lhs_ty: Ty::Bool,
+                    rhs_ty: Ty::Bool,
+                    ty: Ty::Bool,
+                };
+            }
+            body.push(TStmt::If {
+                cond,
+                cond_ty: Ty::Bool,
+                then_branch: make_return_stmts(&target_mangled),
+                elifs: Vec::new(),
+                else_branch: None,
+            });
+        }
+
+        body.extend(make_return_stmts(&method.mangled));
+
+        TFunc {
+            name: disp_mangled,
+            display: disp_display,
+            params: param_tys,
+            ret: method.ret.clone(),
+            slots,
+            body,
+        }
+    }
+
     fn run(&mut self, program: &ast::Program) -> Option<TProgram> {
         self.collect_classes(program);
         self.collect_signatures(program);
 
         let mut funcs = Vec::new();
 
-        // Analyze methods of classes
+        // Analyze methods declared in classes
         for class_key in self.classes.keys().cloned().collect::<Vec<_>>() {
             let class = self.classes.get(&class_key).unwrap().clone();
             for method in class.methods.values() {
-                if let Some(tf) = self.analyze_method(&class.name, method) {
-                    funcs.push(tf);
+                if method.declaring_class.eq_ignore_ascii_case(&class.name) {
+                    if let Some(tf) = self.analyze_method(&class.name, method) {
+                        funcs.push(tf);
+                    }
+                }
+            }
+        }
+
+        // Synthesize dynamic dispatchers for overridden virtual methods
+        for class_key in self.classes.keys().cloned().collect::<Vec<_>>() {
+            let class = self.classes.get(&class_key).unwrap().clone();
+            for method in class.methods.values() {
+                if method.declaring_class.eq_ignore_ascii_case(&class.name)
+                    && method.name != "__construct"
+                    && self.method_has_overrides(&class.name, &method.name)
+                {
+                    let disp_tf = self.synthesize_dispatcher(&class, method);
+                    funcs.push(disp_tf);
                 }
             }
         }
@@ -598,11 +895,31 @@ impl Analyzer {
         if self.diags.has_errors() {
             return None;
         }
-        Some(TProgram { funcs, main: main? })
+
+        let class_registrations: Vec<(u32, u32)> = self
+            .classes
+            .values()
+            .map(|c| {
+                let parent_id = c
+                    .parent
+                    .as_ref()
+                    .and_then(|p| self.classes.get(p))
+                    .map(|pc| pc.class_id)
+                    .unwrap_or(0);
+                (c.class_id, parent_id)
+            })
+            .collect();
+
+        Some(TProgram {
+            funcs,
+            main: main?,
+            class_registrations,
+        })
     }
 
     fn collect_classes(&mut self, program: &ast::Program) {
-        // Step 1: register all class names so forward references work
+        // Step 1: register all class names and assign unique class IDs
+        let mut class_id_counter = 1u32;
         for item in &program.items {
             let ast::Stmt::ClassDecl(c) = item else {
                 continue;
@@ -616,11 +933,16 @@ impl Analyzer {
                 );
                 continue;
             }
+            let class_id = class_id_counter;
+            class_id_counter += 1;
             self.classes.insert(
                 key,
                 ClassInfo {
+                    class_id,
                     name: c.name.clone(),
                     name_span: c.name_span,
+                    parent: c.extends.as_ref().map(|s| s.to_ascii_lowercase()),
+                    parent_span: c.extends_span,
                     properties: Vec::new(),
                     prop_indices: HashMap::new(),
                     methods: HashMap::new(),
@@ -628,30 +950,112 @@ impl Analyzer {
             );
         }
 
-        // Step 2: resolve properties and methods
+        // Step 2: validate parent class existence and check for inheritance cycles
         for item in &program.items {
             let ast::Stmt::ClassDecl(c) = item else {
                 continue;
             };
-            let key = c.name.to_ascii_lowercase();
+            if let Some(parent_name) = &c.extends {
+                let parent_key = parent_name.to_ascii_lowercase();
+                let parent_span = c.extends_span.unwrap_or(c.name_span);
+                if parent_key == c.name.to_ascii_lowercase() {
+                    self.diags.emit(
+                        Diagnostic::error(format!("class `{}` cannot extend itself", c.name))
+                            .with_code("E0201")
+                            .with_span(parent_span),
+                    );
+                    continue;
+                }
+                if !self.classes.contains_key(&parent_key) {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "class `{}` extends unknown class `{parent_name}`",
+                            c.name
+                        ))
+                        .with_code("E0205")
+                        .with_span(parent_span),
+                    );
+                    continue;
+                }
+                // Check cycle
+                let mut visited = std::collections::HashSet::new();
+                visited.insert(c.name.to_ascii_lowercase());
+                let mut curr_opt = Some(parent_key);
+                while let Some(curr) = curr_opt {
+                    if visited.contains(&curr) {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "circular inheritance detected involving class `{}`",
+                                c.name
+                            ))
+                            .with_code("E0201")
+                            .with_span(c.name_span),
+                        );
+                        break;
+                    }
+                    visited.insert(curr.clone());
+                    curr_opt = self.classes.get(&curr).and_then(|info| info.parent.clone());
+                }
+            }
+        }
+
+        if self.diags.has_errors() {
+            return;
+        }
+
+        // Step 3: topological order: ancestors before children
+        let mut order = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        fn visit(
+            key: &str,
+            classes: &HashMap<String, ClassInfo>,
+            visited: &mut std::collections::HashSet<String>,
+            order: &mut Vec<String>,
+        ) {
+            if visited.contains(key) {
+                return;
+            }
+            visited.insert(key.to_string());
+            if let Some(info) = classes.get(key) {
+                if let Some(parent) = &info.parent {
+                    visit(parent, classes, visited, order);
+                }
+            }
+            order.push(key.to_string());
+        }
+        for k in self.classes.keys().cloned().collect::<Vec<_>>() {
+            visit(&k, &self.classes, &mut visited, &mut order);
+        }
+
+        // Map AST class decls by lowercased name
+        let mut decls_by_name = HashMap::new();
+        for item in &program.items {
+            if let ast::Stmt::ClassDecl(c) = item {
+                decls_by_name.insert(c.name.to_ascii_lowercase(), c.clone());
+            }
+        }
+
+        // Step 4: resolve properties and methods in topological order
+        for class_key in order {
+            let Some(c) = decls_by_name.get(&class_key) else {
+                continue;
+            };
             let mut properties = Vec::new();
             let mut prop_indices = HashMap::new();
             let mut methods = HashMap::new();
 
+            // Inherit from parent if present
+            if let Some(parent_key) = &self.classes.get(&class_key).unwrap().parent {
+                if let Some(parent_info) = self.classes.get(parent_key) {
+                    properties = parent_info.properties.clone();
+                    prop_indices = parent_info.prop_indices.clone();
+                    methods = parent_info.methods.clone();
+                }
+            }
+
             for member in &c.members {
                 match member {
                     ast::ClassMember::Property(p) => {
-                        if prop_indices.contains_key(&p.name) {
-                            self.diags.emit(
-                                Diagnostic::error(format!(
-                                    "property `${}` is already defined in class `{}`",
-                                    p.name, c.name
-                                ))
-                                .with_code("E0201")
-                                .with_span(p.name_span),
-                            );
-                            continue;
-                        }
                         let ty = match &p.ty {
                             Some(t) => self.resolve_type(t),
                             None => {
@@ -683,29 +1087,77 @@ impl Analyzer {
                                     .with_span(p.span),
                             );
                         }
-                        let idx = properties.len();
-                        prop_indices.insert(p.name.clone(), idx);
-                        properties.push(PropertyInfo {
-                            name: p.name.clone(),
-                            name_span: p.name_span,
-                            ty,
-                            visibility: p.visibility,
-                            default: p.default.clone(),
-                        });
+
+                        if let Some(&existing_idx) = prop_indices.get(&p.name) {
+                            let existing = &properties[existing_idx];
+                            if existing.declaring_class.eq_ignore_ascii_case(&c.name) {
+                                self.diags.emit(
+                                    Diagnostic::error(format!(
+                                        "property `${}` is already defined in class `{}`",
+                                        p.name, c.name
+                                    ))
+                                    .with_code("E0201")
+                                    .with_span(p.name_span),
+                                );
+                                continue;
+                            }
+                            // Overriding inherited property
+                            if existing.visibility == ast::Visibility::Public
+                                && p.visibility != ast::Visibility::Public
+                            {
+                                self.diags.emit(
+                                    Diagnostic::error(format!(
+                                        "cannot narrow visibility of public property `${}` in class `{}`",
+                                        p.name, c.name
+                                    ))
+                                    .with_code("E0265")
+                                    .with_span(p.name_span),
+                                );
+                            } else if existing.visibility == ast::Visibility::Protected
+                                && p.visibility == ast::Visibility::Private
+                            {
+                                self.diags.emit(
+                                    Diagnostic::error(format!(
+                                        "cannot narrow visibility of protected property `${}` in class `{}`",
+                                        p.name, c.name
+                                    ))
+                                    .with_code("E0265")
+                                    .with_span(p.name_span),
+                                );
+                            }
+                            if existing.ty != ty {
+                                self.diags.emit(
+                                    Diagnostic::error(format!(
+                                        "type of property `{}::${}` (`{ty}`) must match inherited property type `{}`",
+                                        c.name, p.name, existing.ty
+                                    ))
+                                    .with_code("E0208")
+                                    .with_span(p.span),
+                                );
+                            }
+                            properties[existing_idx] = PropertyInfo {
+                                declaring_class: c.name.clone(),
+                                name: p.name.clone(),
+                                name_span: p.name_span,
+                                ty,
+                                visibility: p.visibility,
+                                default: p.default.clone().or_else(|| existing.default.clone()),
+                            };
+                        } else {
+                            let idx = properties.len();
+                            prop_indices.insert(p.name.clone(), idx);
+                            properties.push(PropertyInfo {
+                                declaring_class: c.name.clone(),
+                                name: p.name.clone(),
+                                name_span: p.name_span,
+                                ty,
+                                visibility: p.visibility,
+                                default: p.default.clone(),
+                            });
+                        }
                     }
                     ast::ClassMember::Method(m) => {
                         let mkey = m.name.to_ascii_lowercase();
-                        if methods.contains_key(&mkey) {
-                            self.diags.emit(
-                                Diagnostic::error(format!(
-                                    "method `{}` is already defined in class `{}`",
-                                    m.name, c.name
-                                ))
-                                .with_code("E0201")
-                                .with_span(m.name_span),
-                            );
-                            continue;
-                        }
                         let mut params = Vec::new();
                         let mut param_names = Vec::new();
                         for param in &m.params {
@@ -766,10 +1218,86 @@ impl Analyzer {
                             }
                         };
 
+                        if let Some(existing) = methods.get(&mkey) {
+                            if existing.declaring_class.eq_ignore_ascii_case(&c.name) {
+                                self.diags.emit(
+                                    Diagnostic::error(format!(
+                                        "method `{}` is already defined in class `{}`",
+                                        m.name, c.name
+                                    ))
+                                    .with_code("E0201")
+                                    .with_span(m.name_span),
+                                );
+                                continue;
+                            }
+                            // Overriding inherited method
+                            if existing.visibility == ast::Visibility::Public
+                                && m.visibility != ast::Visibility::Public
+                            {
+                                self.diags.emit(
+                                    Diagnostic::error(format!(
+                                        "cannot narrow visibility of public method `{}::{}` to protected or private",
+                                        existing.declaring_class, m.name
+                                    ))
+                                    .with_code("E0265")
+                                    .with_span(m.name_span),
+                                );
+                            } else if existing.visibility == ast::Visibility::Protected
+                                && m.visibility == ast::Visibility::Private
+                            {
+                                self.diags.emit(
+                                    Diagnostic::error(format!(
+                                        "cannot narrow visibility of protected method `{}::{}` to private",
+                                        existing.declaring_class, m.name
+                                    ))
+                                    .with_code("E0265")
+                                    .with_span(m.name_span),
+                                );
+                            }
+                            if mkey != "__construct" {
+                                if params.len() != existing.params.len() {
+                                    self.diags.emit(
+                                        Diagnostic::error(format!(
+                                            "declaration of `{}::{}` must be compatible with `{}::{}` (expected {} argument{}, found {})",
+                                            c.name,
+                                            m.name,
+                                            existing.declaring_class,
+                                            m.name,
+                                            existing.params.len(),
+                                            if existing.params.len() == 1 { "" } else { "s" },
+                                            params.len()
+                                        ))
+                                        .with_code("E0207")
+                                        .with_span(m.name_span),
+                                    );
+                                } else if params != existing.params {
+                                    self.diags.emit(
+                                        Diagnostic::error(format!(
+                                            "parameter types in `{}::{}` must be compatible with `{}::{}`",
+                                            c.name, m.name, existing.declaring_class, m.name
+                                        ))
+                                        .with_code("E0208")
+                                        .with_span(m.name_span),
+                                    );
+                                }
+                                if ret != existing.ret && !self.is_assignable(&ret, &existing.ret) {
+                                    self.diags.emit(
+                                        Diagnostic::error(format!(
+                                            "return type `{ret}` in `{}::{}` must be compatible with `{}` in `{}::{}`",
+                                            c.name, m.name, existing.ret, existing.declaring_class, m.name
+                                        ))
+                                        .with_code("E0208")
+                                        .with_span(m.name_span),
+                                    );
+                                }
+                            }
+                        }
+
                         let mangled = mangle_method(&c.name, &m.name);
                         methods.insert(
                             mkey,
                             MethodInfo {
+                                declaring_class: c.name.clone(),
                                 name: m.name.clone(),
                                 name_span: m.name_span,
                                 mangled,
@@ -784,7 +1312,7 @@ impl Analyzer {
                 }
             }
 
-            if let Some(info) = self.classes.get_mut(&key) {
+            if let Some(info) = self.classes.get_mut(&class_key) {
                 info.properties = properties;
                 info.prop_indices = prop_indices;
                 info.methods = methods;
@@ -1254,7 +1782,7 @@ impl Analyzer {
         let vslot = match ctx.slot_of(value) {
             Some(s) => {
                 let existing = ctx.slot_ty(s);
-                if !elem.assignable_to(&existing) {
+                if !self.is_assignable(&elem, &existing) {
                     self.diags.emit(
                         Diagnostic::error(format!(
                             "`foreach` value variable `${value}` is already of type `{existing}`, but the array elements are `{elem}`"
@@ -1418,7 +1946,7 @@ impl Analyzer {
                     }
                 };
 
-                if !val_ty.assignable_to(&decl_ty) {
+                if !self.is_assignable(&val_ty, &decl_ty) {
                     self.diags.emit(
                         Diagnostic::error(format!(
                             "cannot assign value of type `{val_ty}` to variable `${name}` of type `{decl_ty}`"
@@ -1450,7 +1978,7 @@ impl Analyzer {
                 }
                 let target = self.infer_index_target(base, index.as_deref(), span, ctx)?;
                 let elem_ty = self.elem_ty_maybe_refine(&target, &val_ty, ctx);
-                if !val_ty.assignable_to(&elem_ty) {
+                if !self.is_assignable(&val_ty, &elem_ty) {
                     self.diags.emit(
                         Diagnostic::error(format!(
                             "cannot assign value of type `{val_ty}` into an array of element type `{elem_ty}`"
@@ -1525,22 +2053,16 @@ impl Analyzer {
                 };
 
                 let prop = &class.properties[prop_idx];
-                if prop.visibility == ast::Visibility::Private
-                    && ctx.current_class.as_deref().map(|s| s.to_ascii_lowercase())
-                        != Some(class.name.to_ascii_lowercase())
-                {
-                    self.diags.emit(
-                        Diagnostic::error(format!(
-                            "cannot access private property {}::${name} from outside class",
-                            class.name
-                        ))
-                        .with_code("E0265")
-                        .with_span(*name_span),
-                    );
+                if !self.check_member_visibility(
+                    &prop.declaring_class,
+                    prop.visibility,
+                    *name_span,
+                    ctx,
+                ) {
                     return None;
                 }
 
-                if !val_ty.assignable_to(&prop.ty) {
+                if !self.is_assignable(&val_ty, &prop.ty) {
                     self.diags.emit(
                         Diagnostic::error(format!(
                             "cannot assign value of type `{val_ty}` to property `{}::${name}` of type `{}`",
@@ -1597,7 +2119,7 @@ impl Analyzer {
         let val = self.infer(value, ctx)?;
         let vty = val.ty();
         let result_ty = self.binary_type(op, &tty, &vty, span)?;
-        if !result_ty.assignable_to(&tty) {
+        if !self.is_assignable(&result_ty, &tty) {
             self.diags.emit(
                 Diagnostic::error(format!(
                     "result of `{}=` has type `{result_ty}`, which cannot be stored back into a target of type `{tty}`",
@@ -1889,7 +2411,7 @@ impl Analyzer {
             (Some(v), _) => {
                 let t = self.infer(v, ctx)?;
                 let vt = t.ty();
-                if !vt.assignable_to(&ret) {
+                if !self.is_assignable(&vt, &ret) {
                     self.diags.emit(
                         Diagnostic::error(format!(
                             "returning `{vt}` from function declared to return `{ret}`"
@@ -2087,18 +2609,7 @@ impl Analyzer {
                 };
 
                 let prop = &class.properties[prop_idx];
-                if prop.visibility == ast::Visibility::Private
-                    && ctx.current_class.as_deref().map(|s| s.to_ascii_lowercase())
-                        != Some(class.name.to_ascii_lowercase())
-                {
-                    self.diags.emit(
-                        Diagnostic::error(format!(
-                            "cannot access private property {}::${name} from outside class",
-                            class.name
-                        ))
-                        .with_code("E0265")
-                        .with_span(*name_span),
-                    );
+                if !self.check_member_visibility(&prop.declaring_class, prop.visibility, *name_span, ctx) {
                     return None;
                 }
 
@@ -2160,18 +2671,7 @@ impl Analyzer {
                     }
                 };
 
-                if method.visibility == ast::Visibility::Private
-                    && ctx.current_class.as_deref().map(|s| s.to_ascii_lowercase())
-                        != Some(class.name.to_ascii_lowercase())
-                {
-                    self.diags.emit(
-                        Diagnostic::error(format!(
-                            "cannot call private method {}::{name} from outside class",
-                            class.name
-                        ))
-                        .with_code("E0265")
-                        .with_span(*name_span),
-                    );
+                if !self.check_member_visibility(&method.declaring_class, method.visibility, *name_span, ctx) {
                     return None;
                 }
 
@@ -2190,6 +2690,12 @@ impl Analyzer {
                     return None;
                 }
 
+                let target_mangled = if self.method_has_overrides(&class.name, &name) {
+                    mangle_dispatcher(&class.name, &name)
+                } else {
+                    method.mangled.clone()
+                };
+
                 let mut typed_args = vec![base_expr];
                 let mut actual_tys = vec![Ty::Named(class.name.clone())];
                 let mut formal_params = vec![Ty::Named(class.name.clone())];
@@ -2198,7 +2704,7 @@ impl Analyzer {
                 for (arg, formal_ty) in args.iter().zip(method.params.iter()) {
                     let t_arg = self.infer(arg, ctx)?;
                     let aty = t_arg.ty();
-                    if !aty.assignable_to(formal_ty) {
+                    if !self.is_assignable(&aty, formal_ty) {
                         self.diags.emit(
                             Diagnostic::error(format!(
                                 "argument type mismatch in call to `{}::{name}`: expected `{formal_ty}`, found `{aty}`",
@@ -2215,7 +2721,7 @@ impl Analyzer {
 
                 Some(TExpr::Call {
                     callee: Callee::User {
-                        mangled: method.mangled,
+                        mangled: target_mangled,
                         name: format!("{}::{name}", class.name),
                         params: formal_params,
                     },
@@ -2245,18 +2751,7 @@ impl Analyzer {
 
                 let ctor = class.methods.get("__construct").cloned();
                 let ctor_info = if let Some(ctor) = &ctor {
-                    if ctor.visibility == ast::Visibility::Private
-                        && ctx.current_class.as_deref().map(|s| s.to_ascii_lowercase())
-                            != Some(class.name.to_ascii_lowercase())
-                    {
-                        self.diags.emit(
-                            Diagnostic::error(format!(
-                                "cannot call private constructor of class `{}` from outside class",
-                                class.name
-                            ))
-                            .with_code("E0265")
-                            .with_span(*span),
-                        );
+                    if !self.check_member_visibility(&ctor.declaring_class, ctor.visibility, *span, ctx) {
                         return None;
                     }
 
@@ -2280,7 +2775,7 @@ impl Analyzer {
                     for (arg, formal_ty) in args.iter().zip(ctor.params.iter()) {
                         let t_arg = self.infer(arg, ctx)?;
                         let aty = t_arg.ty();
-                        if !aty.assignable_to(formal_ty) {
+                        if !self.is_assignable(&aty, formal_ty) {
                             self.diags.emit(
                                 Diagnostic::error(format!(
                                     "argument type mismatch in call to `{}::__construct`: expected `{formal_ty}`, found `{aty}`",
@@ -2317,7 +2812,7 @@ impl Analyzer {
                     if let Some(def_expr) = &p.default {
                         let mut dummy_ctx = FnCtx::new(Ty::Void, false);
                         if let Some(t_def) = self.infer(def_expr, &mut dummy_ctx) {
-                            if !t_def.ty().assignable_to(&p.ty) {
+                            if !self.is_assignable(&t_def.ty(), &p.ty) {
                                 self.diags.emit(
                                     Diagnostic::error(format!(
                                         "default value of property `{}::${}` is of type `{}`, expected `{}`",
@@ -2334,11 +2829,170 @@ impl Analyzer {
                 }
 
                 Some(TExpr::New {
+                    class_id: class.class_id,
                     class_name: class.name.clone(),
                     num_props: class.properties.len() as u32,
                     prop_defaults,
                     ctor: ctor_info,
                     ty: Ty::Named(class.name.clone()),
+                })
+            }
+            ast::Expr::Instanceof {
+                expr,
+                class_name,
+                class_span,
+                span: _,
+            } => {
+                let t_expr = self.infer(expr, ctx)?;
+                let expr_ty = t_expr.ty();
+                if !matches!(expr_ty, Ty::Named(_)) {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "cannot use `instanceof` on non-object of type `{expr_ty}`"
+                        ))
+                        .with_code("E0260")
+                        .with_span(expr.span()),
+                    );
+                    return None;
+                }
+                let target_class = match self.classes.get(&class_name.to_ascii_lowercase()) {
+                    Some(c) => c.clone(),
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error(format!("unknown class `{class_name}`"))
+                                .with_code("E0205")
+                                .with_span(*class_span),
+                        );
+                        return None;
+                    }
+                };
+                Some(TExpr::Instanceof {
+                    expr: Box::new(t_expr),
+                    target_class_id: target_class.class_id,
+                    target_class_name: target_class.name,
+                })
+            }
+            ast::Expr::ParentMethodCall {
+                method,
+                method_span,
+                args,
+                span,
+            } => {
+                let current_class_name = match &ctx.current_class {
+                    Some(c) => c.clone(),
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error("cannot use `parent::` outside a class context")
+                                .with_code("E0268")
+                                .with_span(*span),
+                        );
+                        return None;
+                    }
+                };
+                let current_class = self
+                    .classes
+                    .get(&current_class_name.to_ascii_lowercase())
+                    .unwrap()
+                    .clone();
+                let parent_name = match &current_class.parent {
+                    Some(p) => p.clone(),
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "cannot use `parent::` in class `{}` which does not extend any class",
+                                current_class.name
+                            ))
+                            .with_code("E0268")
+                            .with_span(*span),
+                        );
+                        return None;
+                    }
+                };
+                let parent_class = match self.classes.get(&parent_name) {
+                    Some(c) => c.clone(),
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error(format!("unknown parent class `{parent_name}`"))
+                                .with_code("E0205")
+                                .with_span(*span),
+                        );
+                        return None;
+                    }
+                };
+                let parent_method = match parent_class.methods.get(&method.to_ascii_lowercase()) {
+                    Some(m) => m.clone(),
+                    None => {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "parent class `{}` has no method `{method}`",
+                                parent_class.name
+                            ))
+                            .with_code("E0262")
+                            .with_span(*method_span),
+                        );
+                        return None;
+                    }
+                };
+                if parent_method.visibility == ast::Visibility::Private {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "cannot call private method {}::{method} using `parent::`",
+                            parent_class.name
+                        ))
+                        .with_code("E0265")
+                        .with_span(*method_span),
+                    );
+                    return None;
+                }
+                if args.len() != parent_method.params.len() {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "method `{}::{method}` expects {} argument{}, found {}",
+                            parent_class.name,
+                            parent_method.params.len(),
+                            if parent_method.params.len() == 1 { "" } else { "s" },
+                            args.len()
+                        ))
+                        .with_code("E0207")
+                        .with_span(*span),
+                    );
+                    return None;
+                }
+                let this_expr = TExpr::Var {
+                    name: "$this".to_string(),
+                    slot: 0,
+                    ty: Ty::Named(current_class.name.clone()),
+                };
+                let mut typed_args = vec![this_expr];
+                let mut actual_tys = vec![Ty::Named(current_class.name.clone())];
+                let mut formal_params = vec![Ty::Named(parent_class.name.clone())];
+                formal_params.extend(parent_method.params.iter().cloned());
+                for (arg, formal_ty) in args.iter().zip(parent_method.params.iter()) {
+                    let t_arg = self.infer(arg, ctx)?;
+                    let aty = t_arg.ty();
+                    if !self.is_assignable(&aty, formal_ty) {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "argument type mismatch in call to `parent::{method}`: expected `{formal_ty}`, found `{aty}`"
+                            ))
+                            .with_code("E0208")
+                            .with_span(arg.span()),
+                        );
+                        return None;
+                    }
+                    actual_tys.push(aty);
+                    typed_args.push(t_arg);
+                }
+                Some(TExpr::Call {
+                    callee: Callee::User {
+                        mangled: parent_method.mangled,
+                        name: format!("parent::{method}"),
+                        params: formal_params,
+                    },
+                    ret: parent_method.ret,
+                    args: typed_args,
+                    arg_tys: actual_tys,
+                    span: *span,
                 })
             }
         }
@@ -2786,7 +3440,7 @@ impl Analyzer {
                 match self.infer(a, ctx) {
                     Some(t) => {
                         let at = t.ty();
-                        if !at.assignable_to(pty) {
+                        if !self.is_assignable(&at, pty) {
                             self.diags.emit(
                                 Diagnostic::error(format!(
                                     "argument {} of `{}` expects `{pty}`, found `{at}`",
@@ -3180,7 +3834,7 @@ impl Analyzer {
                     return self.builtin_ty_err(name, "an `int` size", &atys[1], args[1].span());
                 }
                 let elem = atys[0].array_elem().unwrap().clone();
-                if !atys[2].assignable_to(&elem) {
+                if !self.is_assignable(&atys[2], &elem) {
                     return self.builtin_ty_err(
                         name,
                         &format!("a value assignable to `{elem}`"),
@@ -3384,6 +4038,14 @@ pub fn mangle_fn(name: &str) -> String {
 pub fn mangle_method(class: &str, method: &str) -> String {
     format!(
         "pxr$m${}${}",
+        class.to_ascii_lowercase(),
+        method.to_ascii_lowercase()
+    )
+}
+
+pub fn mangle_dispatcher(class: &str, method: &str) -> String {
+    format!(
+        "pxr$disp${}${}",
         class.to_ascii_lowercase(),
         method.to_ascii_lowercase()
     )

@@ -172,6 +172,8 @@ pub enum Visibility {
 pub struct ClassDecl {
     pub name: String,
     pub name_span: Span,
+    pub extends: Option<String>,
+    pub extends_span: Option<Span>,
     pub members: Vec<ClassMember>,
     pub span: Span,
 }
@@ -362,6 +364,18 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
+    Instanceof {
+        expr: Box<Expr>,
+        class_name: String,
+        class_span: Span,
+        span: Span,
+    },
+    ParentMethodCall {
+        method: String,
+        method_span: Span,
+        args: Vec<Expr>,
+        span: Span,
+    },
     Paren(Box<Expr>, Span),
 }
 
@@ -403,7 +417,9 @@ impl Expr {
             | Expr::Call { span, .. }
             | Expr::Property { span, .. }
             | Expr::MethodCall { span, .. }
-            | Expr::New { span, .. } => *span,
+            | Expr::New { span, .. }
+            | Expr::Instanceof { span, .. }
+            | Expr::ParentMethodCall { span, .. } => *span,
         }
     }
 }

@@ -1422,3 +1422,141 @@ fn class_type_errors_are_loud() {
     assert_ne!(r4.code, 0);
     assert!(r4.stderr.contains("E0207") || r4.stdout.contains("E0207"));
 }
+
+#[test]
+fn inheritance_and_polymorphism_match_php() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let src = r#"<?php
+class Base {
+    public string $name;
+    protected int $val;
+
+    public function __construct(string $name, int $val) {
+        $this->name = $name;
+        $this->val = $val;
+    }
+
+    public function greet(): string {
+        return "Base: " . $this->name . " (" . $this->val . ")";
+    }
+}
+
+class Sub extends Base {
+    public function __construct(string $name, int $val) {
+        parent::__construct($name, $val * 2);
+    }
+
+    public function greet(): string {
+        return "Sub: " . parent::greet() . "!";
+    }
+}
+
+function runGreet(Base $b): void {
+    echo $b->greet() . "\n";
+}
+
+$b = new Base("Alpha", 10);
+$s = new Sub("Beta", 10);
+runGreet($b);
+runGreet($s);
+"#;
+    let f = temp_php("inheritance_poly", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let expected = "\
+Base: Alpha (10)
+Sub: Base: Beta (20)!
+";
+    assert_eq!(r.stdout, expected);
+}
+
+#[test]
+fn instanceof_hierarchy_matches_php() {
+    if !have_cc() {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let src = r#"<?php
+class GrandParent {}
+class ParentClass extends GrandParent {}
+class ChildClass extends ParentClass {}
+class OtherClass {}
+
+$c = new ChildClass();
+$p = new ParentClass();
+$o = new OtherClass();
+
+echo ($c instanceof ChildClass ? "1" : "0") . "\n";
+echo ($c instanceof ParentClass ? "1" : "0") . "\n";
+echo ($c instanceof GrandParent ? "1" : "0") . "\n";
+echo ($c instanceof OtherClass ? "1" : "0") . "\n";
+echo ($p instanceof ChildClass ? "1" : "0") . "\n";
+echo ($p instanceof GrandParent ? "1" : "0") . "\n";
+echo ($o instanceof GrandParent ? "1" : "0") . "\n";
+"#;
+    let f = temp_php("instanceof_check", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let expected = "\
+1
+1
+1
+0
+0
+1
+0
+";
+    assert_eq!(r.stdout, expected);
+}
+
+#[test]
+fn inheritance_diagnostics_rejected() {
+    // 1. Extending non-existent class (E0205)
+    let src1 = r#"<?php class A extends NonExistent {}"#;
+    let f1 = temp_php("extend_nonexistent", src1);
+    let r1 = run_ok(&["check", f1.to_str().unwrap()]);
+    assert_ne!(r1.code, 0);
+    assert!(r1.stderr.contains("E0205") || r1.stdout.contains("E0205"));
+
+    // 2. Self inheritance (E0201 / E0205)
+    let src2 = r#"<?php class SelfExt extends SelfExt {}"#;
+    let f2 = temp_php("self_extend", src2);
+    let r2 = run_ok(&["check", f2.to_str().unwrap()]);
+    assert_ne!(r2.code, 0);
+    assert!(r2.stderr.contains("E0201") || r2.stderr.contains("E0205"));
+
+    // 3. Narrowing visibility (E0265)
+    let src3 = r#"<?php
+class ParentVis { public function foo(): void {} }
+class ChildVis extends ParentVis { protected function foo(): void {} }
+"#;
+    let f3 = temp_php("narrow_vis", src3);
+    let r3 = run_ok(&["check", f3.to_str().unwrap()]);
+    assert_ne!(r3.code, 0);
+    assert!(r3.stderr.contains("E0265") || r3.stdout.contains("E0265"));
+
+    // 4. Overriding signature mismatch (E0208)
+    let src4 = r#"<?php
+class ParentSig { public function foo(int $a): void {} }
+class ChildSig extends ParentSig { public function foo(string $a): void {} }
+"#;
+    let f4 = temp_php("sig_mismatch", src4);
+    let r4 = run_ok(&["check", f4.to_str().unwrap()]);
+    assert_ne!(r4.code, 0);
+    assert!(r4.stderr.contains("E0208") || r4.stdout.contains("E0208"));
+
+    // 5. Instanceof with non-object operand (E0260)
+    let src5 = r#"<?php
+class TargetCls {}
+$x = 42;
+if ($x instanceof TargetCls) { echo "bad"; }
+"#;
+    let f5 = temp_php("instanceof_nonobj", src5);
+    let r5 = run_ok(&["check", f5.to_str().unwrap()]);
+    assert_ne!(r5.code, 0);
+    assert!(r5.stderr.contains("E0260") || r5.stdout.contains("E0260"));
+}
+
