@@ -654,6 +654,13 @@ impl Parser {
     }
 
     fn parse_class(&mut self) -> Result<ClassDecl, ()> {
+        let previous = std::mem::take(&mut self.type_params);
+        let result = self.parse_class_inner();
+        self.type_params = previous;
+        result
+    }
+
+    fn parse_class_inner(&mut self) -> Result<ClassDecl, ()> {
         let start = self.peek().span;
         let explicit_abstract = self.eat(&TokenKind::Abstract);
         let is_interface = self.eat(&TokenKind::Interface);
@@ -676,17 +683,32 @@ impl Parser {
         }
         self.declared_types.push(name.to_ascii_lowercase());
         let name = self.declared_name(&name);
+        let mut type_params = Vec::new();
+        if self.eat(&TokenKind::Lt) {
+            loop {
+                let token = self.expect_ident("generic class type parameter")?;
+                let TokenKind::Ident(name) = token.kind else {
+                    unreachable!()
+                };
+                if self.type_params.contains(&name) {
+                    self.error(token.span, format!("duplicate type parameter `{name}`"));
+                }
+                self.type_params.push(name.clone());
+                type_params.push((name, token.span));
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect_type_close()?;
+        }
         let mut extends = None;
-        let mut extends_span = None;
         let mut interfaces = Vec::new();
         if is_interface {
             if self.eat(&TokenKind::Extends) {
                 interfaces = self.parse_interface_names()?;
             }
         } else if self.eat(&TokenKind::Extends) {
-            let (parent_name, span) = self.parse_name()?;
-            extends = Some(self.resolve_name(&parent_name, false).0);
-            extends_span = Some(span);
+            extends = Some(self.parse_class_ref()?);
         }
         if !is_interface && self.eat(&TokenKind::Implements) {
             interfaces = self.parse_interface_names()?;
@@ -705,23 +727,33 @@ impl Parser {
         }
         let close = self.expect(&TokenKind::RBrace, "`}` after class body")?;
         Ok(ClassDecl {
+            type_params,
             is_interface,
             interfaces,
             is_abstract,
             name,
             name_span,
             extends,
-            extends_span,
             members,
             span: start.merge(close.span),
         })
     }
 
-    fn parse_interface_names(&mut self) -> Result<Vec<(String, Span)>, ()> {
+    fn parse_class_ref(&mut self) -> Result<ClassRef, ()> {
+        let (name, span) = self.parse_name()?;
+        let name = self.resolve_name(&name, false).0;
+        let type_args = self.parse_type_arguments()?;
+        Ok(ClassRef {
+            name,
+            type_args,
+            span,
+        })
+    }
+
+    fn parse_interface_names(&mut self) -> Result<Vec<ClassRef>, ()> {
         let mut names = Vec::new();
         loop {
-            let (name, span) = self.parse_name()?;
-            names.push((self.resolve_name(&name, false).0, span));
+            names.push(self.parse_class_ref()?);
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
@@ -930,7 +962,13 @@ impl Parser {
             if self.type_params.contains(&name) {
                 return Ok(TypeRef::Param(name, span));
             }
-            return Ok(TypeRef::Named(self.resolve_name(&name, false).0));
+            let name = self.resolve_name(&name, false).0;
+            let args = self.parse_type_arguments()?;
+            return Ok(if args.is_empty() {
+                TypeRef::Named(name)
+            } else {
+                TypeRef::Applied(name, args, span)
+            });
         }
 
         if self.at(&TokenKind::KwArray) {
@@ -958,6 +996,37 @@ impl Parser {
                 TypeRef::Span(tok.span)
             }
         })
+    }
+
+    fn parse_type_arguments(&mut self) -> Result<Vec<TypeRef>, ()> {
+        let mut arguments = Vec::new();
+        if self.eat(&TokenKind::Lt) {
+            loop {
+                arguments.push(self.parse_type()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect_type_close()?;
+        }
+        Ok(arguments)
+    }
+
+    // `instanceof C < expr` can be an ordinary comparison. Speculate only
+    // here, restoring split `>>` tokens as well as diagnostics on failure.
+    fn parse_instanceof_type_arguments(&mut self) -> Vec<TypeRef> {
+        if !self.at(&TokenKind::Lt) {
+            return Vec::new();
+        }
+        let previous = (self.pos, self.toks.clone(), self.diags.clone());
+        let arguments = self.parse_type_arguments();
+        if self.diags.items().len() == previous.2.items().len() {
+            if let Ok(arguments) = arguments {
+                return arguments;
+            }
+        }
+        (self.pos, self.toks, self.diags) = previous;
+        Vec::new()
     }
 
     /// Expression statement or assignment.
@@ -1071,10 +1140,12 @@ impl Parser {
         match e {
             Expr::StaticProperty {
                 class_name,
+                type_args,
                 name,
                 span,
             } => Ok(LValue::StaticProperty {
                 class_name,
+                type_args,
                 name,
                 span,
             }),
@@ -1305,10 +1376,12 @@ impl Parser {
                 self.advance();
                 let (raw_name, class_span) = self.parse_name()?;
                 let class_name = self.resolve_name(&raw_name, false).0;
+                let type_args = self.parse_instanceof_type_arguments();
                 let span = lhs.span().merge(class_span);
                 lhs = Expr::Instanceof {
                     expr: Box::new(lhs),
                     class_name,
+                    type_args,
                     class_span,
                     span,
                 };
@@ -1436,7 +1509,12 @@ impl Parser {
         Ok(base)
     }
 
-    fn parse_qualified_member(&mut self, class_name: String, start: Span) -> Result<Expr, ()> {
+    fn parse_qualified_member(
+        &mut self,
+        class_name: String,
+        type_args: Vec<TypeRef>,
+        start: Span,
+    ) -> Result<Expr, ()> {
         self.expect(&TokenKind::DoubleColon, "`::` after class name")?;
         if matches!(self.peek().kind, TokenKind::Variable(_)) {
             let token = self.advance();
@@ -1445,6 +1523,7 @@ impl Parser {
             };
             return Ok(Expr::StaticProperty {
                 class_name,
+                type_args,
                 name,
                 span: start.merge(token.span),
             });
@@ -1475,6 +1554,7 @@ impl Parser {
         } else {
             Ok(Expr::StaticCall {
                 class_name,
+                type_args,
                 method,
                 args,
                 span: start.merge(close.span),
@@ -1522,6 +1602,7 @@ impl Parser {
                 self.advance();
                 let (raw_name, class_span) = self.parse_name()?;
                 let class_name = self.resolve_name(&raw_name, false).0;
+                let type_args = self.parse_type_arguments()?;
                 let (args, end_span) = if self.eat(&TokenKind::LParen) {
                     let mut args = Vec::new();
                     if !self.at(&TokenKind::RParen) {
@@ -1540,6 +1621,7 @@ impl Parser {
                 };
                 Ok(Expr::New {
                     class_name,
+                    type_args,
                     class_span,
                     args,
                     span: span.merge(end_span),
@@ -1560,23 +1642,18 @@ impl Parser {
                 }
                 .to_string();
                 self.advance();
-                self.parse_qualified_member(class_name, span)
+                self.parse_qualified_member(class_name, Vec::new(), span)
             }
             TokenKind::Ident(_) | TokenKind::Backslash | TokenKind::Namespace => {
                 let (name, _) = self.parse_name()?;
                 if self.at(&TokenKind::DoubleColon) {
                     let name = self.resolve_name(&name, false).0;
-                    return self.parse_qualified_member(name, span);
+                    return self.parse_qualified_member(name, Vec::new(), span);
                 }
-                let mut type_args = Vec::new();
-                if self.eat(&TokenKind::Lt) {
-                    loop {
-                        type_args.push(self.parse_type()?);
-                        if !self.eat(&TokenKind::Comma) {
-                            break;
-                        }
-                    }
-                    self.expect_type_close()?;
+                let type_args = self.parse_type_arguments()?;
+                if self.at(&TokenKind::DoubleColon) {
+                    let name = self.resolve_name(&name, false).0;
+                    return self.parse_qualified_member(name, type_args, span);
                 }
                 if self.at(&TokenKind::LParen) {
                     self.advance();
@@ -1866,6 +1943,21 @@ mod tests {
     }
 
     #[test]
+    fn instanceof_generic_arguments_preserve_comparisons_and_shifts() {
+        let p = ok("<?php echo $x instanceof C < (8 >> 1); echo $x instanceof Box<array<int>>;");
+        let Stmt::Echo(values, _) = &p.items[0] else {
+            panic!("expected echo")
+        };
+        assert!(matches!(&values[0], Expr::Binary { op: BinOp::Lt, lhs, .. }
+            if matches!(lhs.as_ref(), Expr::Instanceof { type_args, .. } if type_args.is_empty())));
+        let Stmt::Echo(values, _) = &p.items[1] else {
+            panic!("expected echo")
+        };
+        assert!(matches!(&values[0], Expr::Instanceof { type_args, .. }
+            if type_args == &[TypeRef::Array(Box::new(TypeRef::Int))]));
+    }
+
+    #[test]
     fn class_declaration_and_objects() {
         let p = ok("<?php
             class Counter {
@@ -1944,7 +2036,10 @@ mod tests {
         match &p.items[0] {
             Stmt::ClassDecl(c) => {
                 assert_eq!(c.name, "Dog");
-                assert_eq!(c.extends, Some("Animal".into()));
+                assert_eq!(
+                    c.extends.as_ref().map(|parent| parent.name.as_str()),
+                    Some("Animal")
+                );
                 match &c.members[0] {
                     ClassMember::Method(m) => {
                         assert_eq!(m.name, "speak");

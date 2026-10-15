@@ -1,6 +1,7 @@
-# Generic functions
+# Generics
 
-M5.1 adds native generic functions. Files keep the `.php` extension, but generic
+M5.1 adds native generic functions; M5.2 adds generic classes and interfaces.
+Files keep the `.php` extension, but generic
 syntax is a PXR extension: these files must be compiled with `pxr`, and do not
 parse in the PHP interpreter.
 
@@ -65,19 +66,75 @@ Direct and mutual recursion reuse registered specializations. To bound growing
 polymorphic recursion, compilation allows at most 64 specializations per generic
 function and 256 in one program; exceeding either emits `E0283`.
 
-Generic signatures are checked even when unused. Bodies are checked when
+Generic function signatures are checked even when unused. Bodies are checked when
 instantiated, and unused templates emit no native function. This is a template
 model: operations must be valid for each concrete instantiation; declared
 constraints are not implemented yet.
 
+## Generic classes and interfaces
+
+```php
+class Box<T> {
+    public T $value;
+    public function __construct(T $value) { $this->value = $value; }
+    public function get(): T { return $this->value; }
+}
+function wrap<T>(T $value): Box<T> { return new Box<T>($value); }
+function unwrap<T>(Box<T> $box): T { return $box->get(); }
+
+$number: Box<int> = new Box<int>(42);
+$word = wrap('hello');       // Box<string>
+echo unwrap($number);       // infers T = int from Box<int>
+```
+
+Class type arguments are explicit at construction and in annotations; `new
+Box(42)` is an error. Type parameters scope over fields, constructors, method
+signatures/bodies, and inheritance headers. Multiple parameters, nested generic
+types (`Box<Box<int>>`), recursive fields, array and mixed arguments, namespace
+aliases, and declaration modules are supported.
+
+Generic inheritance and interface contracts use ordinary nominal checking:
+
+```php
+interface Reader<T> { public function get(): T; }
+class ReadableBox<T> extends Box<T> implements Reader<T> {}
+class IntBox extends ReadableBox<int> {}
+```
+
+Function inference can extract arguments from instantiated generic classes or
+their generic ancestors/interfaces. Repeated evidence must agree; conflicting
+inherited instantiations do not select an arbitrary type. Distinct instantiations
+are invariant: `Box<int>` does not become `Box<float>`, `Box<mixed>`, or
+`Box<Parent>` through element coercion. An explicitly declared inheritance edge
+still permits the ordinary upcast.
+
+Each instantiation gets its own concrete fields, methods, class ID, and static
+storage. `Box<int>::method(...)`, `Box<int>::$property`, `self::`, `parent::`,
+virtual dispatch, visibility checks, and `instanceof Box<int>` use that concrete
+class. Objects retain shared identity; arrays copied into/out of fields retain
+value semantics. Native `__toString`, including direct typed object `echo` and
+`print`, uses runtime dispatch.
+
+Class specialization is demand-driven and cached. A generic function can request
+a new class through its inferred bindings; the analyzer completes the expanded
+class graph before accepting the program. All members of an instantiated class
+are checked, including methods that are never called. Uninstantiated class
+templates are parsed but not semantically checked or emitted. Duplicate class
+names are rejected even without instantiation. Class specialization has its own
+limits of 64 instantiations per template, 256 per program, and 16,384 bytes per
+expanded type name (`E0283`). The size limit also bounds exponentially growing
+type expressions. Finite self-references reuse the cached instance.
+
 ## Remaining M5 work
 
-Generic classes/types (`class Box<T>`, `new Box<int>(42)`), generic methods,
-constraints/traits, and omitted return annotations remain unsupported. They
-produce diagnostics; this slice does not claim to implement them. Return-type
-inference and generic types are subsequent M5 work. Async remains planned for
-M7 after the ownership work in M6.
+Methods may use their class's parameters. Methods declaring independent type
+parameters, constraints/traits, omitted return annotations, partial type
+argument lists, default type arguments, and constructor type-argument inference
+remain unsupported. They produce diagnostics. Async remains planned for M7
+after the ownership work in M6.
 
 Run [`../examples/generics.php`](../examples/generics.php) with
 `pxr run examples/generics.php` for recursion, forwarding, nested arrays,
 explicit/inferred calls, and mixed specialization.
+[`../examples/generic_classes.php`](../examples/generic_classes.php) demonstrates
+concrete boxes, function/class inference, nesting, arrays, and object identity.

@@ -19,6 +19,7 @@ use pxr_diag::{Diagnostic, Diagnostics, Span};
 use pxr_types::Ty;
 use std::collections::{HashMap, VecDeque};
 
+mod class_generics;
 mod generics;
 
 /// Aliases re-exported so downstream stages can refer to the operator enums
@@ -761,6 +762,8 @@ pub struct MethodInfo {
 }
 
 pub struct Analyzer {
+    class_expander: class_generics::ClassExpander,
+    validating_template: bool,
     php_interop: bool,
     diags: Diagnostics,
     /// lowercased name -> signature
@@ -850,17 +853,35 @@ fn uses_php(statement: &ast::Stmt) -> bool {
 }
 
 pub fn analyze(program: &ast::Program) -> (Option<TProgram>, Diagnostics) {
-    let mut a = Analyzer {
-        php_interop: program.items.iter().any(uses_php),
-        diags: Diagnostics::new(),
-        funcs: HashMap::new(),
-        generics: HashMap::new(),
-        specializations: HashMap::new(),
-        pending_specializations: VecDeque::new(),
-        classes: HashMap::new(),
-    };
-    let result = a.run(program);
-    (result, a.diags)
+    let mut class_expander = class_generics::ClassExpander::new(program);
+    loop {
+        let expanded = class_expander.program(program);
+        if class_expander.diags.has_errors() {
+            return (None, class_expander.diags);
+        }
+        let mut a = Analyzer {
+            class_expander,
+            validating_template: false,
+            php_interop: program.items.iter().any(uses_php),
+            diags: Diagnostics::new(),
+            funcs: HashMap::new(),
+            generics: HashMap::new(),
+            specializations: HashMap::new(),
+            pending_specializations: VecDeque::new(),
+            classes: HashMap::new(),
+        };
+        let result = a.run(&expanded);
+        if a.class_expander.diags.has_errors() {
+            return (None, a.class_expander.diags);
+        }
+        if !a.class_expander.has_pending() {
+            return (result, a.diags);
+        }
+        // A generic function can discover a class specialization through its
+        // inferred type bindings. Recheck against the expanded declaration graph;
+        // only diagnostics from the complete graph are externally visible.
+        class_expander = a.class_expander;
+    }
 }
 
 impl Analyzer {
@@ -1298,14 +1319,17 @@ impl Analyzer {
                     interfaces: c
                         .interfaces
                         .iter()
-                        .map(|(n, _)| n.to_ascii_lowercase())
+                        .map(|reference| reference.name.to_ascii_lowercase())
                         .collect(),
                     is_abstract: c.is_abstract,
                     class_id,
                     name: c.name.clone(),
                     name_span: c.name_span,
-                    parent: c.extends.as_ref().map(|s| s.to_ascii_lowercase()),
-                    parent_span: c.extends_span,
+                    parent: c
+                        .extends
+                        .as_ref()
+                        .map(|reference| reference.name.to_ascii_lowercase()),
+                    parent_span: c.extends.as_ref().map(|reference| reference.span),
                     properties: Vec::new(),
                     prop_indices: HashMap::new(),
                     methods: HashMap::new(),
@@ -1322,8 +1346,12 @@ impl Analyzer {
             let edges = c
                 .extends
                 .iter()
-                .map(|n| (n, c.extends_span.unwrap_or(c.name_span), false))
-                .chain(c.interfaces.iter().map(|(n, span)| (n, *span, true)));
+                .map(|reference| (&reference.name, reference.span, false))
+                .chain(
+                    c.interfaces
+                        .iter()
+                        .map(|reference| (&reference.name, reference.span, true)),
+                );
             for (name, span, want_interface) in edges {
                 let key = name.to_ascii_lowercase();
                 let Some(target) = self.classes.get(&key) else {
@@ -1874,6 +1902,7 @@ impl Analyzer {
                 .iter()
                 .map(|(name, _)| (name.clone(), Ty::Mixed))
                 .collect();
+            self.validating_template = !f.type_params.is_empty();
             let mut params = Vec::new();
             let mut param_names = Vec::new();
             for p in &f.params {
@@ -1927,6 +1956,7 @@ impl Analyzer {
                 }
             };
 
+            self.validating_template = false;
             if !f.type_params.is_empty() {
                 self.generics.insert(key, (**f).clone());
                 continue;
@@ -1951,6 +1981,23 @@ impl Analyzer {
 
     fn resolve_type_with(&mut self, t: &ast::TypeRef, bindings: &HashMap<String, Ty>) -> Ty {
         match t {
+            ast::TypeRef::EmptyElement => Ty::Null,
+            ast::TypeRef::Applied(..) => {
+                if self.validating_template {
+                    self.class_expander.validate_type(t);
+                    return Ty::Mixed;
+                }
+                let mut concrete = t.clone();
+                let bindings = bindings
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), class_generics::type_ref(ty)))
+                    .collect();
+                self.class_expander.rewrite_type(&mut concrete, &bindings);
+                match concrete {
+                    ast::TypeRef::Named(name) => Ty::Named(name),
+                    _ => Ty::Mixed,
+                }
+            }
             ast::TypeRef::Param(name, span) => bindings.get(name).cloned().unwrap_or_else(|| {
                 self.diags.emit(
                     Diagnostic::error(format!("unbound generic type parameter `{name}`"))
@@ -2004,6 +2051,14 @@ impl Analyzer {
         sig: &Signature,
         bindings: HashMap<String, Ty>,
     ) -> TFunc {
+        let mut declaration = f.clone();
+        let substitutions = bindings
+            .iter()
+            .map(|(name, ty)| (name.clone(), class_generics::type_ref(ty)))
+            .collect();
+        self.class_expander
+            .function(&mut declaration, &substitutions);
+        let f = &declaration;
         let mut ctx = FnCtx::new(sig.ret.clone(), false);
         ctx.type_bindings = bindings;
         for (name, ty) in sig.param_names.iter().zip(sig.params.iter()) {
@@ -3565,6 +3620,7 @@ impl Analyzer {
                 class_span,
                 args,
                 span,
+                ..
             } => {
                 let class = match self.classes.get(&class_name.to_ascii_lowercase()) {
                     Some(c) => c.clone(),
@@ -3699,6 +3755,7 @@ impl Analyzer {
                 class_name,
                 class_span,
                 span: _,
+                ..
             } => {
                 let t_expr = self.infer(expr, ctx)?;
                 let expr_ty = t_expr.ty();
@@ -3737,11 +3794,13 @@ impl Analyzer {
                 method,
                 args,
                 span,
+                ..
             } => self.qualified_call(class_name, method, args, *span, ctx),
             ast::Expr::StaticProperty {
                 class_name,
                 name,
                 span,
+                ..
             } => {
                 let (target, _) = self.static_property(class_name, name, *span, ctx)?;
                 let TTarget::Property {
@@ -5147,7 +5206,7 @@ pub fn mangle_fn(name: &str) -> String {
 pub fn mangle_method(class: &str, method: &str) -> String {
     format!(
         "pxr$m${}${}",
-        class.to_ascii_lowercase().replace('\\', "$"),
+        mangle_class_name(class),
         method.to_ascii_lowercase()
     )
 }
@@ -5155,9 +5214,20 @@ pub fn mangle_method(class: &str, method: &str) -> String {
 pub fn mangle_dispatcher(class: &str, method: &str) -> String {
     format!(
         "pxr$disp${}${}",
-        class.to_ascii_lowercase().replace('\\', "$"),
+        mangle_class_name(class),
         method.to_ascii_lowercase()
     )
+}
+
+fn mangle_class_name(class: &str) -> String {
+    if class.contains('<') {
+        format!(
+            "$generic${}",
+            generics::hex_name(&class.to_ascii_lowercase())
+        )
+    } else {
+        class.to_ascii_lowercase().replace('\\', "$")
+    }
 }
 
 #[cfg(test)]

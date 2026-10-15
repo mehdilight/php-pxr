@@ -257,12 +257,22 @@ impl Lowerer {
                 for e in exprs {
                     let v = self.lower_expr(e);
                     let ty = e.ty();
+                    let (ty, v) = if matches!(ty, Ty::Named(_)) {
+                        (Ty::Mixed, self.cast(v, &ty, &Ty::Mixed))
+                    } else {
+                        (ty, v)
+                    };
                     self.emit(Inst::Print { ty, src: v });
                 }
             }
             TStmt::Print(e) => {
                 let v = self.lower_expr(e);
                 let ty = e.ty();
+                let (ty, v) = if matches!(ty, Ty::Named(_)) {
+                    (Ty::Mixed, self.cast(v, &ty, &Ty::Mixed))
+                } else {
+                    (ty, v)
+                };
                 self.emit(Inst::Print { ty, src: v });
             }
             TStmt::Expr(e) => {

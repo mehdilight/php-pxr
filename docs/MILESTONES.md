@@ -582,7 +582,24 @@ implementation remains sequenced after M5/M6 in M7.
 See [`GENERICS.md`](GENERICS.md) and `examples/generics.php`. Generic syntax is a
 PXR extension in `.php` files and does not parse in PHP.
 
-**Remaining.** Generic classes/types and methods; constraints/traits;
+**Delivered (M5.2: generic classes and interfaces).**
+
+* `class Box<T>`, `new Box<int>(42)`, and `Box<T>` annotations with concrete
+  fields, constructors, methods, and separate static state per instantiation.
+* Generic inheritance/interfaces, virtual dispatch, visibility, typed
+  `instanceof`, nested types, recursive fields, namespaces, and module aliases.
+* Generic functions construct classes from inferred bindings and extract type
+  arguments from class/ancestor/interface patterns. Distinct instantiations are
+  invariant. Class expansion is cached and bounded, with no PHP dependency.
+* Fixed direct typed-object `echo`/`print` to use native magic stringification
+  instead of silently emitting nothing.
+* Nine additional CLI tests cover execution, inference, inheritance, static
+  state, recursive/multiple parameters, mixed/empty arrays, reuse, diagnostics,
+  expansion limits, and object printing. The suite now has 116 CLI tests plus
+  44 unit tests (160 total), including a parser regression for `instanceof`
+  followed by comparison/shift expressions.
+
+**Remaining.** Independently generic methods; constraints/traits;
 whole-function return-type inference. M5 is not complete.
 
 ## ⛔ M6 — Ownership & memory safety

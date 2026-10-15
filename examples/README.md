@@ -24,6 +24,7 @@ Run any of these with `pxr run <file>`, or from a release build:
 | `nulls.php` | Boxed nulls, predicates, conversions, strict matching, lazy coalescing | ✅ |
 | `narrowing.php` | Scalar guards, early returns, short-circuiting, guarded mixed mutation | ✅ |
 | `generics.php` | Generic functions, explicit/inferred calls, native specialization, recursion | ❌ PXR generic syntax |
+| `generic_classes.php` | Generic classes, function/class inference, nested types, array copies, identity | ❌ PXR generic syntax |
 
 `compat.php` and `quicksort.php` are compatibility proofs: they compile with
 `pxr` and run under `php`, and both produce the same bytes.

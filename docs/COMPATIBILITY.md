@@ -281,12 +281,17 @@ compiled subset. PHP boundaries handle broader language/library behavior but
 reject resources, references, callbacks, and native objects crossing the wire.
 See [`MIXED.md`](MIXED.md).
 
-**Generic functions (PXR extension).** `function identity<T>(T $value): T`
+**Generics (PXR extension).** `function identity<T>(T $value): T`
 supports explicit `identity<int>(42)` and inferred `identity(42)` calls, with
 concrete native specialization. Namespaces and compile-time modules work as for
 ordinary functions. Generic syntax stays in `.php` files but is not valid PHP.
-Bodies are checked per instantiation; signatures are always checked. Generic
-classes/methods, constraints, and return-type inference remain unsupported.
+Function bodies are checked per instantiation; function signatures are always
+checked. Generic classes/interfaces support `class Box<T>`, `new Box<int>(42)`,
+typed fields/methods, inheritance, separate static state, and `instanceof Box<int>`.
+Class templates are checked when instantiated; type arguments are explicit at
+construction. Functions can infer arguments through generic class/interface
+patterns. Independently generic methods, constraints, and return-type inference
+remain unsupported.
 Scalar widening does not convert `array<int>` storage to `array<float>`; such
 calls fail at compile time. See [`GENERICS.md`](GENERICS.md).
 

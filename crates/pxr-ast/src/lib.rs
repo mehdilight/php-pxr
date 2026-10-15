@@ -231,6 +231,7 @@ pub enum LValue {
     },
     StaticProperty {
         class_name: String,
+        type_args: Vec<TypeRef>,
         name: String,
         span: Span,
     },
@@ -290,15 +291,22 @@ pub enum Visibility {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClassDecl {
+    pub type_params: Vec<(String, Span)>,
     pub is_interface: bool,
     /// Implemented interfaces, or extended interfaces for an interface declaration.
-    pub interfaces: Vec<(String, Span)>,
+    pub interfaces: Vec<ClassRef>,
     pub is_abstract: bool,
     pub name: String,
     pub name_span: Span,
-    pub extends: Option<String>,
-    pub extends_span: Option<Span>,
+    pub extends: Option<ClassRef>,
     pub members: Vec<ClassMember>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClassRef {
+    pub name: String,
+    pub type_args: Vec<TypeRef>,
     pub span: Span,
 }
 
@@ -335,8 +343,11 @@ pub struct MethodDecl {
 /// A syntactic type reference, before resolution.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeRef {
-    /// A lexically scoped generic function parameter.
+    /// A lexically scoped generic parameter.
     Param(String, Span),
+    Applied(String, Vec<TypeRef>, Span),
+    /// Internal element marker retained when specializing an inferred empty array.
+    EmptyElement,
     Mixed,
     Int,
     Float,
@@ -353,7 +364,7 @@ pub enum TypeRef {
 impl TypeRef {
     pub fn span(&self) -> Span {
         match self {
-            TypeRef::Span(s) | TypeRef::Param(_, s) => *s,
+            TypeRef::Span(s) | TypeRef::Param(_, s) | TypeRef::Applied(_, _, s) => *s,
             _ => Span::synthetic(),
         }
     }
@@ -493,6 +504,7 @@ pub enum Expr {
     },
     New {
         class_name: String,
+        type_args: Vec<TypeRef>,
         class_span: Span,
         args: Vec<Expr>,
         span: Span,
@@ -500,16 +512,19 @@ pub enum Expr {
     Instanceof {
         expr: Box<Expr>,
         class_name: String,
+        type_args: Vec<TypeRef>,
         class_span: Span,
         span: Span,
     },
     StaticProperty {
         class_name: String,
+        type_args: Vec<TypeRef>,
         name: String,
         span: Span,
     },
     StaticCall {
         class_name: String,
+        type_args: Vec<TypeRef>,
         method: String,
         args: Vec<Expr>,
         span: Span,

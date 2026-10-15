@@ -42,7 +42,9 @@ Scalar widening does not widen array elements: `array<int>` cannot be used as
 ```
 program   := topstmt*
 topstmt   := class_decl | fn | stmt
-class_decl:= 'class' NAME '{' member* '}'
+class_decl:= 'class' NAME type_params? ('extends' class_ref)? ('implements' class_refs)? '{' member* '}'
+class_ref := NAME type_args?
+class_refs := class_ref (',' class_ref)*
 member    := prop_decl | method_decl
 prop_decl := visibility type VARIABLE ('=' expr)? ';'
 method_decl := visibility 'function' NAME '(' params? ')' (':' type)? block
@@ -52,7 +54,7 @@ type_params := '<' NAME (',' NAME)* '>'
 type_args := '<' type (',' type)* '>'
 params    := param (',' param)*
 param     := type VARIABLE
-type      := 'int' | 'float' | 'string' | 'bool' | 'void' | 'mixed' | 'array' '<' type '>' | NAME
+type      := 'int' | 'float' | 'string' | 'bool' | 'void' | 'mixed' | 'array' '<' type '>' | NAME type_args?
 block     := '{' stmt* '}'
 
 stmt      := 'echo' expr (',' expr)* ';'
@@ -103,7 +105,7 @@ postfix   := postfix '->' NAME '(' (expr (',' expr)*)? ')'  // method call
            | primary
 primary   := INT | FLOAT | STRING | INTERP_STRING | 'true' | 'false' | 'null'
            | VARIABLE
-           | 'new' NAME ('(' (expr (',' expr)*)? ')')?
+           | 'new' class_ref ('(' (expr (',' expr)*)? ')')?
            | '[' (array_item (',' array_item)*)? ','? ']'
            | 'array' '(' ... ')'
            | VARIABLE '(' (expr (',' expr)*)? ')' | NAME type_args? '(' (expr (',' expr)*)? ')'
@@ -144,8 +146,10 @@ deliberately does **not** allow assignment expressions (so `$a = $b = 1` and
   usable in local and nested array annotations. Each concrete instantiation is
   checked and specialized before IR generation; unused bodies are not checked.
   Inference requires exact agreement for repeated parameters and does not use
-  the expected return type. Generic classes/methods, constraints, and return-type
-  inference remain unsupported. See [`GENERICS.md`](GENERICS.md).
+  the expected return type. Generic classes/interfaces support concrete fields,
+  methods, inheritance, static state, and `instanceof Box<int>`. Class arguments
+  must be explicit at construction. Independently generic methods, constraints,
+  and return-type inference remain unsupported. See [`GENERICS.md`](GENERICS.md).
 
 The remaining top‑level statements (everything that is not a function
 declaration) become the program entry point.
@@ -396,7 +400,7 @@ are `W020x`.
 | `E0275` | Invalid `__toString` signature |
 | `E0280` | Invalid generic type arguments or unbound type parameter |
 | `E0281` | Missing or conflicting generic inference |
-| `E0283` | Generic specialization limit exceeded |
+| `E0283` | Generic function or class specialization limit exceeded |
 | `W0202` | `return` with a value at top level is ignored |
 
 ## Classes, Inheritance & Polymorphism

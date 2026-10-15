@@ -6,6 +6,9 @@ fn pattern_is_bound(pattern: &ast::TypeRef, bindings: &HashMap<String, Ty>) -> b
     match pattern {
         ast::TypeRef::Param(name, _) => bindings.contains_key(name),
         ast::TypeRef::Array(element) => pattern_is_bound(element, bindings),
+        ast::TypeRef::Applied(_, args, _) => args
+            .iter()
+            .all(|argument| pattern_is_bound(argument, bindings)),
         _ => true,
     }
 }
@@ -14,6 +17,8 @@ fn infer_bindings(
     pattern: &ast::TypeRef,
     actual: &Ty,
     bindings: &mut HashMap<String, Ty>,
+    classes: &class_generics::ClassExpander,
+    class_infos: &HashMap<String, ClassInfo>,
 ) -> Result<(), String> {
     match pattern {
         ast::TypeRef::Param(name, _) => {
@@ -31,7 +36,40 @@ fn infer_bindings(
             };
             // An empty array contains no evidence for an element parameter.
             if **actual != Ty::Null {
-                infer_bindings(element, actual, bindings)?;
+                infer_bindings(element, actual, bindings, classes, class_infos)?;
+            }
+        }
+        ast::TypeRef::Applied(base, patterns, _) => {
+            let Ty::Named(name) = actual else {
+                return Err(format!("expected `{base}<...>`, found `{actual}`"));
+            };
+            let mut pending = vec![name.to_ascii_lowercase()];
+            let mut visited = std::collections::HashSet::new();
+            let mut found = false;
+            while let Some(name) = pending.pop() {
+                if !visited.insert(name.clone()) {
+                    continue;
+                }
+                if let Some(arguments) = classes.arguments(&name, base) {
+                    found = true;
+                    for (pattern, argument) in patterns.iter().zip(arguments) {
+                        infer_bindings(
+                            pattern,
+                            &class_generics::concrete_type(argument),
+                            bindings,
+                            classes,
+                            class_infos,
+                        )?;
+                    }
+                }
+                if let Some(info) = class_infos.get(&name) {
+                    pending.extend(info.parent.iter().chain(&info.interfaces).cloned());
+                }
+            }
+            if !found {
+                return Err(format!(
+                    "expected an instance of `{base}<...>`, found `{actual}`"
+                ));
             }
         }
         _ => {}
@@ -53,7 +91,7 @@ fn encode_type(ty: &Ty) -> String {
     }
 }
 
-fn hex_name(name: &str) -> String {
+pub(super) fn hex_name(name: &str) -> String {
     name.as_bytes()
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -135,7 +173,13 @@ impl Analyzer {
                 return None;
             }
             if type_args.is_empty() {
-                if let Err(message) = infer_bindings(pattern, &value.ty(), &mut bindings) {
+                if let Err(message) = infer_bindings(
+                    pattern,
+                    &value.ty(),
+                    &mut bindings,
+                    &self.class_expander,
+                    &self.classes,
+                ) {
                     self.diags.emit(
                         Diagnostic::error(format!(
                             "cannot infer `{}`: {message}",

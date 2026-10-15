@@ -413,7 +413,6 @@ fn generic_invalid_programs_fail_with_diagnostics() {
             "function f<T>(T $x): T {return $x;} function g(T $x): int {return 1;}",
             "E0205",
         ),
-        ("classes_pending", "class Box<T> {}", "E0100"),
         (
             "methods_pending",
             "class Box {public function get<T>(T $x): T {return $x;}}",
@@ -468,6 +467,278 @@ fn generic_polymorphic_recursion_is_bounded() {
     let r = run_ok(&["check", f.to_str().unwrap()]);
     assert_eq!(r.code, 1, "{}", r.stderr);
     assert!(r.stderr.contains("E0283"), "{}", r.stderr);
+}
+
+#[test]
+fn generic_classes_run_and_compose_with_function_inference() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "generic_classes",
+        include_str!("../../../examples/generic_classes.php"),
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "42:hello\n7\n1:99\n7\n1:\n");
+}
+
+#[test]
+fn generic_class_static_state_dispatch_and_interfaces() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "generic_class_dispatch",
+        r#"<?php
+        interface Reader<T> { public function get(): T; }
+        class Base<T> implements Reader<T> {
+            protected T $value;
+            public static int $calls = 0;
+            public function __construct(T $value) { $this->value = $value; }
+            public function get(): T { self::$calls += 1; return $this->value; }
+            public static function count(): int { return self::$calls; }
+        }
+        class Child<T> extends Base<T> {
+            public function get(): T { return parent::get(); }
+        }
+        class Number extends Child<int> {}
+        function read<T>(Reader<T> $reader): T { return $reader->get(); }
+        $number = new Number(7);
+        $word = new Child<string>('ok');
+        echo read($number), ':', $word->get(), "\n";
+        Base<int>::$calls += 2;
+        echo Base<int>::count(), ':', Base<string>::count(), "\n";
+        echo ($number instanceof Base<int>), ':', ($number instanceof Reader<int>), ':', ($number instanceof Reader<string>), "\n";
+    "#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "7:ok\n3:1\n1:1:\n");
+}
+
+#[test]
+fn generic_class_aliases_and_nominal_type_arguments() {
+    if !have_cc() {
+        return;
+    }
+    let module = temp_php(
+        "generic_class_module",
+        r#"<?php
+        namespace Library;
+        class Box<T> {
+            public T $value;
+            public function __construct(T $value) { $this->value = $value; }
+            public function get(): T { return $this->value; }
+        }
+    "#,
+    );
+    let source = format!(
+        r#"<?php
+        namespace App;
+        require '{}';
+        use Library\Box as Container;
+        class Item {{ public string $label = 'item'; }}
+        function wrap<T>(T $value): Container<T> {{ return new Container<T>($value); }}
+        function unwrap<T>(Container<T> $box): T {{ return $box->get(); }}
+        $box: Container<Item> = wrap(new Item());
+        $alias = unwrap($box);
+        $alias->label = 'shared';
+        echo $box->get()->label, "\n";
+        $same: \Library\Box<Item> = new Container<item>(new Item());
+        echo unwrap($same)->label, "\n";
+    "#,
+        module.display()
+    );
+    let f = temp_php("generic_class_aliases", &source);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "shared\nitem\n");
+}
+
+#[test]
+fn generic_classes_mixed_and_empty_array_specializations() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "generic_class_mixed",
+        r#"<?php
+        class Box<T> {
+            public T $value;
+            public function __construct(T $value) { $this->value = $value; }
+            public function get(): T { return $this->value; }
+            public function __toString(): string { return strval($this->value); }
+        }
+        function wrap<T>(T $value): Box<T> { return new Box<T>($value); }
+        function unwrap<T>(Box<T> $box): T { return $box->get(); }
+        $empty = wrap([]);
+        echo count(unwrap($empty)), "\n";
+        $box = new Box<mixed>([1, 'two']);
+        $copy = $box->get();
+        if (is_array($copy)) { $copy[0] = 99; }
+        $original = $box->get();
+        if (is_array($original)) { echo $original[0], ':', $original[1], "\n"; }
+        echo wrap(42), ':', wrap('ok'), "\n";
+        print wrap('print');
+        echo "\n";
+    "#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "0\n1:two\n42:ok\nprint\n");
+}
+
+#[test]
+fn generic_class_specializations_are_reused_and_templates_are_lazy() {
+    let f = temp_php(
+        "generic_class_ir",
+        r#"<?php
+        class Box<T> { public function get(T $value): T { return $value; } }
+        class Unused<T> { public function invalid(): T { return $undefined; } }
+        function unused<U>(U $value): U { return new Box<void>(); }
+        $one = new Box<int>();
+        $two = new box<int>();
+        echo $one->get(1), $two->get(2);
+    "#,
+    );
+    let r = run_ok(&["emit-ir", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(
+        r.stdout
+            .lines()
+            .filter(|line| line.starts_with("func pxr$m$"))
+            .count(),
+        1,
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn generic_class_invalid_programs_fail_loudly() {
+    let cases = [
+        ("bare_new", "class Box<T> {} new Box();", "E0280"),
+        ("bare_type", "class Box<T> {} function f(Box $box): void {}", "E0280"),
+        ("arity", "class Box<T> {} new Box<int,string>();", "E0280"),
+        ("ordinary", "class Box {} new Box<int>();", "E0280"),
+        ("void", "class Box<T> {} new Box<void>();", "E0280"),
+        ("void_array", "class Box<T> {} new Box<array<void>>();", "E0205"),
+        ("unknown", "class Box<T> {} new Box<Missing>();", "E0205"),
+        ("duplicate", "class Box<T,T> {}", "E0100"),
+        ("duplicate_class", "class Box<T> {} class box {}", "E0201"),
+        ("out_of_scope", "class Box<T> {} function f(T $value): int {return 1;}", "E0205"),
+        ("invariant", "class Box<T> {} function f(Box<float> $box): void {} f(new Box<int>());", "E0231"),
+        ("constructor", "class Box<T> {public function __construct(T $value) {}} new Box<int>('s');", "E0208"),
+        ("field", "class Box<T> {public T $value;} $b = new Box<int>(); $b->value = 's';", "E0212"),
+        ("method", "class Box<T> {public function set(T $value): void {}} $b = new Box<int>(); $b->set('s');", "E0208"),
+        ("body", "class Box<T> {public function get(): T {return 's';}} new Box<int>();", "E0215"),
+        ("override", "class Box<T> {public function get(): T {return 1;}} class Child extends Box<int> {public function get(): string {return 's';}}", "E0208"),
+        ("template_signature", "class Box<T> {} function f<U>(Box<U,U> $box): U {return 1;}", "E0280"),
+        ("cycle", "class A<T> extends B<T> {} class B<T> extends A<T> {} new A<int>();", "E0201"),
+    ];
+    for (name, source, code) in cases {
+        let f = temp_php(
+            &format!("generic_class_error_{name}"),
+            &format!("<?php {source}"),
+        );
+        let r = run_ok(&["check", f.to_str().unwrap()]);
+        assert_eq!(r.code, 1, "{name}: {}", r.stderr);
+        assert!(
+            r.stderr.contains(code),
+            "{name}: expected {code}: {}",
+            r.stderr
+        );
+    }
+}
+
+#[test]
+fn generic_class_expansion_is_bounded() {
+    let f = temp_php(
+        "generic_class_limit",
+        r#"<?php
+        class Grow<T> { public Grow<array<T>> $next; }
+        new Grow<int>();
+    "#,
+    );
+    let r = run_ok(&["check", f.to_str().unwrap()]);
+    assert_eq!(r.code, 1, "{}", r.stderr);
+    assert!(r.stderr.contains("E0283"), "{}", r.stderr);
+    let f = temp_php(
+        "generic_class_exponential_limit",
+        r#"<?php
+        class Pair<A,B> {}
+        class Grow<T> { public Grow<Pair<T,T>> $next; }
+        new Grow<int>();
+    "#,
+    );
+    let r = run_ok(&["check", f.to_str().unwrap()]);
+    assert_eq!(r.code, 1, "{}", r.stderr);
+    assert!(r.stderr.contains("E0283"), "{}", r.stderr);
+    assert!(r.stderr.contains("16384-byte"), "{}", r.stderr);
+}
+
+#[test]
+fn generic_class_multiple_parameters_and_recursive_fields() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "generic_class_recursive",
+        r#"<?php
+        class Pair<A,B> {
+            public A $first;
+            public B $second;
+            public function __construct(A $first, B $second) {
+                $this->first = $first; $this->second = $second;
+            }
+        }
+        class Node<T> {
+            public T $value;
+            public Node<T> $next;
+            public function __construct(T $value) { $this->value = $value; }
+            public function link(Node<T> $next): void { $this->next = $next; }
+        }
+        function second<A,B>(Pair<A,B> $pair): B { return $pair->second; }
+        $pair = new Pair<int,string>(42, 'ok');
+        $head = new Node<array<int>>([1]);
+        $tail = new Node<array<int>>([2]);
+        $head->link($tail);
+        echo second($pair), ':', $head->next->value[0], "\n";
+    "#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "ok:2\n");
+}
+
+#[test]
+fn native_typed_object_echo_and_print_use_magic_stringification() {
+    assert_matches_php(
+        "typed_object_print",
+        r#"<?php
+        class BaseText { public function __toString(): string { return 'base'; } }
+        class ChildText extends BaseText { public function __toString(): string { return 'child'; } }
+        function value(): BaseText { return new ChildText(); }
+        echo value(), ':';
+        print value();
+        echo "\n";
+    "#,
+    );
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "typed_object_no_string",
+        "<?php class Item {} echo new Item();",
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 255, "{}", r.stderr);
+    assert!(
+        r.stderr.contains("could not be converted to string"),
+        "{}",
+        r.stderr
+    );
 }
 
 #[test]
