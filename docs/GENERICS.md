@@ -1,6 +1,7 @@
 # Generics
 
-M5.1 adds native generic functions; M5.2 adds generic classes and interfaces.
+M5.1 adds native generic functions; M5.2 adds generic classes and interfaces;
+M5.3 adds independent generic methods.
 Files keep the `.php` extension, but generic
 syntax is a PXR extension: these files must be compiled with `pxr`, and do not
 parse in the PHP interpreter.
@@ -117,18 +118,59 @@ value semantics. Native `__toString`, including direct typed object `echo` and
 
 Class specialization is demand-driven and cached. A generic function can request
 a new class through its inferred bindings; the analyzer completes the expanded
-class graph before accepting the program. All members of an instantiated class
-are checked, including methods that are never called. Uninstantiated class
+class graph before accepting the program. Non-generic members of an instantiated
+class are checked even when never called. Generic method signatures are checked
+with the class; their bodies are checked when specialized. Uninstantiated class
 templates are parsed but not semantically checked or emitted. Duplicate class
 names are rejected even without instantiation. Class specialization has its own
 limits of 64 instantiations per template, 256 per program, and 16,384 bytes per
 expanded type name (`E0283`). The size limit also bounds exponentially growing
 type expressions. Finite self-references reuse the cached instance.
 
+## Independent generic methods
+
+Methods can declare parameters independently of their class:
+
+```php
+class Factory<T> {
+    public function boxed<U>(U $value): Box<U> { return new Box<U>($value); }
+    public static function first<U>(array<U> $values): U { return $values[0]; }
+}
+$factory = new Factory<int>();
+$text = $factory->boxed<string>('hello');  // explicit method argument
+$number = $factory->boxed(42);             // inferred U = int
+echo Factory<int>::first<string>(['ok']);  // class and method arguments differ
+```
+
+`$this->method<U>(...)`, `self::method<U>(...)`, and `parent::method<U>(...)`
+are supported. Normal receiver/argument evaluation order, visibility, static
+access rules, array value semantics, object identity, and recursive calls apply.
+Function-style inference can extract method arguments through `array<U>` and
+generic class/interface patterns. Namespace aliases and native declaration
+modules work as for ordinary methods.
+
+Interfaces and abstract classes can declare generic methods. Overrides must
+preserve the number and positions of type parameters and the signature shape,
+including the return annotation; parameter names can differ (`<U>` and `<V>`).
+Calls through base classes/interfaces specialize potential implementations and
+use the existing concrete virtual dispatch. Newly discovered classes acquire
+previously requested specializations before the program is accepted. Qualified
+parent calls select the parent implementation directly.
+
+Unused method bodies emit no code and are not checked. Repeated calls reuse
+their specialization. Body diagnostics identify `Class::method<types>`. Method
+expansion permits 64 instantiations per declared method, 256 generated method
+declarations per program, and 16,384 bytes per displayed specialization
+(`E0283`); virtual/interface calls can materialize multiple implementations.
+The generic call-checking budget also applies.
+
+Method type parameters cannot shadow class parameters. Constructors and magic
+methods cannot declare independent type parameters (`E0282`), though their
+signatures may use class parameters as before.
+
 ## Remaining M5 work
 
-Methods may use their class's parameters. Methods declaring independent type
-parameters, constraints/traits, omitted return annotations, partial type
+Constraints/traits, omitted return annotations, partial type
 argument lists, default type arguments, and constructor type-argument inference
 remain unsupported. They produce diagnostics. Async remains planned for M7
 after the ownership work in M6.
@@ -138,3 +180,5 @@ Run [`../examples/generics.php`](../examples/generics.php) with
 explicit/inferred calls, and mixed specialization.
 [`../examples/generic_classes.php`](../examples/generic_classes.php) demonstrates
 concrete boxes, function/class inference, nesting, arrays, and object identity.
+[`../examples/generic_methods.php`](../examples/generic_methods.php) demonstrates
+independent method parameters, static calls, parent calls, and interface dispatch.

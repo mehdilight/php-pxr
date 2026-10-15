@@ -329,6 +329,7 @@ pub struct PropertyDecl {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MethodDecl {
+    pub type_params: Vec<(String, Span)>,
     pub is_static: bool,
     pub is_abstract: bool,
     pub visibility: Visibility,
@@ -498,6 +499,7 @@ pub enum Expr {
     MethodCall {
         base: Box<Expr>,
         name: String,
+        type_args: Vec<TypeRef>,
         name_span: Span,
         args: Vec<Expr>,
         span: Span,
@@ -526,11 +528,13 @@ pub enum Expr {
         class_name: String,
         type_args: Vec<TypeRef>,
         method: String,
+        method_type_args: Vec<TypeRef>,
         args: Vec<Expr>,
         span: Span,
     },
     ParentMethodCall {
         method: String,
+        type_args: Vec<TypeRef>,
         method_span: Span,
         args: Vec<Expr>,
         span: Span,

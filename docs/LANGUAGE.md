@@ -47,7 +47,7 @@ class_ref := NAME type_args?
 class_refs := class_ref (',' class_ref)*
 member    := prop_decl | method_decl
 prop_decl := visibility type VARIABLE ('=' expr)? ';'
-method_decl := visibility 'function' NAME '(' params? ')' (':' type)? block
+method_decl := visibility 'function' NAME type_params? '(' params? ')' (':' type)? block
 visibility:= 'public' | 'protected' | 'private'
 fn        := 'function' NAME type_params? '(' params? ')' (':' type)? block
 type_params := '<' NAME (',' NAME)* '>'
@@ -99,7 +99,7 @@ concat    := additive ('.' additive)*
 additive  := multiplicative (('+' | '-') multiplicative)*
 multiplicative := unary (('*' | '/' | '%') unary)*
 unary     := ('!' | '-' | '~') unary | postfix
-postfix   := postfix '->' NAME '(' (expr (',' expr)*)? ')'  // method call
+postfix   := postfix '->' NAME type_args? '(' (expr (',' expr)*)? ')'  // method call
            | postfix '->' NAME                              // property access
            | postfix '[' expr ']' | postfix '[' ']'
            | primary
@@ -148,8 +148,11 @@ deliberately does **not** allow assignment expressions (so `$a = $b = 1` and
   Inference requires exact agreement for repeated parameters and does not use
   the expected return type. Generic classes/interfaces support concrete fields,
   methods, inheritance, static state, and `instanceof Box<int>`. Class arguments
-  must be explicit at construction. Independently generic methods, constraints,
-  and return-type inference remain unsupported. See [`GENERICS.md`](GENERICS.md).
+  must be explicit at construction. Methods may declare independent parameters
+  (`function map<U>(U $value): U`) with explicit/inferred instance/static calls,
+  interface/abstract contracts, and virtual dispatch. Overrides preserve signature
+  shape up to parameter renaming. Constraints and return-type inference remain
+  unsupported. See [`GENERICS.md`](GENERICS.md).
 
 The remaining top‑level statements (everything that is not a function
 declaration) become the program entry point.
@@ -400,7 +403,8 @@ are `W020x`.
 | `E0275` | Invalid `__toString` signature |
 | `E0280` | Invalid generic type arguments or unbound type parameter |
 | `E0281` | Missing or conflicting generic inference |
-| `E0283` | Generic function or class specialization limit exceeded |
+| `E0282` | Incompatible generic method contract or generic constructor/magic method |
+| `E0283` | Generic function, class, or method expansion limit exceeded |
 | `W0202` | `return` with a value at top level is ignored |
 
 ## Classes, Inheritance & Polymorphism

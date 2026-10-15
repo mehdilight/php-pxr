@@ -50,7 +50,7 @@ today     typed scalars, arrays, control flow, LLVM backend, tests, benchmarks
   ├─ M2  owned strings + a real standard library          ✅ done
   ├─ M3  classes, namespaces, compile-time modules        ✅ done
   ├─ M4  mixed values, narrowing, PHP interop, report          ✅ done
-  ├─ M5  generics + inference                             🚧 functions + types delivered
+  ├─ M5  generics + inference                             🚧 functions + types + methods delivered
   ├─ M6  ownership & borrowing, no leaks                  (memory safety)
   ├─ M7  async/await + structured tasks, then threads     (I/O + parallelism)
   ├─ M8  C interoperability (extern "C", FFI)             (systems access)

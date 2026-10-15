@@ -22,7 +22,8 @@ worker when they execute.
 > operators, runtime PHP include/call boundaries, and a migration report.
 > `examples/migration/main.php` runs a typed native entry point with untyped PHP.
 > M5 is in progress: generic functions, classes, and interfaces now support
-> native specialization. Generic methods, constraints, and return inference follow.
+> native specialization, including independent generic methods. Constraints and
+> return inference follow.
 > See [`docs/GENERICS.md`](docs/GENERICS.md), [`docs/MILESTONES.md`](docs/MILESTONES.md),
 > [`docs/MIXED.md`](docs/MIXED.md), and [`docs/INTEROP.md`](docs/INTEROP.md).
 
@@ -198,7 +199,7 @@ automatically when no C compiler is available.
 Tracked honestly in [`docs/ROADMAP.md`](docs/ROADMAP.md). The larger items:
 keyed `foreach`, `echo` of arrays, nested array assignment, nullable
 annotations, overflow promotion for concrete `int` arithmetic, late static binding (`static::`),
-independently generic methods, constraints and return-type inference,
+generic constraints and return-type inference,
 ownership & borrowing, the complex string‑interpolation forms (`"$a[0]"`,
 `"{$expr}"`, `"${name}"`, `"$obj->p"`; the simple `"$name"` / `"{$name}"` work),
 native exceptions, C interop (`extern`), async/await and concurrency

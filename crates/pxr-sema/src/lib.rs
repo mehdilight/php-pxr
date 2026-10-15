@@ -1212,6 +1212,9 @@ impl Analyzer {
         for class_key in self.classes.keys().cloned().collect::<Vec<_>>() {
             let class = self.classes.get(&class_key).unwrap().clone();
             for method in class.methods.values() {
+                if !method.ast_method.type_params.is_empty() {
+                    continue;
+                }
                 if method.declaring_class.eq_ignore_ascii_case(&class.name) {
                     if let Some(tf) = self.analyze_method(&class.name, method) {
                         funcs.push(tf);
@@ -1224,6 +1227,9 @@ impl Analyzer {
         for class_key in self.classes.keys().cloned().collect::<Vec<_>>() {
             let class = self.classes.get(&class_key).unwrap().clone();
             for method in class.methods.values() {
+                if !method.ast_method.type_params.is_empty() {
+                    continue;
+                }
                 if !method.ast_method.is_static
                     && (method.name != "__construct" || method.ast_method.is_abstract)
                     && self.method_has_overrides(&class.name, &method.name)
@@ -1617,11 +1623,43 @@ impl Analyzer {
                             );
                         }
                         let mkey = m.name.to_ascii_lowercase();
+                        if !m.type_params.is_empty() && mkey.starts_with("__") {
+                            self.diags.emit(
+                                Diagnostic::error(
+                                    "magic methods and constructors cannot declare type parameters",
+                                )
+                                .with_code("E0282")
+                                .with_span(m.name_span),
+                            );
+                        }
+                        self.validating_template = !m.type_params.is_empty();
+                        let bindings: HashMap<_, _> = m
+                            .type_params
+                            .iter()
+                            .map(|(name, _)| (name.clone(), Ty::Mixed))
+                            .collect();
                         let mut params = Vec::new();
                         let mut param_names = Vec::new();
                         for param in &m.params {
+                            if param_names.contains(&param.name) {
+                                self.diags.emit(
+                                    Diagnostic::error(format!(
+                                        "duplicate parameter `${}`",
+                                        param.name
+                                    ))
+                                    .with_code("E0201")
+                                    .with_span(param.name_span),
+                                );
+                            }
+                            if param.name == "this" {
+                                self.diags.emit(
+                                    Diagnostic::error("a method parameter cannot replace `$this`")
+                                        .with_code("E0267")
+                                        .with_span(param.name_span),
+                                );
+                            }
                             let pty = match &param.ty {
-                                Some(t) => self.resolve_type(t),
+                                Some(t) => self.resolve_type_with(t, &bindings),
                                 None => {
                                     self.diags.emit(
                                         Diagnostic::error(format!(
@@ -1647,7 +1685,7 @@ impl Analyzer {
 
                         let ret = if mkey == "__construct" {
                             if let Some(t) = &m.ret {
-                                let r = self.resolve_type(t);
+                                let r = self.resolve_type_with(t, &bindings);
                                 if r != Ty::Void {
                                     self.diags.emit(
                                         Diagnostic::error(
@@ -1661,7 +1699,7 @@ impl Analyzer {
                             Ty::Void
                         } else {
                             match &m.ret {
-                                Some(t) => self.resolve_type(t),
+                                Some(t) => self.resolve_type_with(t, &bindings),
                                 None => {
                                     self.diags.emit(
                                         Diagnostic::error(format!(
@@ -1677,6 +1715,7 @@ impl Analyzer {
                             }
                         };
 
+                        self.validating_template = false;
                         if let Some(existing) = methods.get(&mkey) {
                             if existing.declaring_class.eq_ignore_ascii_case(&c.name) {
                                 self.diags.emit(
@@ -1708,6 +1747,12 @@ impl Analyzer {
                                 );
                             }
                             // Overriding inherited method
+                            if (!m.type_params.is_empty()
+                                || !existing.ast_method.type_params.is_empty())
+                                && !self.generic_method_compatible(m, &existing.ast_method)
+                            {
+                                self.diags.emit(Diagnostic::error(format!("generic method `{}` must preserve its inherited type-parameter contract", m.name)).with_code("E0282").with_span(m.name_span));
+                            }
                             if existing.visibility == ast::Visibility::Public
                                 && m.visibility != ast::Visibility::Public
                             {
@@ -1813,6 +1858,15 @@ impl Analyzer {
                 .collect();
             for (key, requirement) in contracts {
                 if let Some(implementation) = methods.get(&key) {
+                    if (!implementation.ast_method.type_params.is_empty()
+                        || !requirement.ast_method.type_params.is_empty())
+                        && !self.generic_method_compatible(
+                            &implementation.ast_method,
+                            &requirement.ast_method,
+                        )
+                    {
+                        self.diags.emit(Diagnostic::error(format!("generic method `{}` is incompatible with its interface type-parameter contract", implementation.name)).with_code("E0282").with_span(implementation.name_span));
+                    }
                     if implementation.ast_method.is_static != requirement.ast_method.is_static {
                         self.diags.emit(
                             Diagnostic::error(
@@ -1871,6 +1925,30 @@ impl Analyzer {
                 info.prop_indices = prop_indices;
                 info.methods = methods;
             }
+        }
+        // A class discovered by a later generic instantiation must implement
+        // concrete method contracts requested on an earlier pass, including
+        // overrides of an inherited specialization and interface requirements.
+        let mut requests = Vec::new();
+        for (root, name, original, types) in self.class_expander.virtual_method_requests() {
+            for class in self.classes.values() {
+                if class.name.eq_ignore_ascii_case(&root) || self.is_subclass_of(&class.name, &root)
+                {
+                    if let Some(implementation) = class.methods.get(&original) {
+                        if !implementation.ast_method.type_params.is_empty() {
+                            requests.push((implementation.clone(), types.clone(), name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        for (implementation, types, name) in requests {
+            self.class_expander.specialize_method(
+                &implementation.declaring_class,
+                &implementation.ast_method,
+                &types,
+                &name,
+            );
         }
     }
 
@@ -2085,6 +2163,31 @@ impl Analyzer {
     }
 
     fn analyze_method(&mut self, class_name: &str, method: &MethodInfo) -> Option<TFunc> {
+        let display = self
+            .class_expander
+            .method_display(class_name, &method.name)
+            .map(str::to_owned);
+        let Some(display) = display else {
+            return self.analyze_method_inner(class_name, method);
+        };
+        let previous = std::mem::take(&mut self.diags);
+        let mut result = self.analyze_method_inner(class_name, method);
+        let specialized = std::mem::take(&mut self.diags);
+        self.diags = previous;
+        for diagnostic in specialized.items() {
+            self.diags.emit(
+                diagnostic
+                    .clone()
+                    .with_note(format!("while specializing `{display}`")),
+            );
+        }
+        if let Some(function) = &mut result {
+            function.display = display;
+        }
+        result
+    }
+
+    fn analyze_method_inner(&mut self, class_name: &str, method: &MethodInfo) -> Option<TFunc> {
         let mut ctx = FnCtx::new(method.ret.clone(), false);
         ctx.current_class = Some(class_name.to_string());
         if !method.ast_method.is_static {
@@ -3493,6 +3596,7 @@ impl Analyzer {
             ast::Expr::MethodCall {
                 base,
                 name,
+                type_args,
                 name_span,
                 args,
                 span,
@@ -3546,6 +3650,35 @@ impl Analyzer {
                     *name_span,
                     ctx,
                 ) {
+                    return None;
+                }
+
+                if !method.ast_method.type_params.is_empty() {
+                    if method.ast_method.is_static {
+                        self.diags.emit(
+                            Diagnostic::error("static methods require class-qualified access")
+                                .with_code("E0271")
+                                .with_span(*span),
+                        );
+                        return None;
+                    }
+                    return self.infer_generic_method_call(
+                        &class,
+                        &method,
+                        Some(base_expr),
+                        type_args,
+                        args,
+                        *span,
+                        ctx,
+                        true,
+                    );
+                }
+                if !type_args.is_empty() {
+                    self.diags.emit(
+                        Diagnostic::error("method does not declare type parameters")
+                            .with_code("E0280")
+                            .with_span(*span),
+                    );
                     return None;
                 }
 
@@ -3787,15 +3920,20 @@ impl Analyzer {
                 })
             }
             ast::Expr::ParentMethodCall {
-                method, args, span, ..
-            } => self.qualified_call("parent", method, args, *span, ctx),
-            ast::Expr::StaticCall {
-                class_name,
                 method,
+                type_args,
                 args,
                 span,
                 ..
-            } => self.qualified_call(class_name, method, args, *span, ctx),
+            } => self.qualified_call("parent", method, type_args, args, *span, ctx),
+            ast::Expr::StaticCall {
+                class_name,
+                method,
+                method_type_args,
+                args,
+                span,
+                ..
+            } => self.qualified_call(class_name, method, method_type_args, args, *span, ctx),
             ast::Expr::StaticProperty {
                 class_name,
                 name,
@@ -3938,6 +4076,7 @@ impl Analyzer {
         &mut self,
         class_name: &str,
         name: &str,
+        type_args: &[ast::TypeRef],
         args: &[ast::Expr],
         span: Span,
         ctx: &mut FnCtx,
@@ -3960,6 +4099,14 @@ impl Analyzer {
             return None;
         }
         if !self.check_member_visibility(&method.declaring_class, method.visibility, span, ctx) {
+            return None;
+        }
+        if method.ast_method.type_params.is_empty() && !type_args.is_empty() {
+            self.diags.emit(
+                Diagnostic::error("method does not declare type parameters")
+                    .with_code("E0280")
+                    .with_span(span),
+            );
             return None;
         }
         if args.len() != method.params.len() {
@@ -4000,6 +4147,18 @@ impl Analyzer {
             });
             actual.push(this_ty);
             formal.push(Ty::Named(class.name.clone()));
+        }
+        if !method.ast_method.type_params.is_empty() {
+            return self.infer_generic_method_call(
+                &class,
+                &method,
+                typed.into_iter().next(),
+                type_args,
+                args,
+                span,
+                ctx,
+                false,
+            );
         }
         formal.extend(method.params.clone());
         for (arg, want) in args.iter().zip(&method.params) {

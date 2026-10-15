@@ -414,11 +414,6 @@ fn generic_invalid_programs_fail_with_diagnostics() {
             "E0205",
         ),
         (
-            "methods_pending",
-            "class Box {public function get<T>(T $x): T {return $x;}}",
-            "E0100",
-        ),
-        (
             "constraints_pending",
             "function f<T: Countable>(T $x): T {return $x;}",
             "E0100",
@@ -739,6 +734,259 @@ fn native_typed_object_echo_and_print_use_magic_stringification() {
         "{}",
         r.stderr
     );
+}
+
+#[test]
+fn generic_methods_run_with_class_and_method_parameters() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "generic_methods",
+        include_str!("../../../examples/generic_methods.php"),
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "hello:7\nchanged:42\nstatic:9\ninterface\n");
+}
+
+#[test]
+fn generic_method_dispatch_handles_interfaces_and_later_classes() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "generic_method_dispatch",
+        r#"<?php
+        interface Contract { public function apply<T>(T $value): T; }
+        abstract class Base implements Contract {
+            abstract public function apply<U>(U $value): U;
+        }
+        class Child extends Base {
+            public function apply<V>(V $value): V { echo 'child:'; return $value; }
+        }
+        class Late<T> extends Base {
+            public function apply<V>(V $value): V { echo 'late:'; return $value; }
+        }
+        function throughBase(Base $base): string { return $base->apply<string>('base'); }
+        function throughInterface(Contract $value): int { return $value->apply(9); }
+        function create<T>(T $unused): Base { return new Late<T>(); }
+        echo throughBase(new Child()), "\n";
+        echo throughInterface(create(1)), "\n";
+        echo throughBase(create('s')), "\n";
+    "#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "child:base\nlate:9\nlate:base\n");
+}
+
+#[test]
+fn generic_method_recursion_scope_and_array_value_semantics() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "generic_method_values",
+        r#"<?php
+        class Store<T> {
+            private T $value;
+            public function __construct(T $value) { $this->value = $value; }
+            public function stored<U>(U $unused): T { return $this->value; }
+            public function repeat<U>(U $value, int $n): U {
+                if ($n == 0) { return $value; }
+                return $this->forward<U>($value, $n - 1);
+            }
+            private function forward<V>(V $value, int $n): V { return $this->repeat<V>($value, $n); }
+            public static function choose<A,B>(A $unused, B $value): B { return $value; }
+            public static function relay<U>(U $value): U { return self::choose<int,U>(0, $value); }
+        }
+        $store = new Store<int>(42);
+        $original = [[1]];
+        $copy = $store->repeat($original, 3);
+        $row = $copy[0]; $row[0] = 99; $copy[0] = $row;
+        echo $original[0][0], ':', $copy[0][0], ':', $store->stored('s'), "\n";
+        echo Store<int>::relay('static'), "\n";
+        $mixed = $store->repeat<mixed>([1, 'two'], 1);
+        if (is_array($mixed)) { echo $mixed[1], "\n"; }
+    "#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "1:99:42\nstatic\ntwo\n");
+}
+
+#[test]
+fn generic_method_receiver_and_arguments_evaluate_once_in_order() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "generic_method_order",
+        r#"<?php
+        class Tools {
+            public function second<A,B>(A $a, B $b): B { echo $a, ':'; return $b; }
+        }
+        function receiver(): Tools { echo 'receiver:'; return new Tools(); }
+        function argument(int $value): int { echo $value, ':'; return $value; }
+        echo receiver()->second(argument(1), argument(2)), "\n";
+    "#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "receiver:1:2:1:2\n");
+}
+
+#[test]
+fn generic_method_specializations_reuse_and_unused_bodies_stay_lazy() {
+    let f = temp_php(
+        "generic_method_ir",
+        r#"<?php
+        interface Contract { public function id<T>(T $value): T; }
+        class Tools implements Contract {
+            public function id<U>(U $value): U { return $value; }
+            public function unused<T>(T $value): T { return new Missing(); }
+        }
+        class Other implements Contract {
+            public function id<U>(U $value): U { return $undefined; }
+        }
+        class StaticTools {public static function id<T>(T $value): T {return $value;}}
+        class UnusedStaticChild extends StaticTools {public static function id<U>(U $value): U {return $undefined;}}
+        class ParentTools {public function id<T>(T $value): T {return $value;}}
+        class ParentCaller extends ParentTools {public function run(): int {return parent::id<int>(1);}}
+        class UnusedSibling extends ParentTools {public function id<U>(U $value): U {return $undefined;}}
+        $tools = new Tools();
+        echo $tools->id(1), $tools->id<int>(2);
+        echo StaticTools::id(3);
+    "#,
+    );
+    let r = run_ok(&["emit-ir", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let definitions: Vec<_> = r
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("func pxr$m$"))
+        .collect();
+    assert_eq!(definitions.len(), 4, "{}", r.stdout);
+    assert_eq!(
+        definitions
+            .iter()
+            .filter(|line| line.contains("(%v0: Tools, %v1: int) -> int"))
+            .count(),
+        1,
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn generic_method_diagnostics_reject_invalid_programs() {
+    let cases = [
+        ("type_arity", "class C {public function f<T>(T $v): T {return $v;}} (new C())->f<int,string>(1);", "E0280"),
+        ("value_arity", "class C {public function f<T>(T $v): T {return $v;}} (new C())->f();", "E0230"),
+        ("missing_inference", "class C {public function f<T>(array<T> $v): T {return $v[0];}} (new C())->f([]);", "E0281"),
+        ("conflict", "class C {public function f<T>(T $a,T $b): T {return $a;}} (new C())->f(1,'s');", "E0281"),
+        ("void", "class C {public static function f<T>(T $v): T {return $v;}} C::f<void>(1);", "E0280"),
+        ("ordinary", "class C {public function f(int $v): int {return $v;}} (new C())->f<int>(1);", "E0280"),
+        ("ordinary_static", "class C {public static function f(int $v): int {return $v;}} C::f<int>(1);", "E0280"),
+        ("wrong_value", "class C {public function f<T>(T $v): T {return $v;}} (new C())->f<int>('s');", "E0231"),
+        ("shadow", "class C<T> {public function f<T>(T $v): T {return $v;}}", "E0100"),
+        ("duplicate", "class C {public function f<T,T>(T $v): T {return $v;}}", "E0100"),
+        ("duplicate_value", "class C {public function f<T>(T $v,T $v): T {return $v;}}", "E0201"),
+        ("this_parameter", "class C {public function f<T>(T $this): T {return $this;}}", "E0267"),
+        ("scope", "class C {public function f<T>(T $v): T {return $v;} public function g(T $v): int {return 1;}}", "E0205"),
+        ("override_arity", "class B {public function f<T>(T $v): T {return $v;}} class C extends B {public function f<A,B>(A $v): A {return $v;}}", "E0282"),
+        ("override_shape", "class B {public function f<A,B>(A $v,B $w): A {return $v;}} class C extends B {public function f<X,Y>(Y $v,X $w): Y {return $v;}}", "E0282"),
+        ("interface_shape", "interface I {public function f<T>(T $v): T;} class C implements I {public function f<T>(array<T> $v): T {return $v[0];}}", "E0282"),
+        ("erase_generic", "interface I {public function f<T>(T $v): T;} class C implements I {public function f(mixed $v): mixed {return $v;}}", "E0282"),
+        ("constructor", "class C {public function __construct<T>(T $v) {}}", "E0282"),
+        ("magic", "class C {public function __toString<T>(): string {return 's';}}", "E0282"),
+        ("private", "class C {private function f<T>(T $v): T {return $v;}} (new C())->f(1);", "E0265"),
+        ("static_object", "class C {public static function f<T>(T $v): T {return $v;}} (new C())->f(1);", "E0271"),
+        ("no_receiver", "class C {public function f<T>(T $v): T {return $v;}} C::f(1);", "E0271"),
+    ];
+    for (name, source, code) in cases {
+        let f = temp_php(
+            &format!("generic_method_error_{name}"),
+            &format!("<?php {source}"),
+        );
+        let r = run_ok(&["check", f.to_str().unwrap()]);
+        assert_eq!(r.code, 1, "{name}: {}", r.stderr);
+        assert!(
+            r.stderr.contains(code),
+            "{name}: expected {code}: {}",
+            r.stderr
+        );
+    }
+}
+
+#[test]
+fn generic_method_body_errors_name_the_specialization() {
+    let f = temp_php(
+        "generic_method_body_error",
+        r#"<?php
+        class C { public function invert<T>(T $value): T { return ~$value; } }
+        echo (new C())->invert('s');
+    "#,
+    );
+    let r = run_ok(&["check", f.to_str().unwrap()]);
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("E0221"), "{}", r.stderr);
+    assert!(
+        r.stderr.contains("while specializing `C::invert<string>`"),
+        "{}",
+        r.stderr
+    );
+}
+
+#[test]
+fn generic_methods_resolve_module_aliases_and_generic_class_patterns() {
+    if !have_cc() {
+        return;
+    }
+    let module = temp_php(
+        "generic_method_module",
+        r#"<?php
+        namespace Library;
+        class Box<T> {
+            public T $value;
+            public function __construct(T $value) { $this->value = $value; }
+        }
+        class Tools<T> {
+            public function unwrap<U>(Box<U> $box): U { return $box->value; }
+            public static function wrap<U>(U $value): Box<U> { return new Box<U>($value); }
+        }
+    "#,
+    );
+    let source = format!(
+        r#"<?php
+        namespace App;
+        require '{}';
+        use Library\Tools as Helper;
+        $tools = new Helper<array<int>>();
+        $box = Helper<array<int>>::wrap<string>('ok');
+        echo $tools->unwrap($box), ':', $tools->unwrap<int>(Helper<int>::wrap(7)), "\n";
+    "#,
+        module.display()
+    );
+    let f = temp_php("generic_method_modules", &source);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "ok:7\n");
+}
+
+#[test]
+fn generic_method_polymorphic_recursion_is_bounded() {
+    let f = temp_php(
+        "generic_method_limit",
+        r#"<?php
+        class C {public function grow<T>(T $value): void { $this->grow([$value]); }}
+        (new C())->grow(1);
+    "#,
+    );
+    let r = run_ok(&["check", f.to_str().unwrap()]);
+    assert_eq!(r.code, 1, "{}", r.stderr);
+    assert!(r.stderr.contains("E0283"), "{}", r.stderr);
 }
 
 #[test]

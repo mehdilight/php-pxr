@@ -10,6 +10,11 @@ pub(super) struct ClassExpander {
     instances: HashMap<String, (String, Vec<ast::TypeRef>)>,
     pending: VecDeque<(ast::ClassDecl, Bindings)>,
     declarations: Vec<ast::ClassDecl>,
+    class_bindings: HashMap<String, Bindings>,
+    method_instances: HashMap<(String, String), ast::MethodDecl>,
+    method_displays: HashMap<(String, String), String>,
+    virtual_methods: HashMap<(String, String), (String, Vec<Ty>)>,
+    methods_pending: bool,
     pub diags: Diagnostics,
 }
 
@@ -61,6 +66,11 @@ impl ClassExpander {
             instances: HashMap::new(),
             pending: VecDeque::new(),
             declarations: Vec::new(),
+            class_bindings: HashMap::new(),
+            method_instances: HashMap::new(),
+            method_displays: HashMap::new(),
+            virtual_methods: HashMap::new(),
+            methods_pending: false,
             diags: Diagnostics::new(),
         };
         for item in &program.items {
@@ -87,7 +97,90 @@ impl ClassExpander {
     }
 
     pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+        !self.pending.is_empty() || self.methods_pending
+    }
+
+    pub fn method_display(&self, class: &str, name: &str) -> Option<&str> {
+        self.method_displays
+            .get(&(class.to_ascii_lowercase(), name.to_ascii_lowercase()))
+            .map(String::as_str)
+    }
+
+    pub fn request_virtual_method(
+        &mut self,
+        class: &str,
+        name: &str,
+        original: &str,
+        types: &[Ty],
+    ) {
+        self.virtual_methods
+            .entry((class.to_ascii_lowercase(), name.to_ascii_lowercase()))
+            .or_insert_with(|| (original.to_ascii_lowercase(), types.to_vec()));
+    }
+
+    pub fn virtual_method_requests(&self) -> Vec<(String, String, String, Vec<Ty>)> {
+        self.virtual_methods
+            .iter()
+            .map(|((class, name), (original, types))| {
+                (class.clone(), name.clone(), original.clone(), types.clone())
+            })
+            .collect()
+    }
+
+    pub fn specialize_method(
+        &mut self,
+        class: &str,
+        template: &ast::MethodDecl,
+        types: &[Ty],
+        name: &str,
+    ) {
+        let key = (class.to_ascii_lowercase(), name.to_ascii_lowercase());
+        if self.method_instances.contains_key(&key) {
+            return;
+        }
+        let display = format!(
+            "{class}::{}<{}>",
+            template.name,
+            types
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if self.method_instances.len() >= 256
+            || self
+                .method_displays
+                .values()
+                .filter(|display| display.starts_with(&format!("{class}::{}<", template.name)))
+                .count()
+                >= 64
+            || display.len() > 16_384
+        {
+            self.error(
+                "E0283",
+                template.name_span,
+                format!(
+                    "generic method specialization limit exceeded for `{class}::{}`",
+                    template.name
+                ),
+            );
+            return;
+        }
+        let mut bindings = self.class_bindings.get(&key.0).cloned().unwrap_or_default();
+        bindings.extend(
+            template
+                .type_params
+                .iter()
+                .zip(types)
+                .map(|((name, _), ty)| (name.clone(), type_ref(ty))),
+        );
+        let mut method = template.clone();
+        method.type_params.clear();
+        method.name = name.into();
+        self.method(&mut method, &bindings);
+        self.method_instances.insert(key.clone(), method);
+        self.method_displays.insert(key, display);
+        self.methods_pending = true;
     }
 
     pub fn arguments(&self, name: &str, template: &str) -> Option<&[ast::TypeRef]> {
@@ -240,7 +333,7 @@ impl ClassExpander {
             );
             return None;
         }
-        let bindings = template
+        let bindings: Bindings = template
             .type_params
             .iter()
             .zip(&args)
@@ -249,6 +342,8 @@ impl ClassExpander {
         self.instances
             .insert(key.clone(), (template.name.to_ascii_lowercase(), args));
         self.names.insert(key, display.clone());
+        self.class_bindings
+            .insert(display.to_ascii_lowercase(), bindings.clone());
         let mut declaration = template;
         declaration.name = display.clone();
         declaration.type_params.clear();
@@ -257,6 +352,7 @@ impl ClassExpander {
     }
 
     pub fn program(&mut self, original: &ast::Program) -> ast::Program {
+        self.methods_pending = false;
         let mut program = original.clone();
         program.items.retain(
             |item| !matches!(item, ast::Stmt::ClassDecl(class) if !class.type_params.is_empty()),
@@ -277,6 +373,21 @@ impl ClassExpander {
                 .cloned()
                 .map(|class| ast::Stmt::ClassDecl(Box::new(class))),
         );
+        for item in &mut program.items {
+            if let ast::Stmt::ClassDecl(class) = item {
+                let mut methods: Vec<_> = self
+                    .method_instances
+                    .iter()
+                    .filter(|((owner, _), _)| owner == &class.name.to_ascii_lowercase())
+                    .collect();
+                methods.sort_by_key(|((_, name), _)| name.as_str());
+                class.members.extend(
+                    methods
+                        .into_iter()
+                        .map(|(_, method)| ast::ClassMember::Method(method.clone())),
+                );
+            }
+        }
         program
     }
 
@@ -314,14 +425,20 @@ impl ClassExpander {
                     }
                 }
                 ast::ClassMember::Method(method) => {
-                    for parameter in &mut method.params {
-                        self.annotation(&mut parameter.ty, bindings);
-                    }
-                    self.annotation(&mut method.ret, bindings);
-                    for statement in &mut method.body {
-                        self.statement(statement, bindings);
-                    }
+                    self.method(method, bindings);
                 }
+            }
+        }
+    }
+
+    fn method(&mut self, method: &mut ast::MethodDecl, bindings: &Bindings) {
+        for parameter in &mut method.params {
+            self.annotation(&mut parameter.ty, bindings);
+        }
+        self.annotation(&mut method.ret, bindings);
+        if method.type_params.is_empty() {
+            for statement in &mut method.body {
+                self.statement(statement, bindings);
             }
         }
     }
@@ -509,15 +626,24 @@ impl ClassExpander {
                 args,
                 class_span: span,
                 ..
+            } => {
+                self.class_reference(class_name, type_args, *span, bindings);
+                for argument in args {
+                    self.expression(argument, bindings);
+                }
             }
-            | E::StaticCall {
+            E::StaticCall {
                 class_name,
                 type_args,
+                method_type_args,
                 args,
                 span,
                 ..
             } => {
                 self.class_reference(class_name, type_args, *span, bindings);
+                for argument in method_type_args {
+                    self.rewrite_type(argument, bindings);
+                }
                 for argument in args {
                     self.expression(argument, bindings);
                 }
@@ -538,13 +664,26 @@ impl ClassExpander {
                 self.expression(expr, bindings);
                 self.class_reference(class_name, type_args, *class_span, bindings);
             }
-            E::MethodCall { base, args, .. } => {
+            E::MethodCall {
+                base,
+                type_args,
+                args,
+                ..
+            } => {
+                for argument in type_args {
+                    self.rewrite_type(argument, bindings);
+                }
                 self.expression(base, bindings);
                 for argument in args {
                     self.expression(argument, bindings);
                 }
             }
-            E::ParentMethodCall { args, .. } => {
+            E::ParentMethodCall {
+                args, type_args, ..
+            } => {
+                for argument in type_args {
+                    self.rewrite_type(argument, bindings);
+                }
                 for argument in args {
                     self.expression(argument, bindings);
                 }

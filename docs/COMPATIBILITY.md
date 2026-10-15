@@ -290,8 +290,11 @@ checked. Generic classes/interfaces support `class Box<T>`, `new Box<int>(42)`,
 typed fields/methods, inheritance, separate static state, and `instanceof Box<int>`.
 Class templates are checked when instantiated; type arguments are explicit at
 construction. Functions can infer arguments through generic class/interface
-patterns. Independently generic methods, constraints, and return-type inference
-remain unsupported.
+patterns. Methods can declare independent parameters with explicit/inferred
+instance/static calls, interface/abstract contracts, and native virtual dispatch.
+Generic overrides preserve signature shape up to parameter renaming. Generic
+constructors/magic methods and class-parameter shadowing are rejected.
+Constraints and return-type inference remain unsupported.
 Scalar widening does not convert `array<int>` storage to `array<float>`; such
 calls fail at compile time. See [`GENERICS.md`](GENERICS.md).
 

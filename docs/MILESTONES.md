@@ -599,8 +599,24 @@ PXR extension in `.php` files and does not parse in PHP.
   44 unit tests (160 total), including a parser regression for `instanceof`
   followed by comparison/shift expressions.
 
-**Remaining.** Independently generic methods; constraints/traits;
-whole-function return-type inference. M5 is not complete.
+**Delivered (M5.3: independent generic methods).**
+
+* Instance/static methods declare their own parameters, with explicit/inferred
+  calls, separate class/method arguments, and existing access checks. Generic
+  functions and methods share argument inference and concrete type checking.
+* Interface/abstract contracts and overrides compare signature shapes up to
+  type-parameter renaming. Concrete specializations use existing virtual
+  dispatch; parent calls select their implementation directly. Class discovery
+  propagates previously requested method specializations to new implementations.
+* Lazy body checking, cached specialization, recursion limits, source-context
+  diagnostics, receiver/argument order, arrays, and module aliases are covered.
+  Class-parameter shadowing, generic constructors/magic methods, and invalid
+  contracts fail explicitly. Duplicate/`$this` method parameters are rejected.
+* Nine additional CLI tests and one parser regression: 125 CLI tests plus
+  45 unit tests (170 total). See `examples/generic_methods.php`.
+
+**Remaining.** Constraints/traits and whole-function return-type inference.
+M5 is not complete.
 
 ## ⛔ M6 — Ownership & memory safety
 

@@ -853,6 +853,19 @@ impl Parser {
         is_abstract: bool,
         is_static: bool,
     ) -> Result<MethodDecl, ()> {
+        let previous = self.type_params.clone();
+        let result = self.parse_method_inner(start, visibility, is_abstract, is_static);
+        self.type_params = previous;
+        result
+    }
+
+    fn parse_method_inner(
+        &mut self,
+        start: Span,
+        visibility: Visibility,
+        is_abstract: bool,
+        is_static: bool,
+    ) -> Result<MethodDecl, ()> {
         self.expect(&TokenKind::Function, "`function`")?;
         let name_tok = self.expect_ident("method name")?;
         let name = match name_tok.kind {
@@ -860,6 +873,28 @@ impl Parser {
             _ => unreachable!(),
         };
         let name_span = name_tok.span;
+
+        let mut type_params = Vec::new();
+        if self.eat(&TokenKind::Lt) {
+            loop {
+                let token = self.expect_ident("method type parameter")?;
+                let TokenKind::Ident(name) = token.kind else {
+                    unreachable!()
+                };
+                if self.type_params.contains(&name) {
+                    self.error(
+                        token.span,
+                        format!("duplicate or shadowed type parameter `{name}`"),
+                    );
+                }
+                self.type_params.push(name.clone());
+                type_params.push((name, token.span));
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect_type_close()?;
+        }
 
         self.expect(&TokenKind::LParen, "`(` after method name")?;
         let mut params = Vec::new();
@@ -903,6 +938,7 @@ impl Parser {
         };
         let end = self.peek().span;
         Ok(MethodDecl {
+            type_params,
             is_static,
             is_abstract,
             visibility,
@@ -1012,9 +1048,9 @@ impl Parser {
         Ok(arguments)
     }
 
-    // `instanceof C < expr` can be an ordinary comparison. Speculate only
-    // here, restoring split `>>` tokens as well as diagnostics on failure.
-    fn parse_instanceof_type_arguments(&mut self) -> Vec<TypeRef> {
+    // `<` after an instanceof target or property can begin a comparison.
+    // Restore split `>>` tokens as well as diagnostics when speculation fails.
+    fn try_parse_type_arguments(&mut self) -> Vec<TypeRef> {
         if !self.at(&TokenKind::Lt) {
             return Vec::new();
         }
@@ -1376,7 +1412,7 @@ impl Parser {
                 self.advance();
                 let (raw_name, class_span) = self.parse_name()?;
                 let class_name = self.resolve_name(&raw_name, false).0;
-                let type_args = self.parse_instanceof_type_arguments();
+                let type_args = self.try_parse_type_arguments();
                 let span = lhs.span().merge(class_span);
                 lhs = Expr::Instanceof {
                     expr: Box::new(lhs),
@@ -1474,6 +1510,11 @@ impl Parser {
                     _ => unreachable!(),
                 };
                 let name_span = name_tok.span;
+                let type_args = if self.at(&TokenKind::Lt) {
+                    self.try_parse_type_arguments()
+                } else {
+                    Vec::new()
+                };
                 if self.eat(&TokenKind::LParen) {
                     let mut args = Vec::new();
                     if !self.at(&TokenKind::RParen) {
@@ -1489,11 +1530,16 @@ impl Parser {
                     base = Expr::MethodCall {
                         base: Box::new(base),
                         name,
+                        type_args,
                         name_span,
                         args,
                         span,
                     };
                 } else {
+                    if !type_args.is_empty() {
+                        self.error(name_span, "type arguments require a method call");
+                        return Err(());
+                    }
                     let span = base.span().merge(name_span);
                     base = Expr::Property {
                         base: Box::new(base),
@@ -1532,6 +1578,7 @@ impl Parser {
         let TokenKind::Ident(method) = token.kind else {
             unreachable!()
         };
+        let method_type_args = self.parse_type_arguments()?;
         self.expect(&TokenKind::LParen, "`(` after method name")?;
         let mut args = Vec::new();
         if !self.at(&TokenKind::RParen) {
@@ -1547,6 +1594,7 @@ impl Parser {
         if class_name == "parent" {
             Ok(Expr::ParentMethodCall {
                 method,
+                type_args: method_type_args,
                 method_span: token.span,
                 args,
                 span: start.merge(close.span),
@@ -1556,6 +1604,7 @@ impl Parser {
                 class_name,
                 type_args,
                 method,
+                method_type_args,
                 args,
                 span: start.merge(close.span),
             })
@@ -1955,6 +2004,29 @@ mod tests {
         };
         assert!(matches!(&values[0], Expr::Instanceof { type_args, .. }
             if type_args == &[TypeRef::Array(Box::new(TypeRef::Int))]));
+    }
+
+    #[test]
+    fn generic_method_arguments_preserve_property_comparisons() {
+        let p = ok("<?php echo $x->value < (8 >> 1); echo $x->id<array<int>>([1]); echo Box<int>::id<string>('s');");
+        let Stmt::Echo(values, _) = &p.items[0] else {
+            panic!("expected echo")
+        };
+        assert!(
+            matches!(&values[0], Expr::Binary {op: BinOp::Lt, lhs, ..} if matches!(lhs.as_ref(), Expr::Property {..}))
+        );
+        let Stmt::Echo(values, _) = &p.items[1] else {
+            panic!("expected echo")
+        };
+        assert!(
+            matches!(&values[0], Expr::MethodCall {type_args, ..} if type_args == &[TypeRef::Array(Box::new(TypeRef::Int))])
+        );
+        let Stmt::Echo(values, _) = &p.items[2] else {
+            panic!("expected echo")
+        };
+        assert!(
+            matches!(&values[0], Expr::StaticCall {type_args, method_type_args, ..} if type_args == &[TypeRef::Int] && method_type_args == &[TypeRef::String])
+        );
     }
 
     #[test]

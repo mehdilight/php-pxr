@@ -98,7 +98,173 @@ pub(super) fn hex_name(name: &str) -> String {
         .collect()
 }
 
+struct GenericCall {
+    key: (String, Vec<Ty>),
+    signature: Signature,
+    bindings: HashMap<String, Ty>,
+    values: Vec<TExpr>,
+}
+
+impl GenericCall {
+    fn expression(self, span: Span) -> TExpr {
+        let arg_tys = self.values.iter().map(TExpr::ty).collect();
+        TExpr::Call {
+            callee: Callee::User {
+                mangled: self.signature.mangled,
+                name: self.signature.display,
+                params: self.signature.params,
+            },
+            ret: self.signature.ret,
+            args: self.values,
+            arg_tys,
+            span,
+        }
+    }
+}
+
 impl Analyzer {
+    pub(super) fn generic_method_compatible(
+        &self,
+        method: &ast::MethodDecl,
+        inherited: &ast::MethodDecl,
+    ) -> bool {
+        fn shape(ty: &ast::TypeRef, parameters: &[(String, Span)]) -> String {
+            match ty {
+                ast::TypeRef::Param(name, _) => format!(
+                    "p{}",
+                    parameters
+                        .iter()
+                        .position(|(parameter, _)| parameter == name)
+                        .unwrap_or(usize::MAX)
+                ),
+                ast::TypeRef::Array(element) => format!("a({})", shape(element, parameters)),
+                ast::TypeRef::Applied(name, args, _) => format!(
+                    "{}<{}>",
+                    name.to_ascii_lowercase(),
+                    args.iter()
+                        .map(|argument| shape(argument, parameters))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                ast::TypeRef::Named(name) => format!("n({})", name.to_ascii_lowercase()),
+                _ => format!("{ty:?}"),
+            }
+        }
+        if method.type_params.len() != inherited.type_params.len()
+            || method.params.len() != inherited.params.len()
+        {
+            return false;
+        }
+        method
+            .params
+            .iter()
+            .zip(&inherited.params)
+            .all(|(left, right)| match (&left.ty, &right.ty) {
+                (Some(left), Some(right)) => {
+                    shape(left, &method.type_params) == shape(right, &inherited.type_params)
+                }
+                _ => false,
+            })
+            && match (&method.ret, &inherited.ret) {
+                (Some(left), Some(right)) => {
+                    shape(left, &method.type_params) == shape(right, &inherited.type_params)
+                }
+                _ => false,
+            }
+    }
+
+    pub(super) fn infer_generic_method_call(
+        &mut self,
+        class: &ClassInfo,
+        method: &MethodInfo,
+        receiver: Option<TExpr>,
+        type_args: &[ast::TypeRef],
+        args: &[ast::Expr],
+        span: Span,
+        ctx: &mut FnCtx,
+        virtual_call: bool,
+    ) -> Option<TExpr> {
+        let declaration = ast::FnDecl {
+            type_params: method.ast_method.type_params.clone(),
+            name: format!("{}::{}", method.declaring_class, method.name),
+            name_span: method.name_span,
+            params: method.ast_method.params.clone(),
+            ret: method.ast_method.ret.clone(),
+            body: Vec::new(),
+            span: method.ast_method.span,
+        };
+        let prepared = self.prepare_generic_call(&declaration, type_args, args, span, ctx)?;
+        let types = &prepared.key.1;
+        let member = format!(
+            "$g${}${}",
+            method.name.to_ascii_lowercase(),
+            types.iter().map(encode_type).collect::<Vec<_>>().join("$")
+        );
+        // Materialize the same concrete member in every applicable implementation
+        // and contract. The ordinary inheritance checker and dispatcher then
+        // operate on concrete types, including interface and abstract calls.
+        let mut targets = vec![method.clone()];
+        if virtual_call {
+            self.class_expander
+                .request_virtual_method(&class.name, &member, &method.name, types);
+            for candidate in self.classes.values() {
+                if candidate.name.eq_ignore_ascii_case(&class.name)
+                    || self.is_subclass_of(&candidate.name, &class.name)
+                {
+                    if let Some(implementation) =
+                        candidate.methods.get(&method.name.to_ascii_lowercase())
+                    {
+                        targets.push(implementation.clone());
+                    }
+                }
+            }
+        }
+        targets.sort_by(|left, right| left.declaring_class.cmp(&right.declaring_class));
+        targets.dedup_by(|left, right| {
+            left.declaring_class
+                .eq_ignore_ascii_case(&right.declaring_class)
+        });
+        for target in targets {
+            self.class_expander.specialize_method(
+                &target.declaring_class,
+                &target.ast_method,
+                types,
+                &member,
+            );
+        }
+        self.specializations
+            .insert(prepared.key.clone(), prepared.signature.clone());
+        let concrete = class.methods.get(&member);
+        let mangled = if virtual_call
+            && concrete.is_some()
+            && self.method_has_overrides(&class.name, &member)
+        {
+            mangle_dispatcher(&class.name, &member)
+        } else {
+            concrete
+                .map(|method| method.mangled.clone())
+                .unwrap_or_else(|| mangle_method(&method.declaring_class, &member))
+        };
+        let mut values = prepared.values;
+        let mut params = prepared.signature.params;
+        if let Some(receiver) = receiver {
+            params.insert(0, Ty::Named(class.name.clone()));
+            values.insert(0, receiver);
+        }
+        let arg_tys = values.iter().map(TExpr::ty).collect();
+        Some(TExpr::Call {
+            callee: Callee::User {
+                mangled,
+                name: prepared.signature.display,
+                params,
+            },
+            ret: prepared.signature.ret,
+            args: values,
+            arg_tys,
+            span,
+        })
+    }
+
     pub(super) fn is_compiled_function(&self, name: &str) -> bool {
         self.funcs.contains_key(name) || self.generics.contains_key(name)
     }
@@ -111,6 +277,27 @@ impl Analyzer {
         span: Span,
         ctx: &mut FnCtx,
     ) -> Option<TExpr> {
+        let prepared = self.prepare_generic_call(declaration, type_args, args, span, ctx)?;
+        if !self.specializations.contains_key(&prepared.key) {
+            self.specializations
+                .insert(prepared.key.clone(), prepared.signature.clone());
+            self.pending_specializations.push_back((
+                declaration.clone(),
+                prepared.signature.clone(),
+                prepared.bindings.clone(),
+            ));
+        }
+        Some(prepared.expression(span))
+    }
+
+    fn prepare_generic_call(
+        &mut self,
+        declaration: &ast::FnDecl,
+        type_args: &[ast::TypeRef],
+        args: &[ast::Expr],
+        span: Span,
+        ctx: &mut FnCtx,
+    ) -> Option<GenericCall> {
         if args.len() != declaration.params.len() {
             self.diags.emit(
                 Diagnostic::error(format!(
@@ -278,25 +465,11 @@ impl Analyzer {
                 return None;
             }
         }
-        if !self.specializations.contains_key(&key) {
-            self.specializations.insert(key, signature.clone());
-            self.pending_specializations.push_back((
-                declaration.clone(),
-                signature.clone(),
-                bindings,
-            ));
-        }
-        let arg_tys = values.iter().map(TExpr::ty).collect();
-        Some(TExpr::Call {
-            callee: Callee::User {
-                mangled: signature.mangled,
-                name: signature.display,
-                params: signature.params,
-            },
-            ret: signature.ret,
-            args: values,
-            arg_tys,
-            span,
+        Some(GenericCall {
+            key,
+            signature,
+            bindings,
+            values,
         })
     }
 }
