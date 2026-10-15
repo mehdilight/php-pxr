@@ -188,7 +188,8 @@ types, integer‑overflow → `float` promotion, interfaces, static members,
 namespaces, generics,
 ownership & borrowing, the complex string‑interpolation forms (`"$a[0]"`,
 `"{$expr}"`, `"${name}"`, `"$obj->p"`; the simple `"$name"` / `"{$name}"` work),
-exceptions, modules/`include`, C interop (`extern`), concurrency, and the
+exceptions, modules/`include`, C interop (`extern`), async/await and concurrency
+(planned for M7; see [`docs/ASYNC.md`](docs/ASYNC.md)), and the
 `mixed`/dynamic escape hatch for gradual migration.
 
 ## License

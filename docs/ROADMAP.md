@@ -50,7 +50,7 @@ today     typed scalars, arrays, control flow, LLVM backend, tests, benchmarks
   ├─ M4  mixed/dynamic + include interop                  (gradual migration)
   ├─ M5  generics + inference                             (zero-cost abstraction)
   ├─ M6  ownership & borrowing, no leaks                  (memory safety)
-  ├─ M7  concurrency with data-race freedom               (parallelism)
+  ├─ M7  async/await + structured tasks, then threads     (I/O + parallelism)
   ├─ M8  C interoperability (extern "C", FFI)             (systems access)
   └─ M9  package manager, LSP, cross-compile, JIT         (ecosystem)
 ```
@@ -59,6 +59,16 @@ The destination — a compiled, memory‑safe language that speaks PHP — requi
 ownership (M6) and generics (M5) as foundations for concurrency (M7) and a
 trustworthy standard library (M2). The early milestones exist so the compiler is
 *useful* at every step, not only at the end.
+
+## Async sequencing
+
+Async/await is planned for M7.1, followed by threaded parallelism in M7.2.
+The proposed PXR syntax is `async function`, `await`, and explicit `spawn`;
+[`ASYNC.md`](ASYNC.md) records the design and remaining decisions. M5 supplies
+typed task support, and M6 establishes ownership and task lifetimes. Structured
+error propagation and cancellation must be settled before implementation.
+The first executor uses one thread with nonblocking timers and socket I/O;
+ordinary blocking calls still block that thread.
 
 ## Non‑goals (for now)
 

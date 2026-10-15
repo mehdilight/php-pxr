@@ -387,10 +387,41 @@ using `mixed`.
   time; replace the bump arena.
 * Affine/linear types, `&`/`&mut`‑style borrowing, lifetimes where needed.
 
-## ⛔ M7 — Concurrency
+## ⛔ M7 — Async I/O & concurrency
+
+**Sequencing.** Implement after typed task support (M5) and ownership/lifetime
+rules (M6). Define structured error propagation and cancellation before starting
+the runtime implementation. Async is planned, not available in the compiler.
+See [`ASYNC.md`](ASYNC.md) for the proposed syntax and execution contract.
+
+### ⛔ M7.1 — Async functions & structured tasks
+
+* `async function f(...): T` creates a lazy `Task<T>`; its body returns `T`.
+* `await` inside async functions starts or resumes a task and yields its result;
+  suspension allows other ready tasks to progress on a single event-loop thread.
+* `spawn f(...)` schedules a child task immediately and returns a handle that can
+  be awaited. Child tasks cannot silently outlive their parent.
+* An `async function main(): void` entry point starts the executor automatically;
+  combining it with executable top-level statements is rejected.
+* Compiler lowering preserves locals across suspension points. Typed task
+  handles, ownership checks, error propagation, and cooperative cancellation
+  cover both completion and cleanup paths.
+* Begin with nonblocking timers; add readiness-based socket I/O after the task
+  lifecycle works. Ordinary blocking calls remain blocking.
+
+**Acceptance.** Native end-to-end tests verify sequential awaits, overlapping
+spawned timers, result types, entry-point diagnostics, parent/child lifetime
+rules, failure propagation, cancellation, and cleanup. A timer test must prove
+that another task progresses while the first is suspended. A socket test must
+verify actual I/O readiness without blocking the executor. Async examples are
+PXR extensions and are not claimed to run in the PHP interpreter.
+
+### ⛔ M7.2 — Threaded parallelism
 
 * OS threads with `Send`/`Sync`‑style guarantees derived from ownership.
 * Channels and shared‑nothing tasks; data‑race freedom by construction.
+* Explicit cross-thread task transfer rules; async tasks initially stay on their
+  event-loop thread. CPU parallelism is separate from async I/O.
 
 ## ⛔ M8 — C interoperability
 
