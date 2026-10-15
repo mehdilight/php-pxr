@@ -9,6 +9,7 @@
 use pxr_ast::*;
 use pxr_diag::{Diagnostic, Diagnostics, Span};
 use pxr_lexer::{StrPart, Token, TokenKind};
+use std::collections::HashMap;
 
 pub struct Parser {
     toks: Vec<Token>,
@@ -16,18 +17,52 @@ pub struct Parser {
     diags: Diagnostics,
     /// Guards against infinite loops during error recovery.
     stuck: usize,
+    namespace: String,
+    aliases: HashMap<String, String>,
+    function_aliases: HashMap<String, String>,
+    namespace_style: Option<bool>,
+    in_namespace_block: bool,
+    global_imports: bool,
+    declared_types: Vec<String>,
+    declared_functions: Vec<String>,
 }
 
 pub fn parse(src: &str) -> (Option<Program>, Diagnostics) {
-    let (toks, lex_diags) = pxr_lexer::lex(src);
+    parse_at(src, 0)
+}
+
+/// Parse with byte offsets in a driver's combined source map.
+pub fn parse_at(src: &str, offset: usize) -> (Option<Program>, Diagnostics) {
+    let (mut toks, lex_diags) = pxr_lexer::lex(src);
+    for token in &mut toks {
+        token.span.start += offset;
+        token.span.end += offset;
+    }
+    let mut shifted = Diagnostics::new();
+    for diag in lex_diags.items() {
+        let mut diag = diag.clone();
+        if let Some(span) = &mut diag.span {
+            span.start += offset;
+            span.end += offset;
+        }
+        shifted.emit(diag);
+    }
     let mut p = Parser {
         toks,
         pos: 0,
         diags: Diagnostics::new(),
         stuck: 0,
+        namespace: String::new(),
+        aliases: HashMap::new(),
+        function_aliases: HashMap::new(),
+        namespace_style: None,
+        in_namespace_block: false,
+        global_imports: false,
+        declared_types: Vec::new(),
+        declared_functions: Vec::new(),
     };
     let program = p.parse_program();
-    let mut diags = lex_diags;
+    let mut diags = shifted;
     diags.extend(p.diags);
     (program, diags)
 }
@@ -105,9 +140,8 @@ impl Parser {
         let mut items = Vec::new();
         let mut last = self.pos;
         while !self.at(&TokenKind::Eof) {
-            match self.parse_stmt() {
-                Ok(Some(s)) => items.push(s),
-                Ok(None) => {}
+            match self.parse_top_item(&mut items) {
+                Ok(()) => {}
                 Err(()) => self.recover(),
             }
             if self.pos == last {
@@ -125,6 +159,186 @@ impl Parser {
             items,
             span: start.merge(end),
         })
+    }
+
+    fn declared_name(&self, name: &str) -> String {
+        if self.namespace.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}\\{name}", self.namespace)
+        }
+    }
+
+    fn resolve_name(&self, name: &str, function: bool) -> (String, Option<String>) {
+        if let Some(name) = name.strip_prefix('\\') {
+            return (name.to_string(), None);
+        }
+        if let Some(name) = name.strip_prefix("namespace\\") {
+            return (self.declared_name(name), None);
+        }
+        let (head, tail) = name.split_once('\\').unwrap_or((name, ""));
+        if !function
+            && tail.is_empty()
+            && matches!(
+                head.to_ascii_lowercase().as_str(),
+                "self" | "parent" | "static"
+            )
+        {
+            return (name.to_string(), None);
+        }
+        let aliases = if function && tail.is_empty() {
+            &self.function_aliases
+        } else {
+            &self.aliases
+        };
+        if let Some(alias) = aliases.get(&head.to_ascii_lowercase()) {
+            return (
+                if tail.is_empty() {
+                    alias.clone()
+                } else {
+                    format!("{alias}\\{tail}")
+                },
+                None,
+            );
+        }
+        (
+            self.declared_name(name),
+            if function && tail.is_empty() && !self.namespace.is_empty() {
+                Some(name.to_string())
+            } else {
+                None
+            },
+        )
+    }
+
+    fn parse_name(&mut self) -> Result<(String, Span), ()> {
+        let start = self.peek().span;
+        let mut name = String::new();
+        if self.eat(&TokenKind::Backslash) {
+            name.push('\\');
+        }
+        if self.eat(&TokenKind::Namespace) {
+            name.push_str("namespace");
+            self.expect(&TokenKind::Backslash, "`\\` after `namespace`")?;
+            name.push('\\');
+        }
+        loop {
+            let token = self.expect_ident("name")?;
+            let TokenKind::Ident(part) = token.kind else {
+                unreachable!()
+            };
+            name.push_str(&part);
+            if !self.eat(&TokenKind::Backslash) {
+                return Ok((name, start.merge(token.span)));
+            }
+            name.push('\\');
+        }
+    }
+
+    fn parse_top_item(&mut self, items: &mut Vec<Stmt>) -> Result<(), ()> {
+        if self.at(&TokenKind::Namespace) && !matches!(self.peek_at(1).kind, TokenKind::Backslash) {
+            if self.in_namespace_block
+                || (self.namespace_style.is_none() && (!items.is_empty() || self.global_imports))
+            {
+                self.error(
+                    self.peek().span,
+                    "namespace declarations must be top-level and precede code",
+                );
+                return Err(());
+            }
+            let start = self.advance().span;
+            let name = if self.at(&TokenKind::LBrace) {
+                String::new()
+            } else {
+                self.parse_name()?.0
+            };
+            if name.starts_with('\\') || name.starts_with("namespace\\") {
+                self.error(start, "namespace declarations require a relative name");
+                return Err(());
+            }
+            let braced = self.at(&TokenKind::LBrace);
+            if self.namespace_style.is_some_and(|style| style != braced) {
+                self.error(start, "cannot mix braced and unbraced namespaces");
+                return Err(());
+            }
+            self.namespace_style = Some(braced);
+            self.namespace = name;
+            self.aliases.clear();
+            self.function_aliases.clear();
+            self.declared_types.clear();
+            self.declared_functions.clear();
+            if braced {
+                self.advance();
+                self.in_namespace_block = true;
+                while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
+                    let before = self.pos;
+                    if self.parse_top_item(items).is_err() {
+                        self.recover();
+                    }
+                    if self.pos == before {
+                        self.advance();
+                    }
+                }
+                self.expect(&TokenKind::RBrace, "`}` after namespace body")?;
+                self.in_namespace_block = false;
+                self.namespace.clear();
+                self.aliases.clear();
+                self.function_aliases.clear();
+            } else {
+                self.expect(&TokenKind::Semicolon, "`;` after namespace name")?;
+            }
+            return Ok(());
+        }
+        if self.namespace_style == Some(true) && !self.in_namespace_block {
+            self.error(self.peek().span, "code must be inside a namespace block");
+            return Err(());
+        }
+        if self.eat(&TokenKind::Use) {
+            if self.namespace_style.is_none() {
+                self.global_imports = true;
+            }
+            let function = self.eat(&TokenKind::Function);
+            loop {
+                let (name, span) = self.parse_name()?;
+                if name.starts_with("namespace\\") {
+                    self.error(span, "imports must name an absolute symbol");
+                    return Err(());
+                }
+                let name = name.trim_start_matches('\\').to_string();
+                let alias = if self.eat(&TokenKind::As) {
+                    let token = self.expect_ident("import alias")?;
+                    let TokenKind::Ident(alias) = token.kind else {
+                        unreachable!()
+                    };
+                    alias
+                } else {
+                    name.rsplit('\\').next().unwrap().to_string()
+                };
+                let key = alias.to_ascii_lowercase();
+                let declared = if function {
+                    &self.declared_functions
+                } else {
+                    &self.declared_types
+                };
+                let aliases = if function {
+                    &mut self.function_aliases
+                } else {
+                    &mut self.aliases
+                };
+                if declared.contains(&key) || aliases.insert(key, name).is_some() {
+                    self.error(span, format!("import alias `{alias}` is already in use"));
+                }
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::Semicolon, "`;` after import")?;
+            return Ok(());
+        }
+        if let Some(stmt) = self.parse_stmt()? {
+            items.push(stmt);
+        }
+        Ok(())
     }
 
     /// Skip tokens until a plausible statement boundary.
@@ -192,6 +406,35 @@ impl Parser {
             TokenKind::Class | TokenKind::Abstract | TokenKind::Interface => self
                 .parse_class()
                 .map(|c| Some(Stmt::ClassDecl(Box::new(c)))),
+            TokenKind::Require | TokenKind::RequireOnce => {
+                let once = self.advance().kind == TokenKind::RequireOnce;
+                let paren = self.eat(&TokenKind::LParen);
+                let dir_relative = matches!(&self.peek().kind, TokenKind::Ident(name) if name.eq_ignore_ascii_case("__DIR__"));
+                if dir_relative {
+                    self.advance();
+                    self.expect(&TokenKind::Dot, "`.` after `__DIR__`")?;
+                }
+                let token = self.advance();
+                let TokenKind::Str(bytes) = token.kind else {
+                    self.error(
+                        token.span,
+                        "module paths must be literal strings, optionally prefixed by `__DIR__ .`",
+                    );
+                    return Err(());
+                };
+                let path = String::from_utf8(bytes)
+                    .map_err(|_| self.error(token.span, "module paths must be UTF-8"))?;
+                if paren {
+                    self.expect(&TokenKind::RParen, "`)` after module path")?;
+                }
+                let end = self.expect(&TokenKind::Semicolon, "`;` after module dependency")?;
+                Ok(Some(Stmt::Require {
+                    path,
+                    once,
+                    dir_relative,
+                    span: start.merge(end.span),
+                }))
+            }
             TokenKind::Return => {
                 self.advance();
                 let value = if self.at(&TokenKind::Semicolon) {
@@ -321,6 +564,14 @@ impl Parser {
             _ => unreachable!(),
         };
         let name_span = name_tok.span;
+        if self
+            .function_aliases
+            .contains_key(&name.to_ascii_lowercase())
+        {
+            self.error(name_span, "function name conflicts with an import");
+        }
+        self.declared_functions.push(name.to_ascii_lowercase());
+        let name = self.declared_name(&name);
 
         self.expect(&TokenKind::LParen, "`(` after function name")?;
         let mut params = Vec::new();
@@ -386,6 +637,11 @@ impl Parser {
             _ => unreachable!(),
         };
         let name_span = name_tok.span;
+        if self.aliases.contains_key(&name.to_ascii_lowercase()) {
+            self.error(name_span, "type name conflicts with an import");
+        }
+        self.declared_types.push(name.to_ascii_lowercase());
+        let name = self.declared_name(&name);
         let mut extends = None;
         let mut extends_span = None;
         let mut interfaces = Vec::new();
@@ -394,13 +650,9 @@ impl Parser {
                 interfaces = self.parse_interface_names()?;
             }
         } else if self.eat(&TokenKind::Extends) {
-            let parent_tok = self.expect_ident("parent class name after `extends`")?;
-            let parent_name = match parent_tok.kind {
-                TokenKind::Ident(n) => n,
-                _ => unreachable!(),
-            };
-            extends = Some(parent_name);
-            extends_span = Some(parent_tok.span);
+            let (parent_name, span) = self.parse_name()?;
+            extends = Some(self.resolve_name(&parent_name, false).0);
+            extends_span = Some(span);
         }
         if !is_interface && self.eat(&TokenKind::Implements) {
             interfaces = self.parse_interface_names()?;
@@ -434,10 +686,8 @@ impl Parser {
     fn parse_interface_names(&mut self) -> Result<Vec<(String, Span)>, ()> {
         let mut names = Vec::new();
         loop {
-            let token = self.expect_ident("interface name")?;
-            if let TokenKind::Ident(name) = token.kind {
-                names.push((name, token.span));
-            }
+            let (name, span) = self.parse_name()?;
+            names.push((self.resolve_name(&name, false).0, span));
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
@@ -609,10 +859,20 @@ impl Parser {
                 | TokenKind::KwVoid
                 | TokenKind::KwArray
                 | TokenKind::Ident(_)
+                | TokenKind::Backslash
+                | TokenKind::Namespace
         )
     }
 
     fn parse_type(&mut self) -> Result<TypeRef, ()> {
+        if matches!(
+            self.peek().kind,
+            TokenKind::Ident(_) | TokenKind::Backslash | TokenKind::Namespace
+        ) {
+            let (name, _) = self.parse_name()?;
+            return Ok(TypeRef::Named(self.resolve_name(&name, false).0));
+        }
+
         if self.at(&TokenKind::KwArray) {
             let start = self.advance().span;
             self.expect(&TokenKind::Lt, "`<` after `array` (write `array<T>`)")?;
@@ -982,16 +1242,13 @@ impl Parser {
         loop {
             if 7 >= min_prec && self.at(&TokenKind::Instanceof) {
                 self.advance();
-                let class_tok = self.expect_ident("class name after `instanceof`")?;
-                let class_name = match class_tok.kind {
-                    TokenKind::Ident(n) => n,
-                    _ => unreachable!(),
-                };
-                let span = lhs.span().merge(class_tok.span);
+                let (raw_name, class_span) = self.parse_name()?;
+                let class_name = self.resolve_name(&raw_name, false).0;
+                let span = lhs.span().merge(class_span);
                 lhs = Expr::Instanceof {
                     expr: Box::new(lhs),
                     class_name,
-                    class_span: class_tok.span,
+                    class_span,
                     span,
                 };
                 continue;
@@ -1202,12 +1459,8 @@ impl Parser {
             }
             TokenKind::New => {
                 self.advance();
-                let class_tok = self.expect_ident("class name after `new`")?;
-                let class_name = match class_tok.kind {
-                    TokenKind::Ident(n) => n,
-                    _ => unreachable!(),
-                };
-                let class_span = class_tok.span;
+                let (raw_name, class_span) = self.parse_name()?;
+                let class_name = self.resolve_name(&raw_name, false).0;
                 let (args, end_span) = if self.eat(&TokenKind::LParen) {
                     let mut args = Vec::new();
                     if !self.at(&TokenKind::RParen) {
@@ -1248,9 +1501,10 @@ impl Parser {
                 self.advance();
                 self.parse_qualified_member(class_name, span)
             }
-            TokenKind::Ident(name) => {
-                self.advance();
+            TokenKind::Ident(_) | TokenKind::Backslash | TokenKind::Namespace => {
+                let (name, _) = self.parse_name()?;
                 if self.at(&TokenKind::DoubleColon) {
+                    let name = self.resolve_name(&name, false).0;
                     return self.parse_qualified_member(name, span);
                 }
                 if self.at(&TokenKind::LParen) {
@@ -1265,8 +1519,10 @@ impl Parser {
                         }
                     }
                     let close = self.expect(&TokenKind::RParen, "`)` after arguments")?;
+                    let (callee, fallback) = self.resolve_name(&name, true);
                     Ok(Expr::Call {
-                        callee: name,
+                        fallback,
+                        callee,
                         callee_span: span,
                         args,
                         span: span.merge(close.span),
@@ -1388,27 +1644,7 @@ impl Parser {
 }
 
 fn stmt_span(s: &Stmt) -> Span {
-    match s {
-        Stmt::Echo(_, sp)
-        | Stmt::Print(_, sp)
-        | Stmt::Expr(_, sp)
-        | Stmt::Return(_, sp)
-        | Stmt::Break(_, sp)
-        | Stmt::Continue(_, sp) => *sp,
-        Stmt::Assign { span, .. }
-        | Stmt::AssignOp { span, .. }
-        | Stmt::IncDec { span, .. }
-        | Stmt::If { span, .. }
-        | Stmt::While { span, .. }
-        | Stmt::For { span, .. }
-        | Stmt::DoWhile { span, .. }
-        | Stmt::Foreach { span, .. }
-        | Stmt::Switch { span, .. }
-        | Stmt::Block(_, span) => *span,
-        Stmt::FnDecl(f) => f.span,
-        Stmt::ClassDecl(c) => c.span,
-        Stmt::Empty => Span::synthetic(),
-    }
+    s.span()
 }
 
 fn set_stmt_span(s: &mut Stmt, span: Span) {
@@ -1419,7 +1655,8 @@ fn set_stmt_span(s: &mut Stmt, span: Span) {
         | Stmt::Return(_, sp)
         | Stmt::Break(_, sp)
         | Stmt::Continue(_, sp) => *sp = span,
-        Stmt::Assign { span: sp, .. }
+        Stmt::Require { span: sp, .. }
+        | Stmt::Assign { span: sp, .. }
         | Stmt::AssignOp { span: sp, .. }
         | Stmt::IncDec { span: sp, .. }
         | Stmt::If { span: sp, .. }

@@ -1752,6 +1752,16 @@ impl Analyzer {
 
     fn analyze_stmt(&mut self, stmt: &ast::Stmt, ctx: &mut FnCtx) -> Option<TStmt> {
         match stmt {
+            ast::Stmt::Require { span, .. } => {
+                self.diags.emit(
+                    Diagnostic::error(
+                        "module dependencies require a file-based, top-level compilation context",
+                    )
+                    .with_code("E0273")
+                    .with_span(*span),
+                );
+                None
+            }
             ast::Stmt::Empty => None,
             ast::Stmt::Block(body, _) => Some(TStmt::Block(self.analyze_stmts(body, ctx))),
             ast::Stmt::Echo(exprs, _) => {
@@ -2799,7 +2809,15 @@ impl Analyzer {
                 callee_span,
                 args,
                 span,
-            } => self.infer_call(callee, *callee_span, args, *span, ctx),
+                fallback,
+            } => {
+                let name = if self.funcs.contains_key(&callee.to_ascii_lowercase()) {
+                    callee.as_str()
+                } else {
+                    fallback.as_deref().unwrap_or(callee)
+                };
+                self.infer_call(name, *callee_span, args, *span, ctx)
+            }
             ast::Expr::Ternary {
                 cond,
                 then,
@@ -4452,13 +4470,13 @@ fn stmt_terminates(stmt: &ast::Stmt) -> bool {
 }
 
 pub fn mangle_fn(name: &str) -> String {
-    format!("pxr$fn${}", name.to_ascii_lowercase())
+    format!("pxr$fn${}", name.to_ascii_lowercase().replace('\\', "$"))
 }
 
 pub fn mangle_method(class: &str, method: &str) -> String {
     format!(
         "pxr$m${}${}",
-        class.to_ascii_lowercase(),
+        class.to_ascii_lowercase().replace('\\', "$"),
         method.to_ascii_lowercase()
     )
 }
@@ -4466,7 +4484,7 @@ pub fn mangle_method(class: &str, method: &str) -> String {
 pub fn mangle_dispatcher(class: &str, method: &str) -> String {
     format!(
         "pxr$disp${}${}",
-        class.to_ascii_lowercase(),
+        class.to_ascii_lowercase().replace('\\', "$"),
         method.to_ascii_lowercase()
     )
 }

@@ -41,6 +41,12 @@ pub enum Stmt {
     },
     FnDecl(Box<FnDecl>),
     ClassDecl(Box<ClassDecl>),
+    Require {
+        path: String,
+        once: bool,
+        dir_relative: bool,
+        span: Span,
+    },
     Return(Option<Expr>, Span),
     If {
         cond: Expr,
@@ -91,6 +97,33 @@ pub enum Stmt {
     Continue(Option<u32>, Span),
     Block(Vec<Stmt>, Span),
     Empty,
+}
+
+impl Stmt {
+    pub fn span(&self) -> Span {
+        match self {
+            Stmt::Echo(_, sp)
+            | Stmt::Print(_, sp)
+            | Stmt::Expr(_, sp)
+            | Stmt::Return(_, sp)
+            | Stmt::Break(_, sp)
+            | Stmt::Continue(_, sp) => *sp,
+            Stmt::Require { span, .. }
+            | Stmt::Assign { span, .. }
+            | Stmt::AssignOp { span, .. }
+            | Stmt::IncDec { span, .. }
+            | Stmt::If { span, .. }
+            | Stmt::While { span, .. }
+            | Stmt::For { span, .. }
+            | Stmt::DoWhile { span, .. }
+            | Stmt::Foreach { span, .. }
+            | Stmt::Switch { span, .. }
+            | Stmt::Block(_, span) => *span,
+            Stmt::FnDecl(f) => f.span,
+            Stmt::ClassDecl(c) => c.span,
+            Stmt::Empty => Span::synthetic(),
+        }
+    }
 }
 
 /// One `case <expr>:` or `default:` arm of a `switch`.
@@ -352,6 +385,8 @@ pub enum Expr {
         span: Span,
     },
     Call {
+        /// Global fallback for an unqualified call in a namespace.
+        fallback: Option<String>,
         callee: String,
         callee_span: Span,
         args: Vec<Expr>,

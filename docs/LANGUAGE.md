@@ -373,6 +373,7 @@ are `W020x`.
 | `E0269` | Invalid abstract declaration, missing implementation, abstract/interface instantiation, or abstract parent call |
 | `E0270` | Invalid class/interface inheritance edge, duplicate supertype, or non-public interface method |
 | `E0271` | Static-member misuse, static/instance modifier mismatch, or unsupported static form |
+| `E0273` | Invalid/unresolved compile-time module dependency or missing file context |
 | `W0202` | `return` with a value at top level is ignored |
 
 ## Classes, Inheritance & Polymorphism
@@ -431,3 +432,29 @@ are `W020x`.
   static calls, uninitialized static properties, and direct array element writes
   through properties are not supported yet. Use a local array copy and assign the
   whole property when updating an array-valued static property.
+
+## Namespaces and imports
+
+* `namespace App\Feature;` applies to the following declarations and code.
+  `namespace App\Feature { ... }` scopes a braced block; `namespace { ... }`
+  selects the global namespace. A file cannot mix braced and unbraced forms.
+* `use Vendor\Thing as Alias;` imports a class/interface or namespace prefix;
+  `use function Vendor\helper as localHelper;` imports a function. Aliases are
+  local to the file and namespace block; comma-separated imports are supported.
+  Grouped imports and `use const` are not implemented.
+* `Thing` resolves in the current namespace or through its import;
+  `\Vendor\Thing` is absolute, and `namespace\Thing` is namespace-relative.
+* Unqualified function calls try the namespaced function and then the global
+  function or builtin. Explicitly qualified calls have no global fallback.
+* Namespaces and imports must be top-level. Namespace declarations precede code.
+
+## Compile-time modules
+
+`require_once __DIR__ . "/Library.php";` loads declarations at compile time.
+Literal `require "Library.php";` is also supported. Relative paths resolve from
+that file's directory. Dependencies must precede executable top-level statements;
+loaded files may contain only declarations and dependencies. Once dependencies
+are deduplicated by canonical path. Non-once cycles and dynamic paths are errors.
+See [`MODULES.md`](MODULES.md) for examples and the distinction from runtime PHP
+inclusion. `tokens` and `ast` inspect only the requested file; semantic/build
+commands resolve its full dependency graph.

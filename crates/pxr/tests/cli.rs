@@ -1859,3 +1859,167 @@ fn static_member_diagnostics_are_rejected() {
         assert!(r.stderr.contains(code), "{name}: {}", r.stderr);
     }
 }
+
+#[test]
+fn namespaces_aliases_and_function_fallback_match_php() {
+    assert_matches_php(
+        "namespaces",
+        include_str!("../../../examples/namespaces.php"),
+    );
+    assert_matches_php(
+        "namespace_semicolon",
+        r#"<?php
+namespace Alpha;
+function label(): string { return "alpha"; }
+class Item { public static function value(): int { return 4; } }
+namespace Beta;
+use Alpha\Item;
+use function Alpha\label;
+echo label() . ":" . Item::value() . ":" . strlen("ok") . "\n";
+namespace Gamma;
+function strlen(string $value): int { return 99; }
+echo strlen("ok") . ":" . \strlen("ok") . "\n";
+"#,
+    );
+}
+
+#[test]
+fn module_example_runs_and_all_compiler_commands_resolve_dependencies() {
+    if !have_cc() {
+        return;
+    }
+    let f = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/modules.php");
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "[Hello, PXR]\n1\ncontract\n6\n");
+    if have_php() {
+        let php = Command::new("php").arg(&f).output().unwrap();
+        assert!(
+            php.status.success(),
+            "{}",
+            String::from_utf8_lossy(&php.stderr)
+        );
+        assert_eq!(r.stdout.as_bytes(), php.stdout);
+    }
+    for command in ["check", "emit-ir", "emit-llvm"] {
+        let r = run_ok(&[command, f.to_str().unwrap()]);
+        assert_eq!(r.code, 0, "{command}: {}", r.stderr);
+    }
+}
+
+#[test]
+fn module_loader_resolves_transitive_require_once_cycles() {
+    if !have_cc() {
+        return;
+    }
+    let main = temp_php(
+        "module_graph",
+        r#"<?php
+require_once __DIR__ . "/graph/a.php";
+require_once __DIR__ . "/graph/b.php";
+echo \Graph\a() . ":" . \Graph\b() . "\n";
+"#,
+    );
+    let dir = main.parent().unwrap().join("graph");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("a.php"),
+        r#"<?php namespace Graph;
+require_once __DIR__ . "/b.php";
+function a(): int { return 1; }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("b.php"),
+        r#"<?php namespace Graph;
+require_once __DIR__ . "/a.php";
+function b(): int { return 2; }
+"#,
+    )
+    .unwrap();
+    let r = run_ok(&["run", main.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "1:2\n");
+}
+
+#[test]
+fn invalid_namespaces_and_module_forms_are_rejected() {
+    let cases = [
+        ("mixed", "namespace A; namespace B {}", "E0100"),
+        ("late", "echo 1; namespace A;", "E0100"),
+        ("import_before_namespace", "use A\\B; namespace C;", "E0100"),
+        ("nested", "namespace A { namespace B {} }", "E0100"),
+        ("outside", "namespace A {} echo 1;", "E0100"),
+        ("alias", "use A\\B as X; use C\\D as x;", "E0100"),
+        ("alias_declaration", "use A\\B as X; class X {}", "E0100"),
+        ("grouped", "use A\\{B, C};", "E0100"),
+        ("dynamic", "$file = 'x.php'; require_once $file;", "E0100"),
+        (
+            "missing",
+            "require_once 'pxr_nonexistent_module.php';",
+            "E0273",
+        ),
+        (
+            "conditional",
+            "if (true) { require_once 'x.php'; }",
+            "E0273",
+        ),
+        ("after_code", "echo 1; require_once 'x.php';", "E0273"),
+        (
+            "qualified_no_fallback",
+            "namespace A; Missing\\strlen('x');",
+            "E0232",
+        ),
+        (
+            "relative_no_fallback",
+            "namespace A; namespace\\strlen('x');",
+            "E0232",
+        ),
+        (
+            "class_no_fallback",
+            "namespace A { class X {} } namespace B { $x = new X(); }",
+            "E0205",
+        ),
+    ];
+    for (name, source, code) in cases {
+        let f = temp_php(&format!("module_invalid_{name}"), source);
+        let r = run_ok(&["check", f.to_str().unwrap()]);
+        assert_ne!(r.code, 0, "accepted {name}");
+        assert!(r.stderr.contains(code), "{name}: {}", r.stderr);
+    }
+}
+
+#[test]
+fn module_diagnostics_name_the_dependency_and_show_its_source() {
+    let main = temp_php(
+        "module_diagnostics",
+        "<?php require_once __DIR__ . '/broken.php';",
+    );
+    let dependency = main.parent().unwrap().join("broken.php");
+    std::fs::write(
+        &dependency,
+        "<?php\nnamespace Broken;\nfunction fail(): int { return \"bad\"; }\n",
+    )
+    .unwrap();
+    for command in ["check", "build", "emit-ir", "emit-llvm"] {
+        let r = run_ok(&[command, main.to_str().unwrap()]);
+        assert_ne!(r.code, 0, "{command}");
+        assert!(r.stderr.contains("broken.php"), "{}", r.stderr);
+        assert!(r.stderr.contains("return \"bad\""), "{}", r.stderr);
+        assert!(r.stderr.contains("E0215"), "{}", r.stderr);
+    }
+    std::fs::write(&dependency, "<?php\n\necho 'side effect';").unwrap();
+    let r = run_ok(&["check", main.to_str().unwrap()]);
+    assert_ne!(r.code, 0);
+    assert!(r.stderr.contains("declarations and dependencies only"));
+    assert!(r.stderr.contains("echo 'side effect'"), "{}", r.stderr);
+    std::fs::write(
+        &dependency,
+        "<?php require __DIR__ . '/module_diagnostics.php';",
+    )
+    .unwrap();
+    let r = run_ok(&["check", main.to_str().unwrap()]);
+    assert_ne!(r.code, 0);
+    assert!(r.stderr.contains("cyclic"), "{}", r.stderr);
+}

@@ -89,9 +89,151 @@ pub fn check_source(src: &str) -> (Option<TProgram>, Diagnostics) {
 }
 
 pub fn check_file(path: &Path) -> Result<Diagnostics, CompileError> {
-    let src = read_source(path)?;
-    let (_, diags) = check_source(&src);
-    Ok(diags)
+    read_source(path)?;
+    Ok(check_path(path).1)
+}
+
+/// Resolve declaration-only modules and check a complete file-based program.
+pub fn check_path(path: &Path) -> (Option<TProgram>, Diagnostics) {
+    let mut loader = ModuleLoader::default();
+    loader.load(path, false, true, pxr_diag::Span::synthetic());
+    let mut program = None;
+    if !loader.diags.has_errors() {
+        let ast = pxr_ast::Program {
+            items: std::mem::take(&mut loader.items),
+            span: pxr_diag::Span::synthetic(),
+        };
+        let (typed, diags) = pxr_sema::analyze(&ast);
+        loader.diags.extend(diags);
+        program = typed;
+    }
+    let mut diagnostics = Diagnostics::new();
+    for original in loader.diags.items() {
+        let mut diag = original.clone();
+        if let Some(span) = &mut diag.span {
+            if !span.is_synthetic() {
+                if let Some((base, path, source)) =
+                    loader.sources.iter().find(|(base, _, source)| {
+                        span.start >= *base && span.start <= base + source.len()
+                    })
+                {
+                    span.start -= base;
+                    span.end = span.end.saturating_sub(*base).min(source.len());
+                    diag.source = Some((path.display().to_string(), source.clone()));
+                }
+            }
+        }
+        diagnostics.emit(diag);
+    }
+    if diagnostics.has_errors() {
+        program = None;
+    }
+    (program, diagnostics)
+}
+
+#[derive(Default)]
+struct ModuleLoader {
+    items: Vec<pxr_ast::Stmt>,
+    sources: Vec<(usize, PathBuf, String)>,
+    next_offset: usize,
+    seen: std::collections::HashSet<PathBuf>,
+    active: std::collections::HashSet<PathBuf>,
+    diags: Diagnostics,
+}
+
+impl ModuleLoader {
+    fn error(&mut self, span: pxr_diag::Span, message: impl Into<String>) {
+        self.diags.emit(
+            pxr_diag::Diagnostic::error(message)
+                .with_code("E0273")
+                .with_span(span),
+        );
+    }
+
+    fn load(&mut self, requested: &Path, once: bool, entry: bool, site: pxr_diag::Span) {
+        let path = match requested.canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                self.error(
+                    site,
+                    format!("cannot resolve module `{}`: {error}", requested.display()),
+                );
+                return;
+            }
+        };
+        if once && self.seen.contains(&path) {
+            return;
+        }
+        if self.active.contains(&path) || self.active.len() >= 128 {
+            self.error(site, format!("cyclic or excessively deep module dependency at `{}`; use require_once for shared dependencies", path.display()));
+            return;
+        }
+        let source = match read_source(&path) {
+            Ok(source) => source,
+            Err(_) => {
+                self.error(site, format!("cannot read module `{}`", path.display()));
+                return;
+            }
+        };
+        let offset = self.next_offset + 1;
+        self.next_offset = offset + source.len();
+        let (program, diagnostics) = pxr_parser::parse_at(&source, offset);
+        self.sources.push((offset, path.clone(), source));
+        let failed = diagnostics.has_errors();
+        self.diags.extend(diagnostics);
+        if failed {
+            return;
+        }
+        self.seen.insert(path.clone());
+        self.active.insert(path.clone());
+        let mut executable = false;
+        if let Some(program) = program {
+            for item in program.items {
+                match item {
+                    pxr_ast::Stmt::Require {
+                        path: dependency,
+                        once,
+                        dir_relative,
+                        span,
+                    } => {
+                        if executable {
+                            self.error(
+                                span,
+                                "module dependencies must precede executable top-level statements",
+                            );
+                            continue;
+                        }
+                        if dependency.contains('\0') {
+                            self.error(span, "module paths cannot contain NUL bytes");
+                            continue;
+                        }
+                        let directory = path.parent().unwrap();
+                        let dependency = if dir_relative {
+                            PathBuf::from(format!("{}{dependency}", directory.display()))
+                        } else {
+                            directory.join(dependency)
+                        };
+                        self.load(&dependency, once, false, span);
+                    }
+                    pxr_ast::Stmt::FnDecl(_)
+                    | pxr_ast::Stmt::ClassDecl(_)
+                    | pxr_ast::Stmt::Empty => self.items.push(item),
+                    item if !entry => self.error(
+                        item.span(),
+                        format!(
+                            "module `{}` must contain declarations and dependencies only",
+                            path.display()
+                        ),
+                    ),
+                    _ => {
+                        executable = true;
+                        self.items.push(item);
+                    }
+                }
+            }
+        }
+        self.active.remove(&path);
+    }
 }
 
 /// Result of a successful build.
@@ -105,10 +247,8 @@ pub struct BuildResult {
 }
 
 pub fn build(opts: &BuildOptions) -> Result<BuildResult, BuildError> {
-    let src = read_source(&opts.input).map_err(BuildError::Compile)?;
-
     let t0 = Instant::now();
-    let (program, diags) = check_source(&src);
+    let (program, diags) = check_path(&opts.input);
     let frontend_time = t0.elapsed();
     if diags.has_errors() || program.is_none() {
         return Err(BuildError::Compile(CompileError::new(diags)));
@@ -408,9 +548,7 @@ fn run_tool(cmd: &mut Command, what: &str) -> Result<(), BuildError> {
 }
 
 fn indent(s: &str) -> String {
-    s.lines()
-        .map(|l| format!("    {l}\n"))
-        .collect::<String>()
+    s.lines().map(|l| format!("    {l}\n")).collect::<String>()
 }
 
 /// FNV-1a 64-bit hash, used only for cache keys.
@@ -430,6 +568,17 @@ pub fn ir_for_source(src: &str) -> Result<(String, OptStats), CompileError> {
         return Err(CompileError::new(diags));
     }
     let mut module: Module = pxr_codegen::lower_program(&program.unwrap());
+    let stats = pxr_opt::optimize(&mut module);
+    Ok((module.to_text(), stats))
+}
+
+/// Optimized IR for a complete module graph.
+pub fn ir_for_file(path: &Path) -> Result<(String, OptStats), CompileError> {
+    let (program, diagnostics) = check_path(path);
+    let Some(program) = program else {
+        return Err(CompileError::new(diagnostics));
+    };
+    let mut module = pxr_codegen::lower_program(&program);
     let stats = pxr_opt::optimize(&mut module);
     Ok((module.to_text(), stats))
 }

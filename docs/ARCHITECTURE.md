@@ -142,3 +142,18 @@ main.php: error: [E0220] undefined variable `$x`
 
 Error codes are stable and documented in [`LANGUAGE.md`](LANGUAGE.md); tests
 assert on them.
+
+## Compile-time modules and source mapping
+
+The parser resolves namespace declarations and file/block-local imports to
+canonical symbol names. Unqualified namespaced function calls retain an explicit
+global fallback candidate for semantic analysis; aliases and qualified names do
+not. Namespace separators are encoded safely in LLVM link symbols.
+
+The driver's `check_path` loads declaration-only dependencies, parses each file
+independently, and combines the declarations with the entry-point statements.
+Canonical paths govern `require_once` identity and cycle checks. The parser's
+`parse_at` assigns each file a separate byte range; the driver maps diagnostic
+spans back to the originating file and source text before rendering. All semantic
+CLI commands share this resolver. `check_source` and `ir_for_source` remain
+filesystem-independent and reject module dependencies without a file context.

@@ -164,7 +164,7 @@ fn cmd_check(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let (_, diags) = pxr_driver::check_source(&src);
+    let (_, diags) = pxr_driver::check_path(&file);
     report(&diags, &src, &file)
 }
 
@@ -239,18 +239,16 @@ fn cmd_run(args: &[String]) -> i32 {
 }
 
 fn cmd_emit_ir(args: &[String]) -> i32 {
-    with_source(args, |src, _file| {
-        match pxr_driver::ir_for_source(src) {
-            Ok((text, stats)) => {
-                eprint!(
-                    "; pxr: {} constant(s) folded, {} branch(es) folded, {} instruction(s) removed\n",
-                    stats.constants_folded, stats.branches_folded, stats.instructions_removed
-                );
-                print!("{text}");
-                0
-            }
-            Err(e) => report(&e.diagnostics, src, Path::new("<input>")),
+    with_source(args, |src, file| match pxr_driver::ir_for_file(file) {
+        Ok((text, stats)) => {
+            eprint!(
+                "; pxr: {} constant(s) folded, {} branch(es) folded, {} instruction(s) removed\n",
+                stats.constants_folded, stats.branches_folded, stats.instructions_removed
+            );
+            print!("{text}");
+            0
         }
+        Err(e) => report(&e.diagnostics, src, file),
     })
 }
 
@@ -258,7 +256,7 @@ fn cmd_emit_llvm(args: &[String]) -> i32 {
     with_source(args, |src, file| {
         let o = parse_options(args, false);
         let _ = o;
-        match pxr_driver::check_source(src) {
+        match pxr_driver::check_path(file) {
             (Some(program), diags) if !diags.has_errors() => {
                 let mut module = pxr_codegen::lower_program(&program);
                 pxr_opt::optimize(&mut module);
@@ -361,7 +359,10 @@ fn report_build_error(e: BuildError, file: &Path) -> i32 {
     match e {
         BuildError::Compile(c) => {
             let src = std::fs::read_to_string(file).unwrap_or_default();
-            eprint!("{}", c.diagnostics.render(&src, &file.display().to_string()));
+            eprint!(
+                "{}",
+                c.diagnostics.render(&src, &file.display().to_string())
+            );
             1
         }
         other => {
@@ -385,7 +386,12 @@ fn print_build_stats(result: &pxr_driver::BuildResult, file: &Path) {
         "  optimized: {} folded, {} branch-folded, {} removed, {} jumps removed",
         s.constants_folded, s.branches_folded, s.instructions_removed, s.jumps_removed
     );
-    eprintln!("  output   : {} bytes", std::fs::metadata(&result.output).map(|m| m.len()).unwrap_or(0));
+    eprintln!(
+        "  output   : {} bytes",
+        std::fs::metadata(&result.output)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    );
 }
 
 fn describe_token(k: &pxr_lexer::TokenKind) -> String {

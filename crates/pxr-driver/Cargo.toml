@@ -6,6 +6,7 @@ license.workspace = true
 description = "PXR compilation driver: orchestrates the pipeline and the LLVM toolchain"
 
 [dependencies]
+pxr-ast.workspace = true
 pxr-codegen.workspace = true
 pxr-diag.workspace = true
 pxr-ir.workspace = true

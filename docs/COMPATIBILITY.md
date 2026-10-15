@@ -82,8 +82,8 @@ behavioural divergence.
 | Leading‑zero octal literal (`0755`) | **Warning** `W0001`, read as decimal |
 | Functions that return `string|false` / `int|false` (`strpos`, `strstr`, `base64_decode`, `hex2bin`, `substr_compare`, …) | Not yet — needs a union / `false` value type; only the never-failing encoders above are provided |
 | `number_format` | Not yet |
-| Traits, enums, namespaces, closures | Not yet |
-| `include`/`require`, `global`, function-local `static`, references `&` | Not yet |
+| Traits, enums, closures | Not yet |
+| Dynamic/runtime `include`/`require`, `global`, function-local `static`, references `&` | Not yet; literal top-level `require`/`require_once` of declarations is supported |
 | Exceptions, generators, attributes | Not yet |
 
 ### Notes
@@ -246,6 +246,21 @@ properties can be read, copied, and replaced; direct element assignment remains
 unsupported as it is for other property arrays. Object-style calls to static
 methods and late static binding (`static::`) are rejected with `E0271`.
 Function-local static variables and dynamic class/member names remain unsupported.
+
+**Namespaces and modules.** Braced and unbraced namespaces, qualified names,
+class/namespace aliases, and `use function` imports are supported. Unqualified
+function calls fall back to global functions and builtins; qualified function
+names and class references do not. Imports apply only to their file and namespace
+block. Grouped imports, constant imports, autoloading, and dynamic names remain
+unsupported.
+
+Literal `require`/`require_once` dependencies are resolved at compile time and must
+precede executable top-level statements. Dependencies can contain declarations
+and further dependencies, but cannot execute top-level statements. Relative paths
+resolve from the containing file, independent of the process working directory or
+PHP `include_path`. Use `__DIR__ . "/file.php"` for an unambiguous shared PHP/PXR
+path. Missing files and unsupported dependency forms fail compilation (`E0273`).
+This is a static module resolver; runtime inclusion of untyped PHP remains M4.
 
 **Fail loud, never silent.** Features not yet implemented (such as
 `null`, keyed `foreach`, nested array assignment, complex interpolation forms)

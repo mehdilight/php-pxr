@@ -39,6 +39,7 @@ version = "0.1.0"
 name = "pxr-driver"
 version = "0.1.0"
 dependencies = [
+ "pxr-ast",
  "pxr-codegen",
  "pxr-diag",
  "pxr-ir",

@@ -66,6 +66,10 @@ pub enum TokenKind {
     Interface,
     Implements,
     Static,
+    Namespace,
+    Use,
+    Require,
+    RequireOnce,
     New,
     Public,
     Private,
@@ -95,6 +99,7 @@ pub enum TokenKind {
     Arrow,
     DoubleArrow,
     DoubleColon,
+    Backslash,
     Question,
 
     // Operators.
@@ -189,6 +194,10 @@ impl TokenKind {
             TokenKind::Interface => "interface",
             TokenKind::Implements => "implements",
             TokenKind::Static => "static",
+            TokenKind::Namespace => "namespace",
+            TokenKind::Use => "use",
+            TokenKind::Require => "require",
+            TokenKind::RequireOnce => "require_once",
             TokenKind::New => "new",
             TokenKind::Public => "public",
             TokenKind::Private => "private",
@@ -214,6 +223,7 @@ impl TokenKind {
             TokenKind::Arrow => "->",
             TokenKind::DoubleArrow => "=>",
             TokenKind::DoubleColon => "::",
+            TokenKind::Backslash => "\\",
             TokenKind::Question => "?",
             TokenKind::Assign => "=",
             TokenKind::Plus => "+",
@@ -433,6 +443,7 @@ impl<'a> Lexer<'a> {
         } else {
             self.pos += 1;
             match b {
+                b'\\' => TokenKind::Backslash,
                 b'(' => TokenKind::LParen,
                 b')' => TokenKind::RParen,
                 b'{' => TokenKind::LBrace,
@@ -1009,6 +1020,10 @@ fn keyword(word: &str) -> Option<TokenKind> {
         "interface" => TokenKind::Interface,
         "implements" => TokenKind::Implements,
         "static" => TokenKind::Static,
+        "namespace" => TokenKind::Namespace,
+        "use" => TokenKind::Use,
+        "require" => TokenKind::Require,
+        "require_once" => TokenKind::RequireOnce,
         "new" => TokenKind::New,
         "public" => TokenKind::Public,
         "private" => TokenKind::Private,

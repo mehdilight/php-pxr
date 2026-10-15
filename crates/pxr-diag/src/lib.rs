@@ -58,6 +58,8 @@ impl Severity {
 
 #[derive(Clone, Debug)]
 pub struct Diagnostic {
+    /// Optional source context for a diagnostic originating in another module.
+    pub source: Option<(String, String)>,
     pub severity: Severity,
     pub message: String,
     pub span: Option<Span>,
@@ -70,6 +72,7 @@ pub struct Diagnostic {
 impl Diagnostic {
     pub fn error(message: impl Into<String>) -> Self {
         Diagnostic {
+            source: None,
             severity: Severity::Error,
             message: message.into(),
             span: None,
@@ -80,6 +83,7 @@ impl Diagnostic {
 
     pub fn warning(message: impl Into<String>) -> Self {
         Diagnostic {
+            source: None,
             severity: Severity::Warning,
             message: message.into(),
             span: None,
@@ -163,10 +167,12 @@ impl Diagnostics {
 }
 
 fn render_one(out: &mut String, diag: &Diagnostic, source: &str, filename: &str) {
-    let code = diag
-        .code
-        .map(|c| format!("[{c}] "))
-        .unwrap_or_default();
+    let (source, filename) = diag
+        .source
+        .as_ref()
+        .map(|(name, text)| (text.as_str(), name.as_str()))
+        .unwrap_or((source, filename));
+    let code = diag.code.map(|c| format!("[{c}] ")).unwrap_or_default();
     let _ = writeln!(
         out,
         "{}: {}: {}{}",

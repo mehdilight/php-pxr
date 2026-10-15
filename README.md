@@ -17,12 +17,12 @@ The same `main.php` can still be run by the traditional interpreter for
 comparison; PXR programs themselves run **without PHP**, linking only the small
 PXR runtime.
 
-> **Project status: milestone 3 in progress — user types & modules.**
-> Milestones 1 and 2 are complete (control flow, arrays, byte strings, and
-> standard-library builtins). M3 now supports classes, typed properties,
-> constructors, visibility, inheritance, polymorphic method dispatch, `parent::`,
-> `instanceof`, abstract classes and methods, interfaces, and static properties
-> and methods. Namespaces and modules remain planned. See [`docs/MILESTONES.md`](docs/MILESTONES.md).
+> **Project status: milestone 3 complete — user types & modules.**
+> PXR supports classes, typed properties, constructors, visibility, inheritance,
+> polymorphic dispatch, abstract classes, interfaces, static members, namespaces,
+> imports, and compile-time modules via `require`/`require_once`. Dependencies are
+> declaration-only; runtime includes and dynamic PHP interop remain planned for
+> M4. See [`docs/MILESTONES.md`](docs/MILESTONES.md) and [`docs/MODULES.md`](docs/MODULES.md).
 
 ---
 
@@ -112,6 +112,9 @@ migration path possible.
   single inheritance, dynamic dispatch, `parent::`, `instanceof`, and abstract
   classes and methods, interface contracts, calls through interface types, and
   static properties/methods via `Class::`, `self::`, and `parent::`.
+* **Modules** — braced and unbraced namespaces, qualified names, class/namespace
+  aliases, `use function`, and compile-time `require`/`require_once` dependencies
+  with diagnostics pointing to the originating file.
 * **Data** — homogeneous `array<T>` values (PHP ordered‑map semantics) with
   `[...]`/`array(...)` literals, indexing, append, `count`, and `foreach`.
 * **Operators** — ternary `? :`, null coalescing `??`, spaceship `<=>`,
@@ -186,10 +189,10 @@ automatically when no C compiler is available.
 Tracked honestly in [`docs/ROADMAP.md`](docs/ROADMAP.md). The larger items:
 keyed `foreach`, `echo` of arrays, nested array assignment, `null`/nullable
 types, integer‑overflow → `float` promotion, late static binding (`static::`),
-namespaces, generics,
+generics,
 ownership & borrowing, the complex string‑interpolation forms (`"$a[0]"`,
 `"{$expr}"`, `"${name}"`, `"$obj->p"`; the simple `"$name"` / `"{$name}"` work),
-exceptions, modules/`include`, C interop (`extern`), async/await and concurrency
+exceptions, runtime `include`/`require` interop, C interop (`extern`), async/await and concurrency
 (planned for M7; see [`docs/ASYNC.md`](docs/ASYNC.md)), and the
 `mixed`/dynamic escape hatch for gradual migration.
 

@@ -286,7 +286,7 @@ concatenation are byte-exact — matching PHP.
 **Acceptance.** A string‑heavy program (e.g. word count) compiles and matches PHP —
 the word‑count block at the end of `examples/compat.php` does exactly this. ✅
 
-## 🚧 M3 — User types & modules
+## ✅ M3 — User types & modules
 
 * `class`, properties, methods, constructors, visibility (`public`, `protected`, `private`), `$this`, method chaining, instantiation (`new`).
 * Single inheritance (`extends`), method overriding, `parent::`, `instanceof`.
@@ -411,7 +411,39 @@ the word‑count block at the end of `examples/compat.php` does exactly this. �
   initialization, and invalid programs — 70 CLI tests total.
   Example: `examples/static.php`.
 
-**Next:** namespaces and module resolution.
+**Delivered (M3.6: namespaces, imports & compile-time modules slice).**
+
+* Braced/unbraced `namespace` declarations, global namespace blocks, qualified
+  and fully qualified names, and `namespace\Name` relative references.
+* Class/namespace aliases (`use A\B as C`) and function imports
+  (`use function A\f as g`), with file/block-local import tables and duplicate
+  alias/declaration checks. Namespaced unqualified function calls try the local
+  function first, then global functions/builtins; class names never fall back.
+* Literal top-level `require`/`require_once` dependencies, including
+  `__DIR__ . "/path.php"`, resolved relative to the containing file. Canonical
+  paths deduplicate once dependencies, including safe require_once cycles;
+  non-once cycles, missing files, dynamic paths, late/conditional dependencies,
+  and dependencies with executable top-level statements are rejected.
+* Dependencies are parsed independently and checked as one typed program.
+  Diagnostics retain the originating file and source excerpt. `check`, `build`,
+  `run`, `emit-ir`, and `emit-llvm` all use the same resolver; source-only APIs
+  reject dependencies without a file context.
+* Qualified LLVM symbol names use namespace-safe mangling. No runtime PHP or
+  module loader is required by the compiled program.
+* Five new CLI tests cover PHP output comparisons, namespace/import resolution,
+  shared dependency graphs, once cycles, command consistency, included-file
+  diagnostics, and invalid forms — 75 CLI tests total.
+  Examples: `examples/namespaces.php`, `examples/modules.php`.
+
+**Acceptance — met.** Namespaced code split across declaration-only PHP files
+compiles to a native executable, matches PHP output, and reports errors against
+the correct source file. Existing programs and all workspace tests pass. ✅
+
+**Known limits.** No grouped or constant imports, autoloading, dynamic include
+paths, dependency side effects, runtime `include`, or untyped PHP interop. Static
+member limits from M3.5 remain. See [`MODULES.md`](MODULES.md).
+
+**Next:** M4 — gradual migration (`mixed`, narrowing, and dynamic PHP interop).
 
 ## ⛔ M4 — Gradual migration
 
