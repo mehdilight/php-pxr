@@ -5,8 +5,9 @@ written in C (`runtime/pxr_rt.c`), embedded into the `pxr` binary at build time,
 compiled on demand with the system C compiler, and cached as an object file.
 
 The runtime provides the value operations emitted by the native backend,
-including strings, arrays, class membership, and boxed scalar conversions.
-Compiled programs do not need a PHP interpreter or bytecode engine.
+including strings, arrays, class membership, and tagged mixed operations.
+Native-only programs do not need PHP; explicit legacy boundaries start a PHP CLI
+worker when executed.
 
 ## Value representation
 
@@ -25,7 +26,8 @@ Compiled programs do not need a PHP interpreter or bytecode engine.
 
 ## Memory model
 
-Strings and arrays are immutable‑to‑the‑runtime. Operations that produce a string
+Strings are immutable; array mutations operate on private value copies.
+Operations that produce a string
 (`pxr_str_concat`, `pxr_i64_to_str`, …) or a new array (`pxr_array_new`) allocate
 from a **bump arena**:
 
@@ -244,23 +246,49 @@ signature `i32 @main()` so the process exit status is well defined.
 
 ## Caching
 
-The runtime object is keyed by an FNV‑1a hash of its source and stored under
+The runtime object is keyed by an FNV‑1a hash of its combined C/PHP source and
+selected C compiler path, and stored under
 `$PXR_CACHE_DIR` (default `~/.cache/pxr`, falling back to
 `$HOME/.cache/pxr` and then the temp directory). The first build compiles it; later
-builds reuse it. If the cache directory is not writable, PXR compiles the runtime
+builds reuse it. Builds compile privately and publish cache objects atomically
+so concurrent builds cannot observe partial output. If the cache directory is not writable, PXR compiles the runtime
 into the per‑build temporary directory instead.
 
-## Scalar mixed boxes (M4.1)
+## Tagged mixed values (M4)
 
-`pxr_mixed_box(tag, bits)` creates an immutable arena-allocated scalar box. Tags
-1–4 identify `int`, `float`, `bool`, and `string`; float bits are preserved and
-strings remain length-aware byte strings. Mixed values themselves use storage
-tag 7 when placed in a property or array slot, whose payload is the box pointer.
-Copies can share scalar boxes because neither the tag nor the payload mutates.
+`pxr_mixed_box(tag, bits)` allocates a tag/payload pair. Tags 0–6 identify null,
+int, float, bool, byte string, array, and object. Storage tag 7 denotes a box
+pointer in an array/property slot. Scalars and strings share immutable boxes;
+arrays normalize their entries to mixed boxes and deep-copy through storage,
+arguments, returns, foreach, constructors, and array transforms. Objects retain
+reference identity. Array copies carry comparison lineage until mutation,
+preserving PHP copy-on-write equality shortcuts even with NaN elements.
 
-`pxr_mixed_is`, `pxr_mixed_i64`, `pxr_mixed_f64`, `pxr_mixed_bool`,
-`pxr_mixed_str`, and `pxr_mixed_print` implement predicates and conversions.
-`pxr_mixed_identical` compares tags first, then scalar values; strings compare
-by bytes and floating-point comparison preserves IEEE NaN and signed-zero rules.
-Invalid or uninitialized boxes terminate with an error. Array/object/null boxing
-and runtime PHP interop are not implemented in this slice.
+Predicates/conversions inspect tags; guards unbox proven arrays and objects.
+Strict equality recurses over ordered array keys/values and uses object identity.
+Mixed operators implement numeric-string conversion, integer overflow promotion,
+array union, bitwise operations, loose comparison, and ordering. NaNs and
+incomparable arrays/objects retain PHP's distinct relational/spaceship behavior.
+Generated `pxr_native_object_to_string` dispatches compiled magic methods; opaque
+PHP handles stringify and compare in their worker. Native recursive comparisons
+and bridge values have bounded nesting rather than risking stack overflow.
+
+## PHP CLI interop (M4)
+
+`pxr_php_include` and `pxr_php_call` start a persistent worker lazily. Its PHP
+source (`runtime/pxr_php_worker.php`) is embedded alongside the C runtime and
+included in the runtime cache hash. The worker is launched directly with exec,
+not through a shell. Requests use stdin; responses use a dedicated descriptor 3
+pipe. Ordinary stdout/stderr stay separate, including direct PHP stream writes.
+The parent flushes native output before a request; the worker flushes PHP output
+before acknowledging it.
+
+The wire format is length-prefixed binary data with little-endian 64-bit
+integers/doubles, binary strings, ordered array keys, and object handle IDs.
+Arrays cross by value; retained array origins preserve PHP comparison behavior
+across round trips. Mutations acquire a new origin. PHP objects are retained in
+the worker with stable IDs.
+Resources, references, callbacks, and native object transfers fail explicitly.
+Uncaught PHP exceptions become native fatal errors; PHP exit codes propagate.
+Shutdown closes the request stream and reaps the child process. See
+[`INTEROP.md`](INTEROP.md) for the user-facing contract.

@@ -18,6 +18,8 @@ Run any of these with `pxr run <file>`, or from a release build:
 | `static.php` | Static properties/methods, inheritance, `self::`, `parent::`, array copying | ✅ |
 | `namespaces.php` | Namespace blocks, aliases, qualified names, function fallback | ✅ |
 | `modules.php` | Compile-time dependencies in `modules/`, aliases, cross-file types | ✅ |
+| `containers.php` | Mixed arrays/objects, value copies, identity, guards, dynamic operators | ✅ |
+| `migration/main.php` | Native catalog totals with legacy PHP CSV I/O and persistent state | ✅ |
 | `mixed.php` | Tagged scalar values, predicates, conversions, properties, strict comparisons | ✅ |
 | `nulls.php` | Boxed nulls, predicates, conversions, strict matching, lazy coalescing | ✅ |
 | `narrowing.php` | Scalar guards, early returns, short-circuiting, guarded mixed mutation | ✅ |

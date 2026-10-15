@@ -2124,21 +2124,6 @@ echo $value . "\n";
 fn unsupported_mixed_operations_are_rejected() {
     let cases = [
         (
-            "arithmetic",
-            "function f(mixed $v): mixed { return $v + 1; }",
-            "E0274",
-        ),
-        (
-            "loose_compare",
-            "function f(mixed $v): bool { return $v == 1; }",
-            "E0274",
-        ),
-        (
-            "ordering",
-            "function f(mixed $v): bool { return $v < 1; }",
-            "E0274",
-        ),
-        (
             "implicit_unbox",
             "function f(mixed $v): int { return $v; }",
             "E0215",
@@ -2150,24 +2135,14 @@ fn unsupported_mixed_operations_are_rejected() {
         ),
         ("null_into_concrete_variable", "$v = 1; $v = null;", "E0212"),
         (
-            "array_box",
-            "function f(mixed $v): void {} f([1]);",
-            "E0231",
+            "invalid_stringifier_return",
+            "class C { public function __toString(): int { return 1; } }",
+            "E0275",
         ),
         (
-            "object_box",
-            "class C {} function f(mixed $v): void {} f(new C());",
-            "E0231",
-        ),
-        (
-            "whole_array_conversion",
-            "$a: array<mixed> = [1, 2];",
-            "E0212",
-        ),
-        (
-            "array_property_default",
-            "class C { public mixed $value = [1]; }",
-            "E0274",
+            "invalid_stringifier_arguments",
+            "class C { public function __toString(int $v): string { return strval($v); } }",
+            "E0275",
         ),
         (
             "builtin",
@@ -2276,7 +2251,7 @@ fn mixed_narrowing_invalidates_assignments_and_joins() {
     let cases = [
         ("assignment", "function f(mixed $v): int { if (is_int($v)) { $v = 'changed'; return $v + 1; } return 0; }"),
         ("branch_join", "function f(mixed $v, bool $b): int { if (!is_int($v)) { return 0; } if ($b) { $v = 'changed'; } return $v + 1; }"),
-        ("loop_backedge", "function f(mixed $v): void { if (is_int($v)) { $i = 0; while ($i < 2) { echo $v + 1; $v = 'changed'; $i++; } } }"),
+        ("loop_backedge", "function requireInteger(int $v): void {} function f(mixed $v): void { if (is_int($v)) { $i = 0; while ($i < 2) { requireInteger($v); $v = 'changed'; $i++; } } }"),
         ("loop_exit", "function f(mixed $v): int { if (!is_int($v)) { return 0; } while (true) { $v = 'changed'; break; } return $v + 1; }"),
         ("or_does_not_prove", "function f(mixed $v, bool $b): int { if (is_int($v) || $b) { return $v + 1; } return 0; }"),
         ("user_function", "function is_int(mixed $v): bool { return true; } function f(mixed $v): int { if (is_int($v)) { return $v + 1; } return 0; }"),
@@ -2285,7 +2260,11 @@ fn mixed_narrowing_invalidates_assignments_and_joins() {
         let file = temp_php(&format!("narrowing_invalid_{name}"), source);
         let r = run_ok(&["check", file.to_str().unwrap()]);
         assert_ne!(r.code, 0, "accepted unsound refinement: {name}");
-        assert!(r.stderr.contains("E0274"), "{name}: {}", r.stderr);
+        assert!(
+            r.stderr.contains("E0215") || r.stderr.contains("E0231"),
+            "{name}: {}",
+            r.stderr
+        );
     }
 }
 
@@ -2321,14 +2300,15 @@ fn null_guards_preserve_sound_scalar_narrowing() {
         "null_guard_paths",
         r#"<?php
 function booleanOnly(mixed $v): bool {
-    if (is_null($v) || is_int($v) || is_float($v) || is_string($v)) { return false; }
+    if (is_null($v) || is_int($v) || is_float($v) || is_string($v) || is_array($v) || is_object($v)) { return false; }
     return $v;
 }
 function surviving(mixed $v): string {
     if ($v === null) { return "null"; }
     if (is_int($v)) { return "int:" . ($v + 1); }
     if (is_float($v) || is_bool($v)) { return "other"; }
-    return strtoupper($v);
+    if (is_string($v)) { return strtoupper($v); }
+    return "other";
 }
 function inverse(mixed $v): string {
     if (null !== $v && is_string($v)) { return strtoupper($v); }
@@ -2349,4 +2329,527 @@ echo inverse(null) . ":" . inverse("yes") . "\n";
     let r = run_ok(&["check", f.to_str().unwrap()]);
     assert_ne!(r.code, 0);
     assert!(r.stderr.contains("E0215"), "{}", r.stderr);
+}
+
+#[test]
+fn mixed_arrays_and_objects_preserve_php_value_semantics() {
+    assert_matches_php(
+        "mixed_containers",
+        r#"<?php
+class Counter { public int $n = 1; public mixed $defaults = [1, 2]; public static mixed $shared = []; }
+function boxContainer(mixed $value): mixed { return $value; }
+function changeContainer(mixed $value): mixed {
+    if (is_array($value)) { $value[0] = 9; $value[] = "extra"; }
+    return $value;
+}
+function describeContainer(mixed $value): string {
+    if (is_array($value)) {
+        $text = "array:" . count($value) . ":";
+        foreach ($value as $item) { $text .= is_array($item) ? "nested" : strval($item); }
+        return $text;
+    }
+    if ($value instanceof Counter) { $value->n++; return "counter:" . $value->n; }
+    return "other";
+}
+$typed = [1, 2];
+$boxed = boxContainer($typed);
+$typed[0] = 7;
+$changed = changeContainer($boxed);
+echo describeContainer($boxed) . "|" . describeContainer($changed) . "\n";
+$copy = $boxed;
+if (is_array($copy)) { $copy[0] = "changed"; }
+echo describeContainer($boxed) . "|" . describeContainer($copy) . "\n";
+$nested = boxContainer([[1, 2], [3]]);
+if (is_array($nested)) {
+    $inner = $nested[0];
+    if (is_array($inner)) { $inner[0] = 20; }
+    echo describeContainer($nested[0]) . "|" . describeContainer($inner) . "\n";
+}
+$object = new Counter();
+$reference = boxContainer($object);
+echo describeContainer($reference) . ":" . $object->n . "\n";
+echo is_object($reference) . ":" . is_scalar($reference) . ":" . ($reference === $object) . "\n";
+echo ($boxed === boxContainer([1, 2])) . ":" . ($boxed === boxContainer([1, 3])) . "\n";
+echo boolval(boxContainer([])) . ":" . boolval($boxed) . ":" . intval($boxed) . ":" . intval([]) . ":" . floatval([1]) . "\n";
+echo describeContainer($object->defaults) . "\n";
+$object->defaults = ['a' => 1, 'b' => 'two'];
+Counter::$shared = ['a' => 3, 'b' => 'four'];
+echo describeContainer($object->defaults) . ':' . describeContainer(Counter::$shared) . "\n";
+$collection = [boxContainer(0)]; $collection[] = ['a' => 1, 'b' => 'two'];
+echo describeContainer($collection[1]) . "\n";
+$merged = array_merge([1], [boxContainer('two')]);
+foreach ($merged as $item) { echo $item . '|'; }
+echo "\n";
+"#,
+    );
+    let f = temp_php(
+        "whole_array_to_mixed",
+        r#"$a: array<mixed> = [1, 2]; $a[] = "three"; foreach ($a as $v) { echo $v . "|"; }"#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "1|2|three|");
+}
+
+#[test]
+fn mixed_array_transforms_copy_nested_values() {
+    assert_matches_php(
+        "mixed_array_transforms",
+        r#"<?php
+function boxedArray(mixed $v): mixed { return $v; }
+function mutateFirst(mixed $v): string {
+    if (is_array($v)) { $v[0] = 99; return strval($v[0]); }
+    return "other";
+}
+function firstValue(mixed $v): string {
+    if (is_array($v)) { return strval($v[0]); }
+    return "other";
+}
+$a = [boxedArray([1, 2]), boxedArray([3])];
+$b = array_reverse(array_values($a));
+$c = array_slice(array_merge($a, $b), 0, 1);
+$d = array_pad($c, 2, boxedArray([4]));
+$e = array_fill(0, 2, boxedArray([5]));
+echo mutateFirst($b[0]) . ":" . firstValue($a[1]) . ":" . firstValue($b[0]) . "\n";
+echo firstValue($c[0]) . ":" . firstValue($d[1]) . ":" . firstValue($e[1]) . "\n";
+"#,
+    );
+}
+
+#[test]
+fn mixed_arithmetic_comparison_and_bitwise_match_php() {
+    assert_matches_php(
+        "mixed_operators",
+        r#"<?php
+function dynamicValue(mixed $v): mixed { return $v; }
+function resultType(mixed $v): string { return is_int($v) ? 'int:' . $v : (is_float($v) ? 'float:' . $v : strval($v)); }
+function operations(mixed $a, mixed $b): void {
+    echo resultType($a + $b) . '|' . resultType($a - $b) . '|' . resultType($a * $b) . '|' . resultType($a / $b) . "\n";
+}
+operations(6, 2); operations('6', '2'); operations(5, 2); operations(1.5, 2); operations(null, true);
+echo resultType(dynamicValue(9223372036854775807) + 1) . "\n";
+echo resultType(dynamicValue(9223372036854775807) * 2) . "\n";
+echo resultType(-dynamicValue('12')) . ':' . resultType(~dynamicValue(4)) . "\n";
+$flipped = ~dynamicValue('AZ'); if (is_string($flipped)) { echo bin2hex($flipped) . "\n"; }
+echo resultType(dynamicValue(7) % '3') . ':' . resultType(dynamicValue(6) & 3) . ':' . resultType(dynamicValue(1) << 3) . "\n";
+$bits = dynamicValue('AZ') ^ 'BC'; if (is_string($bits)) { echo bin2hex($bits) . "\n"; }
+$v = dynamicValue(2); $v += '3'; $v *= 2; echo $v . "\n";
+$a = dynamicValue(['a' => 1]); $b = dynamicValue(['a' => 2, 'b' => 3]);
+$union = $a + $b;
+if (is_array($union)) { echo $union['a'] . ':' . $union['b'] . "\n"; }
+$values = [dynamicValue(null), dynamicValue(false), dynamicValue(true), dynamicValue(0), dynamicValue(1), dynamicValue(-1), dynamicValue(0.5), dynamicValue(''), dynamicValue('0'), dynamicValue('01'), dynamicValue('a'), dynamicValue([]), dynamicValue([1]), dynamicValue(['a' => 1]), dynamicValue(['b' => 1])];
+foreach ($values as $x) {
+    foreach ($values as $y) { echo ($x == $y) . ':' . ($x != $y) . ':' . ($x < $y) . ':' . ($x <= $y) . ':' . ($x > $y) . ':' . ($x >= $y) . ':' . ($x <=> $y) . '|'; }
+    echo "\n";
+}
+class Pair { public int $x = 1; }
+$left = dynamicValue(new Pair()); $right = dynamicValue(new Pair());
+echo ($left == $right) . ':' . ($left === $right) . ':' . ($left <=> $right) . "\n";
+switch (dynamicValue('01')) { case 1: echo "loose switch\n"; break; default: echo "wrong\n"; }
+echo ([1, 2] === [1, 2]) . ':' . (new Pair() === new Pair()) . "\n";
+"#,
+    );
+}
+
+#[test]
+fn mixed_runtime_operand_errors_fail_loudly() {
+    for (name, source, message) in [
+        (
+            "numeric",
+            "function box(mixed $v): mixed {return $v;} echo box('oops') + 1;",
+            "Unsupported operand types",
+        ),
+        (
+            "array_numeric",
+            "function box(mixed $v): mixed {return $v;} echo box([1]) - 1;",
+            "Unsupported operand types",
+        ),
+        (
+            "zero",
+            "function box(mixed $v): mixed {return $v;} echo box(1) / 0;",
+            "DivisionByZeroError",
+        ),
+        (
+            "shift",
+            "function box(mixed $v): mixed {return $v;} echo box(1) << -1;",
+            "ArithmeticError",
+        ),
+    ] {
+        let file = temp_php(&format!("mixed_runtime_{name}"), source);
+        let r = run_ok(&["run", file.to_str().unwrap()]);
+        assert_eq!(r.code, 255, "{name}: {}", r.stderr);
+        assert!(r.stderr.contains(message), "{name}: {}", r.stderr);
+    }
+}
+
+fn assert_file_matches_php(file: &std::path::Path) {
+    if !have_cc() || !have_php() {
+        return;
+    }
+    let native = run_ok(&["run", file.to_str().unwrap()]);
+    let php = Command::new("php").arg(file).output().unwrap();
+    assert!(
+        php.status.success(),
+        "{}",
+        String::from_utf8_lossy(&php.stderr)
+    );
+    assert_eq!(native.code, 0, "{}", native.stderr);
+    assert_eq!(native.stdout.as_bytes(), php.stdout);
+}
+
+#[test]
+fn gradual_migration_project_matches_php() {
+    let entry = temp_php(
+        "migration_project",
+        include_str!("../../../examples/migration/main.php"),
+    );
+    std::fs::write(
+        entry.parent().unwrap().join("legacy.php"),
+        include_str!("../../../examples/migration/legacy.php"),
+    )
+    .unwrap();
+    std::fs::write(
+        entry.parent().unwrap().join("catalog.csv"),
+        include_str!("../../../examples/migration/catalog.csv"),
+    )
+    .unwrap();
+    assert_file_matches_php(&entry);
+}
+
+#[test]
+fn php_interop_preserves_state_output_binary_data_and_include_modes() {
+    let entry = temp_php(
+        "interop_order",
+        r#"<?php
+require __DIR__ . '/legacy.php';
+echo 'native|';
+include_once __DIR__ . '/legacy.php';
+include __DIR__ . '/legacy.php';
+require_once __DIR__ . '/legacy.php';
+echo legacyCount() . "\n";
+$value = legacyEcho("A\x00\xff\n");
+if (is_string($value)) { echo bin2hex($value) . "\n"; }
+$record = legacyEcho(['text' => 'native', 'count' => 2, 'nested' => [false, null, 1.5], '01' => -4]);
+if (is_array($record)) { echo $record['text'] . ':' . $record['count'] . ':' . $record['01'] . "\n"; }
+echo legacyEcho(9223372036854775807) . "\n";
+echo legacyEcho(-9223372036854775807 - 1) . "\n";
+$big = legacyEcho(str_repeat('x', 200000));
+if (is_string($big)) { echo strlen($big) . "\n"; }
+echo legacyCount() + 1;
+"#,
+    );
+    std::fs::write(
+        entry.parent().unwrap().join("legacy.php"),
+        r#"<?php
+// @pxr-dynamic
+$GLOBALS['loads'] = ($GLOBALS['loads'] ?? 0) + 1;
+echo 'php|';
+if (!function_exists('legacyCount')) {
+    function legacyCount() { return $GLOBALS['loads']; }
+    function legacyEcho($value) { echo 'call|'; return $value; }
+}
+"#,
+    )
+    .unwrap();
+    assert_file_matches_php(&entry);
+}
+
+#[test]
+fn mixed_native_and_php_object_stringification_match_php() {
+    let entry = temp_php(
+        "interop_objects",
+        r#"<?php
+require_once __DIR__ . '/legacy.php';
+class Label { public function __toString(): string { echo 'native string|'; return 'native'; } }
+class ChildLabel extends Label { public function __toString(): string { return 'child'; } }
+function boxObject(mixed $value): mixed { return $value; }
+$value = boxObject(new Label());
+echo $value . ':' . strval(boxObject(new ChildLabel())) . ':' . strval(new ChildLabel()) . "\n";
+echo ($value == 'native') . "\n";
+$proxy = legacyLabel();
+echo $proxy . ':' . ($proxy === legacyLabel()) . "\n";
+echo ($proxy == 'php') . ':' . ($proxy <=> 'php') . ':' . ($proxy != 'other') . "\n";
+"#,
+    );
+    std::fs::write(
+        entry.parent().unwrap().join("legacy.php"),
+        r#"<?php
+// @pxr-dynamic
+class LegacyLabel { public function __toString() { echo 'php string|'; return 'php'; } }
+function legacyLabel() { static $label; return $label ??= new LegacyLabel(); }
+"#,
+    )
+    .unwrap();
+    assert_file_matches_php(&entry);
+}
+
+#[test]
+fn php_interop_resolves_namespaced_calls_and_global_fallback() {
+    let entry = temp_php(
+        "interop_namespaces",
+        r#"<?php
+namespace App;
+require_once __DIR__ . '/legacy.php';
+echo namespacedValue() . ':' . globalValue() . ':' . \globalValue() . "\n";
+echo is_int('text') . ':' . \is_int('text') . "\n";
+"#,
+    );
+    std::fs::write(
+        entry.parent().unwrap().join("legacy.php"),
+        r#"<?php
+// @pxr-dynamic
+namespace App { function namespacedValue() { return 'namespace'; } function is_int($v) { return true; } }
+namespace { function globalValue() { return 'global'; } }
+"#,
+    )
+    .unwrap();
+    assert_file_matches_php(&entry);
+}
+
+#[test]
+fn php_interop_reports_errors_and_preserves_exit_status() {
+    if !have_cc() || !have_php() {
+        return;
+    }
+    for (name, legacy, call, code, message) in [
+        (
+            "exception",
+            "function legacyFailure() { throw new RuntimeException('legacy failed'); }",
+            "legacyFailure();",
+            255,
+            "legacy failed",
+        ),
+        (
+            "reference",
+            "function legacyFailure(&$v) { $v++; }",
+            "legacyFailure(1);",
+            255,
+            "by-reference arguments",
+        ),
+        (
+            "resource",
+            "function legacyFailure() { return fopen('php://memory', 'r'); }",
+            "legacyFailure();",
+            255,
+            "resources cannot cross",
+        ),
+        (
+            "unknown",
+            "",
+            "missingLegacyFunction();",
+            255,
+            "does not exist",
+        ),
+        ("exit", "exit(42);", "", 42, ""),
+        ("exit_zero", "exit(0);", "", 0, ""),
+        (
+            "native_object",
+            "function legacyFailure($v) { return $v; }",
+            "class C {} legacyFailure(new C());",
+            255,
+            "native objects cannot cross",
+        ),
+    ] {
+        let entry = temp_php(
+            &format!("interop_failure_{name}"),
+            &format!("<?php\nrequire __DIR__ . '/legacy.php';\n{call}"),
+        );
+        std::fs::write(
+            entry.parent().unwrap().join("legacy.php"),
+            format!("<?php\n// @pxr-dynamic\n{legacy}"),
+        )
+        .unwrap();
+        let result = run_ok(&["run", entry.to_str().unwrap()]);
+        assert_eq!(result.code, code, "{name}: {}", result.stderr);
+        assert!(result.stderr.contains(message), "{name}: {}", result.stderr);
+    }
+}
+
+#[test]
+fn migration_report_describes_native_and_dynamic_boundaries_without_execution() {
+    let entry = temp_php(
+        "migration_report_\"é",
+        r#"<?php
+require_once __DIR__ . '/legacy.php';
+function typed(int $value): int { return $value + 1; }
+function gradual(mixed $value): mixed { return $value; }
+echo legacyName();
+"#,
+    );
+    let marker = entry.parent().unwrap().join("executed.txt");
+    let legacy = format!("<?php\n// @pxr-dynamic\nfile_put_contents(__DIR__ . '/executed.txt', 'executed');\nfunction legacyName() {{ return 'legacy'; }}");
+    std::fs::write(entry.parent().unwrap().join("legacy.php"), legacy).unwrap();
+    let report = run_ok(&["migration-report", entry.to_str().unwrap(), "--json"]);
+    assert_eq!(report.code, 0, "{}", report.stderr);
+    assert!(report.stdout.contains("\"checked\":true"));
+    assert!(report.stdout.contains("\"mode\":\"php\""));
+    assert!(report.stdout.contains("\"mode\":\"native\""));
+    assert!(report.stdout.contains("\"name\":\"typed\""));
+    assert!(report.stdout.contains("\"mixed_return\":true"));
+    assert!(report.stdout.contains("\"dynamic_calls\":1"));
+    assert!(!marker.exists(), "report executed the legacy file");
+    if have_php() {
+        let json = entry.parent().unwrap().join("report.json");
+        std::fs::write(&json, &report.stdout).unwrap();
+        let parsed = Command::new("php")
+            .args([
+                "-r",
+                "json_decode(file_get_contents($argv[1]), true, 512, JSON_THROW_ON_ERROR);",
+            ])
+            .arg(json)
+            .output()
+            .unwrap();
+        assert!(
+            parsed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&parsed.stderr)
+        );
+    }
+    let invalid = temp_php("migration_invalid", "function untyped($x) { return $x; }");
+    let failed = run_ok(&["migration-report", invalid.to_str().unwrap(), "--json"]);
+    assert_ne!(failed.code, 0);
+    assert!(failed.stdout.contains("\"checked\":false"));
+    assert!(failed.stderr.contains("E0202"));
+}
+
+#[test]
+fn php_is_required_only_when_the_interop_boundary_executes() {
+    if !have_cc() {
+        return;
+    }
+    let entry = temp_php("no_php_dependency", "echo \"native\\n\";");
+    let executable = entry.with_extension("bin");
+    let built = run_ok(&[
+        "build",
+        entry.to_str().unwrap(),
+        "-o",
+        executable.to_str().unwrap(),
+    ]);
+    assert_eq!(built.code, 0, "{}", built.stderr);
+    let native = Command::new(&executable)
+        .env("PXR_PHP", "/missing/php-executable")
+        .output()
+        .unwrap();
+    assert!(native.status.success());
+    assert_eq!(native.stdout, b"native\n");
+    let blocked_cache = entry.parent().unwrap().join("not-a-cache-directory");
+    std::fs::write(&blocked_cache, "file").unwrap();
+    let uncached = Command::new(pxr())
+        .args([
+            "build",
+            entry.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .env("PXR_CACHE_DIR", blocked_cache)
+        .output()
+        .unwrap();
+    assert!(
+        uncached.status.success(),
+        "{}",
+        String::from_utf8_lossy(&uncached.stderr)
+    );
+    let dynamic = temp_php("missing_php_dependency", "require __DIR__ . '/legacy.php';");
+    std::fs::write(
+        dynamic.parent().unwrap().join("legacy.php"),
+        "<?php\n// @pxr-dynamic\necho 'legacy';",
+    )
+    .unwrap();
+    let executable = dynamic.with_extension("bin");
+    let built = run_ok(&[
+        "build",
+        dynamic.to_str().unwrap(),
+        "-o",
+        executable.to_str().unwrap(),
+    ]);
+    assert_eq!(built.code, 0, "{}", built.stderr);
+    let legacy = Command::new(&executable)
+        .env("PXR_PHP", "/missing/php-executable")
+        .output()
+        .unwrap();
+    assert_eq!(legacy.status.code(), Some(127));
+    assert!(String::from_utf8_lossy(&legacy.stderr).contains("PHP interop needs a PHP CLI"));
+}
+
+#[test]
+fn conditional_php_includes_are_lazy_and_preserve_once_semantics() {
+    let entry = temp_php(
+        "conditional_interop",
+        r#"<?php
+if (false) { require_once __DIR__ . '/legacy.php'; }
+function loadLegacy(): void { include_once __DIR__ . '/legacy.php'; }
+loadLegacy(); loadLegacy();
+require_once __DIR__ . '/legacy.php';
+echo legacyConditional() . "\n";
+"#,
+    );
+    std::fs::write(
+        entry.parent().unwrap().join("legacy.php"),
+        "<?php\n// @pxr-dynamic\necho 'loaded|'; function legacyConditional() { return 'yes'; }",
+    )
+    .unwrap();
+    assert_file_matches_php(&entry);
+    if have_cc() {
+        let lazy = temp_php(
+            "unexecuted_interop",
+            "if (false) { require_once __DIR__ . '/legacy.php'; } echo 'native';",
+        );
+        std::fs::write(
+            lazy.parent().unwrap().join("legacy.php"),
+            "<?php\n// @pxr-dynamic\necho 'wrong';",
+        )
+        .unwrap();
+        let executable = lazy.with_extension("bin");
+        let built = run_ok(&[
+            "build",
+            lazy.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ]);
+        assert_eq!(built.code, 0, "{}", built.stderr);
+        let result = Command::new(executable)
+            .env("PXR_PHP", "/missing/php")
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert_eq!(result.stdout, b"native");
+    }
+}
+
+#[test]
+fn php_float_special_values_and_nested_object_comparisons_match_php() {
+    let entry = temp_php(
+        "interop_special_values",
+        r#"<?php
+require __DIR__ . '/legacy.php';
+function boxSpecial(mixed $v): mixed { return $v; }
+$nan = legacyNan();
+$values = [boxSpecial('NAN'), boxSpecial('a'), boxSpecial(0), boxSpecial(false), boxSpecial(true), boxSpecial(null), boxSpecial([]), $nan];
+foreach ($values as $v) { echo ($nan == $v) . ':' . ($nan < $v) . ':' . ($nan > $v) . ':' . ($nan <=> $v) . '|'; }
+echo "\n";
+echo -boxSpecial(0.0) . ':' . -boxSpecial(-0.0) . "\n";
+$nativeArray = [$nan]; $nativeCopy = $nativeArray;
+echo ($nativeArray === $nativeCopy) . ':' . ($nativeArray === array_values($nativeArray)) . ':' . ($nativeArray === array_merge([], $nativeArray)) . ':' . ($nativeArray === array_merge($nativeArray)) . "\n";
+$nativeCopy[0] = $nan; echo ($nativeArray === $nativeCopy) . "\n";
+$returned = legacyNanArray(); $alias = $returned;
+echo ($returned === $alias) . ':' . ($returned === legacyNanArray()) . ':' . ($returned === legacyEchoArray($returned)) . "\n";
+if (is_array($alias)) { $alias[0] = $nan; }
+echo ($returned === $alias) . ':' . ($returned === ($returned + [])) . "\n";
+$left = boxSpecial([legacyText()]); $right = boxSpecial(['text']);
+echo ($left == $right) . "\n";
+"#,
+    );
+    std::fs::write(
+        entry.parent().unwrap().join("legacy.php"),
+        r#"<?php
+// @pxr-dynamic
+function legacyNan() { return NAN; }
+function legacyNanArray() { static $value = [NAN]; return $value; }
+function legacyEchoArray($value) { return $value; }
+class LegacyText { public function __toString() { echo 'cast|'; return 'text'; } }
+function legacyText() { return new LegacyText(); }
+"#,
+    )
+    .unwrap();
+    assert_file_matches_php(&entry);
 }

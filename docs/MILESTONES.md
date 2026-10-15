@@ -445,7 +445,7 @@ member limits from M3.5 remain. See [`MODULES.md`](MODULES.md).
 
 **Next:** M4 — gradual migration (`mixed`, narrowing, and dynamic PHP interop).
 
-## 🚧 M4 — Gradual migration
+## ✅ M4 — Gradual migration
 
 * An opt‑in dynamic `mixed` type with runtime tags, and `is_*` narrowing.
 * `include`/`require` for unmigrated PHP files (interop layer).
@@ -518,9 +518,49 @@ using `mixed`.
   false exhaustiveness — 86 CLI tests total. Example: `examples/nulls.php`.
   Concrete types remain non-nullable; nullable annotations are still planned.
 
-**Next:** broader boxed values and dynamic operations, migration reporting, and
-runtime PHP interop. Property/array-element guards and more precise loop
-fixed-point analysis remain follow-up work; M4 is not complete.
+**Delivered (M4.4: containers and dynamic operations).**
+
+* Arrays and objects box at mixed boundaries; concrete arrays can become
+  `array<mixed>`. Contextual mixed array literals accept heterogeneous records.
+  Nested arrays retain value semantics through assignments, arguments, returns,
+  constructors, foreach, and all supported array transforms. Objects share identity.
+* `is_array` narrows to `array<mixed>`; `instanceof` narrows to compiled classes
+  and interfaces, with nominal facts retained only across valid flow joins.
+* Runtime mixed arithmetic, numeric strings, integer-overflow promotion, array
+  union, bitwise operators, negation, loose comparison/order, strict array/object
+  comparisons, and mixed switch subjects. Native `__toString` dispatch includes
+  inherited/overridden methods; invalid signatures fail with `E0275`.
+
+**Delivered (M4.5: unmigrated PHP interop).**
+
+* Leading `// @pxr-dynamic` opts a file into PHP interpretation. Literal
+  include/include_once/require/require_once boundaries can execute at top level,
+  conditionally, or in functions/methods. Native declaration modules remain AOT.
+* A lazily started persistent PHP CLI worker retains include-once state, globals,
+  statics, and object identity. Calls into PHP return mixed values; namespace
+  lookup, binary data, output order, exceptions, and exit status are covered.
+* Value data crosses a binary protocol; PHP objects cross as opaque handles.
+  References, resources, native callbacks, and native object transfers fail
+  explicitly. Native programs without an executed boundary remain PHP-independent.
+  See [`INTEROP.md`](INTEROP.md) for the deployment and language boundary.
+
+**Delivered (M4.6: migration report and acceptance).**
+
+* `pxr migration-report <entry> [--json]` uses the build/check graph and reports
+  native/PHP files, line counts, concrete/mixed slots, mixed returns, and dynamic
+  call sites. It does not execute PHP. Invalid native code retains diagnostics
+  and a failing exit status; JSON identifies schema version 1.
+* `examples/migration/main.php` is the acceptance project: compiled typed catalog
+  rendering totals a CSV catalog loaded by untyped PHP, alongside globals/statics
+  and object operations.
+  Tests compare its output with PHP and cover the mixed runtime and boundary
+  error paths. There are 99 CLI tests plus 43 unit tests (142 total).
+
+**Acceptance achieved.** All M4 deliverables above run end to end. M4 covers an
+explicit migration boundary, not every PHP feature. Compiled union/nullable
+annotations, property/element guard caching, and more precise loop analysis
+remain outside this milestone. **Next:** M5 — generics and inference; async
+implementation remains sequenced after M5/M6 in M7.
 
 ## ⛔ M5 — Generics & inference
 

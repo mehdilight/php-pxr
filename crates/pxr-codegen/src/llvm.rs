@@ -22,6 +22,17 @@ pub struct LlvmOptions {
 /// Runtime entry points and their C signatures.
 const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     ("abort", "void", &[]),
+    ("pxr_php_include", "void", &["ptr", "i64"]),
+    ("pxr_php_call", "ptr", &["ptr", "ptr", "ptr"]),
+    ("pxr_mixed_negate", "ptr", &["ptr"]),
+    ("pxr_array_merge_pair", "ptr", &["ptr", "ptr"]),
+    ("pxr_mixed_bit_not", "ptr", &["ptr"]),
+    ("pxr_mixed_binary", "ptr", &["i64", "ptr", "ptr"]),
+    ("pxr_mixed_copy", "ptr", &["ptr"]),
+    ("pxr_array_to_mixed", "ptr", &["ptr"]),
+    ("pxr_mixed_array", "ptr", &["ptr"]),
+    ("pxr_mixed_object", "ptr", &["ptr"]),
+    ("pxr_mixed_instanceof", "i64", &["ptr", "i64"]),
     ("pxr_mixed_box", "ptr", &["i64", "i64"]),
     ("pxr_mixed_is", "i64", &["ptr", "i64"]),
     ("pxr_mixed_is_nullish", "i64", &["ptr"]),

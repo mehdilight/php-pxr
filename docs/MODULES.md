@@ -1,7 +1,8 @@
 # Namespaces and compile-time modules
 
 PXR compiles an entry file and its declaration-only dependencies into one native
-program. There is no runtime PHP loader or interpreter dependency.
+program. Native modules need no PHP interpreter; explicitly marked legacy files use
+the separate [PHP boundary](INTEROP.md).
 
 A library file, `Library.php`:
 
@@ -56,7 +57,7 @@ not autoload files. Use `require_once` to provide those declarations.
 
 ## Dependency rules
 
-* `require` and `require_once` are supported as standalone top-level statements
+* `include`, `include_once`, `require`, and `require_once` are supported as standalone top-level statements
   with a literal UTF-8 string path, optionally parenthesized. The literal can be
   prefixed with `__DIR__ .`.
 * Relative literals resolve from the containing file's directory. Absolute paths
@@ -67,19 +68,29 @@ not autoload files. Use `require_once` to provide those declarations.
   may contain class/interface/function declarations, namespace/import directives,
   empty statements, and further dependencies. Runtime side effects, top-level
   variable initialization, and return statements in dependencies are rejected.
-* `require_once` deduplicates canonical paths, including equivalent paths through
+* Once forms deduplicate canonical paths, including equivalent paths through
   `..` or symlinks. Shared dependency cycles are safe when the revisited edge uses
   `require_once`; non-once cycles are compile errors. Repeated plain `require` of
   the same declarations produces duplicate-definition diagnostics.
 * Missing/unreadable files, NUL-containing paths, dynamic paths, conditional or
-  function-local dependencies, and excessive dependency depth are errors.
+  function-local native dependencies, and excessive dependency depth are errors.
 * `check`, `build`, `run`, `emit-ir`, and `emit-llvm` resolve the same graph.
   Dependency diagnostics identify the source file and include its source excerpt.
   `tokens` and `ast` inspect only the requested file.
 
+## Runtime PHP files
+
+A leading `// @pxr-dynamic` comment selects interpretation instead of the native
+declaration loader. These files can contain arbitrary PHP supported by the
+installed CLI. Includes can execute in branches, functions, and methods; PHP
+keeps their once registry. Unbound legacy calls return mixed values. Native
+variable scope and compiled functions do not cross implicitly. See
+[`INTEROP.md`](INTEROP.md) for data rules, runtime dependencies, and reporting.
+
 ## Remaining limits
 
-Grouped imports, constant imports, autoloading, dynamic class/function names,
-`include`/`include_once`, include expressions/return values, PHP `include_path`,
-and runtime inclusion of untyped PHP are not implemented. This module feature
-provides compile-time declarations; runtime PHP interop remains in M4.
+Grouped imports, constant imports, automatic native autoloading, dynamic native
+class/function names, include expressions/return values, and variable include
+paths in compiled source are not implemented. PHP handles such behavior inside
+marked legacy files. The native loader uses source-relative literal paths,
+independent of PHP include_path.

@@ -4,7 +4,7 @@
 //! generator so that every stage agrees on the same representation.
 //!
 //! PXR starts from a small, *statically typed* core that mirrors the
-//! scalar types of PHP. Opt-in `mixed` values use tagged scalar/null boxes.
+//! scalar types of PHP. Opt-in `mixed` values use tagged value boxes.
 
 use std::fmt;
 
@@ -17,7 +17,7 @@ pub enum Ty {
     Int,
     Float,
     String,
-    /// Opt-in tagged scalar/null value.
+    /// Opt-in tagged PHP value (null, scalar, array, or object).
     Mixed,
     /// Internal element-type sentinel for empty array literals.
     /// User-facing null literals have type `Mixed`.
@@ -59,17 +59,18 @@ impl Ty {
     /// Can a value of `self` be implicitly used where `to` is expected?
     ///
     /// This captures the only implicit coercion in the PXR core: a lossless
-    /// widening from `int` to `float`. Array element types must match exactly.
+    /// widening from `int` to `float`, plus boxing into mixed destinations.
+    /// Arrays otherwise retain their element types.
     pub fn assignable_to(&self, to: &Ty) -> bool {
         if self == to {
             return true;
         }
         match (self, to) {
-            (from, Ty::Mixed) if from.is_scalar() => true,
+            (from, Ty::Mixed) if *from != Ty::Void => true,
             (Ty::Int, Ty::Float) => true,
             // An empty array literal (element type `null`) is assignable to any
             // array type; the element type is refined at the assignment site.
-            (Ty::Array(e), Ty::Array(t)) => matches!(**e, Ty::Null) || e == t,
+            (Ty::Array(e), Ty::Array(t)) => matches!(**e, Ty::Null) || e == t || **t == Ty::Mixed,
             _ => false,
         }
     }

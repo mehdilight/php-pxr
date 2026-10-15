@@ -228,6 +228,10 @@ impl Builtin {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Callee {
+    Php {
+        name: String,
+        fallback: Option<String>,
+    },
     User {
         /// Link-time (mangled) name.
         mangled: String,
@@ -412,21 +416,27 @@ impl TTarget {
 // Value possibility sets for local mixed slots. Facts describe values, never
 // alter slot storage types, and are joined only across reachable paths.
 const SCALAR_MASK: u8 = 15;
-const VALUE_MASK: u8 = SCALAR_MASK | 16; // Scalars and null.
+const VALUE_MASK: u8 = 127; // Scalars, null, arrays, and objects.
 #[derive(Clone, Debug)]
 struct FlowState {
     types: HashMap<u32, u8>,
+    named: HashMap<u32, String>,
     reachable: bool,
 }
 impl Default for FlowState {
     fn default() -> Self {
         Self {
             types: HashMap::new(),
+            named: HashMap::new(),
             reachable: true,
         }
     }
 }
 impl FlowState {
+    fn forget(&mut self, slot: u32) {
+        self.types.remove(&slot);
+        self.named.remove(&slot);
+    }
     fn mask(&self, slot: u32) -> u8 {
         self.types.get(&slot).copied().unwrap_or(VALUE_MASK)
     }
@@ -443,6 +453,8 @@ impl FlowState {
             2 => Some(Ty::Float),
             4 => Some(Ty::Bool),
             8 => Some(Ty::String),
+            32 => Some(Ty::array(Ty::Mixed)),
+            64 => self.named.get(&slot).cloned().map(Ty::Named),
             _ => None,
         }
     }
@@ -454,6 +466,13 @@ impl FlowState {
             result
                 .types
                 .insert(*slot, paths.iter().fold(0, |mask, p| mask | p.mask(*slot)));
+        }
+        for slot in paths.iter().flat_map(|p| p.named.keys()) {
+            if let Some(name) = paths[0].named.get(slot) {
+                if paths.iter().all(|p| p.named.get(slot) == Some(name)) {
+                    result.named.insert(*slot, name.clone());
+                }
+            }
         }
         result
     }
@@ -493,6 +512,18 @@ impl FlowState {
                         self.condition(lhs, false).condition(rhs, true),
                     ])
                 }
+            }
+            TExpr::Instanceof {
+                expr,
+                target_class_name,
+                ..
+            } if truth => {
+                let mut result = self.clone();
+                if let Some(slot) = mixed_slot(expr) {
+                    result.restrict(slot, 64);
+                    result.named.insert(slot, target_class_name.clone());
+                }
+                result
             }
             TExpr::Bool(value) => {
                 let mut result = self.clone();
@@ -547,7 +578,8 @@ impl FlowState {
                     Builtin::IsString => 8,
                     Builtin::IsScalar => SCALAR_MASK,
                     Builtin::IsNull => 16,
-                    Builtin::IsArray | Builtin::IsObject => 0,
+                    Builtin::IsArray => 32,
+                    Builtin::IsObject => 64,
                     _ => return self.clone(),
                 };
                 let mut result = self.clone();
@@ -577,12 +609,18 @@ fn scalar_mask(ty: &Ty) -> u8 {
         Ty::Float => 2,
         Ty::Bool => 4,
         Ty::String => 8,
+        Ty::Array(_) => 32,
+        Ty::Named(_) => 64,
         _ => VALUE_MASK,
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TStmt {
+    PhpInclude {
+        path: String,
+        mode: u8,
+    },
     Block(Vec<TStmt>),
     Echo(Vec<TExpr>),
     Print(TExpr),
@@ -674,6 +712,7 @@ pub struct TProgram {
     /// The synthesized entry point running top-level statements.
     pub main: TFunc,
     pub class_registrations: Vec<(u32, u32)>,
+    pub stringifiers: Vec<(u32, String)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +759,7 @@ pub struct MethodInfo {
 }
 
 pub struct Analyzer {
+    php_interop: bool,
     diags: Diagnostics,
     /// lowercased name -> signature
     funcs: HashMap<String, Signature>,
@@ -794,8 +834,17 @@ impl FnCtx {
     }
 }
 
+fn uses_php(statement: &ast::Stmt) -> bool {
+    matches!(statement, ast::Stmt::PhpInclude { .. })
+        || statement
+            .bodies()
+            .iter()
+            .any(|body| body.iter().any(uses_php))
+}
+
 pub fn analyze(program: &ast::Program) -> (Option<TProgram>, Diagnostics) {
     let mut a = Analyzer {
+        php_interop: program.items.iter().any(uses_php),
         diags: Diagnostics::new(),
         funcs: HashMap::new(),
         classes: HashMap::new(),
@@ -830,11 +879,12 @@ impl Analyzer {
             return true;
         }
         match (from, to) {
-            (from, Ty::Mixed) if from.is_scalar() => true,
+            (from, Ty::Mixed) if *from != Ty::Void => true,
             (Ty::Int, Ty::Float) => true,
             (Ty::Array(e), Ty::Array(t)) => {
                 matches!(**e, Ty::Null)
                     || e == t
+                    || **t == Ty::Mixed
                     || (!contains_mixed(e) && !contains_mixed(t) && self.is_assignable(e, t))
             }
             (Ty::Named(child), Ty::Named(parent)) => self.is_subclass_of(child, parent),
@@ -1098,6 +1148,21 @@ impl Analyzer {
             return None;
         }
         self.collect_signatures(program);
+        let mut stringifiers = Vec::new();
+        for class in self.classes.values() {
+            if let Some(method) = class.methods.get("__tostring") {
+                if method.ret != Ty::String
+                    || !method.params.is_empty()
+                    || method.ast_method.is_static
+                    || method.visibility != ast::Visibility::Public
+                {
+                    self.diags.emit(Diagnostic::error("__toString must be public, non-static, take no arguments, and return string").with_code("E0275").with_span(method.name_span));
+                } else if !class.is_abstract && !class.is_interface {
+                    stringifiers.push((class.class_id, method.mangled.clone()));
+                }
+            }
+        }
+        stringifiers.sort();
 
         let mut funcs = Vec::new();
 
@@ -1164,6 +1229,7 @@ impl Analyzer {
             funcs,
             main: main?,
             class_registrations,
+            stringifiers,
         })
     }
 
@@ -1350,14 +1416,24 @@ impl Analyzer {
                         if ty == Ty::Mixed {
                             if let Some(default) = &p.default {
                                 if !static_initializer(default) {
-                                    self.diags.emit(Diagnostic::error("mixed property defaults require constant scalar or null expressions")
-                                        .with_code("E0274").with_span(p.name_span));
+                                    self.diags.emit(
+                                        Diagnostic::error(
+                                            "mixed property defaults require constant expressions",
+                                        )
+                                        .with_code("E0274")
+                                        .with_span(p.name_span),
+                                    );
                                 } else {
                                     let mut context = FnCtx::new(Ty::Void, false);
-                                    if let Some(value) = self.infer(default, &mut context) {
-                                        if !value.ty().is_scalar() && value.ty() != Ty::Mixed {
-                                            self.diags.emit(Diagnostic::error("only scalar and null values can be boxed as mixed in this slice")
-                                                .with_code("E0274").with_span(p.name_span));
+                                    if let Some(value) =
+                                        self.infer_for_type(default, &mut context, &Ty::Mixed)
+                                    {
+                                        if value.ty() == Ty::Void {
+                                            self.diags.emit(
+                                                Diagnostic::error("void cannot be boxed as mixed")
+                                                    .with_code("E0274")
+                                                    .with_span(p.name_span),
+                                            );
                                         }
                                     }
                                 }
@@ -1940,7 +2016,7 @@ impl Analyzer {
                     continue;
                 }
                 if let Some(default) = &property.default {
-                    let value = self.infer(default, &mut ctx)?;
+                    let value = self.infer_for_type(default, &mut ctx, &property.ty)?;
                     if !self.is_assignable(&value.ty(), &property.ty) {
                         self.diags.emit(
                             Diagnostic::error("static property default has the wrong type")
@@ -2008,6 +2084,10 @@ impl Analyzer {
 
     fn analyze_stmt(&mut self, stmt: &ast::Stmt, ctx: &mut FnCtx) -> Option<TStmt> {
         match stmt {
+            ast::Stmt::PhpInclude { path, mode, .. } => Some(TStmt::PhpInclude {
+                path: path.clone(),
+                mode: *mode,
+            }),
             ast::Stmt::Require { span, .. } => {
                 self.diags.emit(
                     Diagnostic::error(
@@ -2027,7 +2107,7 @@ impl Analyzer {
                         if t.ty().is_array() {
                             self.diags.emit(
                                 Diagnostic::error(
-                                    "cannot echo an array; index it or use `implode()` (not yet implemented)",
+                                    "cannot echo an array; index it or use `implode()`",
                                 )
                                 .with_code("E0240")
                                 .with_span(e.span()),
@@ -2043,11 +2123,9 @@ impl Analyzer {
                 let t = self.infer(e, ctx)?;
                 if t.ty().is_array() {
                     self.diags.emit(
-                        Diagnostic::error(
-                            "cannot print an array; index it or use `implode()` (not yet implemented)",
-                        )
-                        .with_code("E0240")
-                        .with_span(e.span()),
+                        Diagnostic::error("cannot print an array; index it or use `implode()`")
+                            .with_code("E0240")
+                            .with_span(e.span()),
                     );
                     return None;
                 }
@@ -2329,7 +2407,7 @@ impl Analyzer {
             None => ctx.declare(value, elem.clone()),
         };
         invalidate_writes(body, ctx);
-        ctx.flow.types.remove(&vslot);
+        ctx.flow.forget(vslot);
         let incoming = ctx.flow.clone();
         ctx.loop_depth += 1;
         let body_t = self.analyze_stmts(body, ctx);
@@ -2434,7 +2512,23 @@ impl Analyzer {
         span: Span,
         ctx: &mut FnCtx,
     ) -> Option<TStmt> {
-        let val = self.infer(value, ctx)?;
+        let expected = if let Some(annotation) = annotation {
+            Some(self.resolve_type(annotation))
+        } else if let ast::LValue::Var { name, .. } = target {
+            ctx.slot_of(name).map(|slot| ctx.slot_ty(slot))
+        } else {
+            Some(match target {
+                ast::LValue::Index { base, index, .. } => self
+                    .infer_index_target(base, index.as_deref(), span, ctx)?
+                    .storage_ty(),
+                _ => self.infer_target_read(target, span, ctx)?.0.storage_ty(),
+            })
+        };
+        let val = if let Some(expected) = expected {
+            self.infer_for_type(value, ctx, &expected)?
+        } else {
+            self.infer(value, ctx)?
+        };
         let val_ty = val.ty();
 
         match target {
@@ -2492,7 +2586,7 @@ impl Analyzer {
                     return None;
                 }
 
-                ctx.flow.types.remove(&slot);
+                ctx.flow.forget(slot);
                 Some(TStmt::Assign {
                     target: TTarget::Var {
                         name: name.clone(),
@@ -2914,18 +3008,8 @@ impl Analyzer {
             );
             return None;
         };
-        let slot = match ctx.slot_of(name) {
-            Some(s) => s,
-            None => {
-                self.diags.emit(
-                    Diagnostic::error(format!("undefined variable `${name}`"))
-                        .with_code("E0220")
-                        .with_span(span),
-                );
-                return None;
-            }
-        };
-        let bty = ctx.slot_ty(slot);
+        let base_expr = self.infer(&ast::Expr::Var(name.clone(), span), ctx)?;
+        let bty = base_expr.ty();
         let Ty::Array(elem) = bty.clone() else {
             self.diags.emit(
                 Diagnostic::error(format!("cannot index a value of type `{bty}` with `[]`"))
@@ -2935,11 +3019,6 @@ impl Analyzer {
             return None;
         };
         let elem = (*elem).clone();
-        let base_expr = TExpr::Var {
-            name: name.clone(),
-            slot,
-            ty: bty.clone(),
-        };
         match index {
             None => Some(TTarget::Push {
                 base: Box::new(base_expr),
@@ -3007,7 +3086,7 @@ impl Analyzer {
                 None
             }
             (Some(v), _) => {
-                let t = self.infer(v, ctx)?;
+                let t = self.infer_for_type(v, ctx, &ret)?;
                 let vt = t.ty();
                 if !self.is_assignable(&vt, &ret) {
                     self.diags.emit(
@@ -3083,7 +3162,7 @@ impl Analyzer {
                 let oty = operand.ty();
                 match op {
                     AUnOp::Neg => {
-                        if !oty.is_numeric() {
+                        if !oty.is_numeric() && oty != Ty::Mixed {
                             self.diags.emit(
                                 Diagnostic::error(format!(
                                     "unary `-` requires a numeric operand, found `{oty}`"
@@ -3119,7 +3198,7 @@ impl Analyzer {
                         })
                     }
                     AUnOp::BitNot => {
-                        if oty != Ty::Int {
+                        if oty != Ty::Int && oty != Ty::Mixed {
                             self.diags.emit(
                                 Diagnostic::error(format!(
                                     "`~` requires an `int` operand, found `{oty}`"
@@ -3131,8 +3210,8 @@ impl Analyzer {
                         }
                         Some(TExpr::Un {
                             op: AUnOp::BitNot,
-                            operand_ty: oty,
-                            ty: Ty::Int,
+                            operand_ty: oty.clone(),
+                            ty: oty,
                             expr: Box::new(operand),
                         })
                     }
@@ -3153,6 +3232,25 @@ impl Analyzer {
                 } else {
                     fallback.as_deref().unwrap_or(callee)
                 };
+                if self.php_interop
+                    && !self.funcs.contains_key(&callee.to_ascii_lowercase())
+                    && fallback
+                        .as_ref()
+                        .is_some_and(|f| !self.funcs.contains_key(&f.to_ascii_lowercase()))
+                {
+                    let mut expression = self.infer_call(callee, *callee_span, args, *span, ctx)?;
+                    if let TExpr::Call {
+                        callee:
+                            Callee::Php {
+                                fallback: target, ..
+                            },
+                        ..
+                    } = &mut expression
+                    {
+                        *target = fallback.clone();
+                    }
+                    return Some(expression);
+                }
                 self.infer_call(name, *callee_span, args, *span, ctx)
             }
             ast::Expr::Ternary {
@@ -3164,7 +3262,7 @@ impl Analyzer {
             ast::Expr::Index { base, index, span } => {
                 self.infer_index(base, index.as_deref(), *span, ctx)
             }
-            ast::Expr::ArrayLit { items, span } => self.infer_array_lit(items, *span, ctx),
+            ast::Expr::ArrayLit { items, span } => self.infer_array_lit(items, *span, ctx, false),
             ast::Expr::Match {
                 subject,
                 arms,
@@ -3341,7 +3439,7 @@ impl Analyzer {
                 formal_params.extend(method.params.iter().cloned());
 
                 for (arg, formal_ty) in args.iter().zip(method.params.iter()) {
-                    let t_arg = self.infer(arg, ctx)?;
+                    let t_arg = self.infer_for_type(arg, ctx, formal_ty)?;
                     let aty = t_arg.ty();
                     if !self.is_assignable(&aty, formal_ty) {
                         self.diags.emit(
@@ -3428,7 +3526,7 @@ impl Analyzer {
                     let mut typed_args = Vec::new();
                     let mut actual_tys = Vec::new();
                     for (arg, formal_ty) in args.iter().zip(ctor.params.iter()) {
-                        let t_arg = self.infer(arg, ctx)?;
+                        let t_arg = self.infer_for_type(arg, ctx, formal_ty)?;
                         let aty = t_arg.ty();
                         if !self.is_assignable(&aty, formal_ty) {
                             self.diags.emit(
@@ -3472,7 +3570,7 @@ impl Analyzer {
                     }
                     if let Some(def_expr) = &p.default {
                         let mut dummy_ctx = FnCtx::new(Ty::Void, false);
-                        if let Some(t_def) = self.infer(def_expr, &mut dummy_ctx) {
+                        if let Some(t_def) = self.infer_for_type(def_expr, &mut dummy_ctx, &p.ty) {
                             if !self.is_assignable(&t_def.ty(), &p.ty) {
                                 self.diags.emit(
                                     Diagnostic::error(format!(
@@ -3512,7 +3610,7 @@ impl Analyzer {
             } => {
                 let t_expr = self.infer(expr, ctx)?;
                 let expr_ty = t_expr.ty();
-                if !matches!(expr_ty, Ty::Named(_)) {
+                if !matches!(expr_ty, Ty::Named(_) | Ty::Mixed) {
                     self.diags.emit(
                         Diagnostic::error(format!(
                             "cannot use `instanceof` on non-object of type `{expr_ty}`"
@@ -3814,20 +3912,30 @@ impl Analyzer {
     /// Validate the operands of a binary operator and compute its result type.
     /// Shared by expression inference and compound assignment.
     fn binary_type(&mut self, op: ABinOp, l: &Ty, r: &Ty, span: Span) -> Option<Ty> {
-        if (*l == Ty::Mixed || *r == Ty::Mixed)
-            && !matches!(
-                op,
-                ABinOp::Concat
-                    | ABinOp::Identical
-                    | ABinOp::NotIdentical
-                    | ABinOp::And
-                    | ABinOp::Or
-                    | ABinOp::NullCoalesce
-            )
-        {
-            self.diags.emit(Diagnostic::error("mixed arithmetic, ordering, and loose comparison require explicit scalar conversion in this slice")
-                .with_code("E0274").with_span(span));
-            return None;
+        if *l == Ty::Mixed || *r == Ty::Mixed {
+            if *l == Ty::Void || *r == Ty::Void {
+                return self.bad_operands(op, l, r, span);
+            }
+            match op {
+                ABinOp::Add
+                | ABinOp::Sub
+                | ABinOp::Mul
+                | ABinOp::Div
+                | ABinOp::Mod
+                | ABinOp::BitAnd
+                | ABinOp::BitOr
+                | ABinOp::BitXor
+                | ABinOp::Shl
+                | ABinOp::Shr => return Some(Ty::Mixed),
+                ABinOp::Eq
+                | ABinOp::NotEq
+                | ABinOp::Lt
+                | ABinOp::LtEq
+                | ABinOp::Gt
+                | ABinOp::GtEq => return Some(Ty::Bool),
+                ABinOp::Spaceship => return Some(Ty::Int),
+                _ => {}
+            }
         }
         match op {
             ABinOp::Add | ABinOp::Sub | ABinOp::Mul => {
@@ -3898,9 +4006,12 @@ impl Analyzer {
                 Some(Ty::Bool)
             }
             ABinOp::Identical | ABinOp::NotIdentical => {
-                let mixed = (*l == Ty::Mixed && (*r == Ty::Mixed || r.is_scalar()))
-                    || (*r == Ty::Mixed && l.is_scalar());
-                let ok = l == r && l.is_scalar() || mixed;
+                let mixed =
+                    (*l == Ty::Mixed && (*r != Ty::Void)) || (*r == Ty::Mixed && *l != Ty::Void);
+                let ok = l == r && l.is_scalar()
+                    || mixed
+                    || (l.is_array() && r.is_array())
+                    || matches!((l, r), (Ty::Named(_), Ty::Named(_)));
                 if !ok {
                     self.diags.emit(
                         Diagnostic::error(format!(
@@ -3986,7 +4097,9 @@ impl Analyzer {
         }
         match (a, b) {
             (Ty::Null, other) | (other, Ty::Null) => return Some(other.clone()),
-            (Ty::Mixed, other) | (other, Ty::Mixed) if other.is_scalar() => return Some(Ty::Mixed),
+            (Ty::Mixed, other) | (other, Ty::Mixed) if *other != Ty::Void => {
+                return Some(Ty::Mixed)
+            }
             (x, y) if x.is_numeric() && y.is_numeric() => return Some(numeric_result(x, y)),
             _ => {}
         }
@@ -4100,11 +4213,30 @@ impl Analyzer {
         })
     }
 
+    fn infer_for_type(
+        &mut self,
+        expr: &ast::Expr,
+        ctx: &mut FnCtx,
+        expected: &Ty,
+    ) -> Option<TExpr> {
+        if *expected == Ty::Mixed || *expected == Ty::array(Ty::Mixed) {
+            match expr {
+                ast::Expr::ArrayLit { items, span } => {
+                    return self.infer_array_lit(items, *span, ctx, true)
+                }
+                ast::Expr::Paren(expr, _) => return self.infer_for_type(expr, ctx, expected),
+                _ => {}
+            }
+        }
+        self.infer(expr, ctx)
+    }
+
     fn infer_array_lit(
         &mut self,
         items: &[ast::ArrayItem],
         span: Span,
         ctx: &mut FnCtx,
+        mixed_elements: bool,
     ) -> Option<TExpr> {
         let _ = span;
         let mut elems = Vec::new();
@@ -4128,23 +4260,31 @@ impl Analyzer {
                 }
                 None => None,
             };
-            let v = self.infer(&item.value, ctx)?;
+            let v = if mixed_elements {
+                self.infer_for_type(&item.value, ctx, &Ty::Mixed)?
+            } else {
+                self.infer(&item.value, ctx)?
+            };
             let vt = v.ty();
-            if vt == Ty::Null {
+            if vt == Ty::Void {
                 self.diags.emit(
-                    Diagnostic::error("`null` is not supported yet")
-                        .with_code("E0209")
+                    Diagnostic::error("array elements cannot be void")
+                        .with_code("E0203")
                         .with_span(item.value.span()),
                 );
                 return None;
             }
-            ety = Some(match &ety {
-                None => vt,
-                Some(e) => self.unify_types(e, &vt, item.value.span())?,
+            ety = Some(if mixed_elements {
+                Ty::Mixed
+            } else {
+                match &ety {
+                    None => vt,
+                    Some(e) => self.unify_types(e, &vt, item.value.span())?,
+                }
             });
             elems.push((key, v));
         }
-        let ety = ety.unwrap_or(Ty::Null);
+        let ety = ety.unwrap_or(if mixed_elements { Ty::Mixed } else { Ty::Null });
         Some(TExpr::ArrayLit { elems, ety })
     }
 
@@ -4168,7 +4308,7 @@ impl Analyzer {
             for c in &arm.conds {
                 let ct = self.infer(c, ctx)?;
                 let cty = ct.ty();
-                if cty != st && !(st == Ty::Mixed && cty.is_scalar()) {
+                if cty != st && !(st == Ty::Mixed && cty != Ty::Void) {
                     self.diags.emit(
                         Diagnostic::error(format!(
                             "match arm condition has type `{cty}` but the subject is `{st}`; `match` uses strict `===` comparison"
@@ -4251,7 +4391,7 @@ impl Analyzer {
             let mut arg_tys = Vec::new();
             let mut ok = true;
             for (i, (a, pty)) in args.iter().zip(sig.params.iter()).enumerate() {
-                match self.infer(a, ctx) {
+                match self.infer_for_type(a, ctx, pty) {
                     Some(t) => {
                         let at = t.ty();
                         if !self.is_assignable(&at, pty) {
@@ -4291,6 +4431,28 @@ impl Analyzer {
         // Builtin?
         if let Some(kind) = Builtin::from_name(&key) {
             return self.infer_builtin(kind, callee, callee_span, args, span, ctx);
+        }
+
+        if self.php_interop {
+            let mut values = Vec::new();
+            for argument in args {
+                let value = self.infer_for_type(argument, ctx, &Ty::Mixed)?;
+                if value.ty() == Ty::Void {
+                    return self.builtin_ty_err(callee, "a value", &Ty::Void, argument.span());
+                }
+                values.push(value);
+            }
+            let arg_tys = values.iter().map(TExpr::ty).collect();
+            return Some(TExpr::Call {
+                callee: Callee::Php {
+                    name: callee.to_string(),
+                    fallback: None,
+                },
+                ret: Ty::Mixed,
+                args: values,
+                arg_tys,
+                span,
+            });
         }
 
         self.diags.emit(
@@ -4368,9 +4530,6 @@ impl Analyzer {
                 if atys[0] == Ty::Void {
                     return self.builtin_ty_err(name, "a value", &atys[0], span);
                 }
-                if kind == Builtin::Boolval && !atys[0].is_scalar() && atys[0] != Ty::Mixed {
-                    return self.builtin_ty_err(name, "a scalar or mixed value", &atys[0], span);
-                }
                 Ty::Bool
             }
 
@@ -4387,8 +4546,8 @@ impl Analyzer {
                 if n != 1 {
                     return self.builtin_arity_err(name, 1, 1, n, span);
                 }
-                if !atys[0].is_scalar() && atys[0] != Ty::Mixed {
-                    return self.builtin_ty_err(name, "a scalar", &atys[0], args[0].span());
+                if atys[0] == Ty::Void {
+                    return self.builtin_ty_err(name, "a value", &atys[0], args[0].span());
                 }
                 Ty::Int
             }
@@ -4396,8 +4555,8 @@ impl Analyzer {
                 if n != 1 {
                     return self.builtin_arity_err(name, 1, 1, n, span);
                 }
-                if !atys[0].is_scalar() && atys[0] != Ty::Mixed {
-                    return self.builtin_ty_err(name, "a scalar", &atys[0], args[0].span());
+                if atys[0] == Ty::Void {
+                    return self.builtin_ty_err(name, "a value", &atys[0], args[0].span());
                 }
                 Ty::Float
             }
@@ -4405,8 +4564,8 @@ impl Analyzer {
                 if n != 1 {
                     return self.builtin_arity_err(name, 1, 1, n, span);
                 }
-                if !atys[0].is_scalar() && atys[0] != Ty::Mixed {
-                    return self.builtin_ty_err(name, "a scalar", &atys[0], args[0].span());
+                if atys[0] == Ty::Void {
+                    return self.builtin_ty_err(name, "a value", &atys[0], args[0].span());
                 }
                 Ty::String
             }
@@ -4613,10 +4772,15 @@ impl Analyzer {
                 }
                 // All arrays must share one element type (an empty `[]` literal
                 // contributes `null`, which unifies with anything).
+                let mixed_elements = atys.iter().any(|ty| ty.array_elem() == Some(&Ty::Mixed));
                 let mut elem: Option<Ty> = None;
                 for (i, t) in atys.iter().enumerate() {
                     if !t.is_array() {
                         return self.builtin_ty_err(name, "an array", t, args[i].span());
+                    }
+                    if mixed_elements {
+                        elem = Some(Ty::Mixed);
+                        continue;
                     }
                     let e = t.array_elem().unwrap().clone();
                     if e == Ty::Null {
@@ -4832,12 +4996,15 @@ fn numeric_result(l: &Ty, r: &Ty) -> Ty {
 pub fn is_truthy(ty: &Ty) -> bool {
     matches!(
         ty,
-        Ty::Bool | Ty::Int | Ty::Float | Ty::String | Ty::Mixed | Ty::Named(_)
+        Ty::Bool | Ty::Int | Ty::Float | Ty::String | Ty::Mixed | Ty::Named(_) | Ty::Array(_)
     )
 }
 
 /// Types that may be compared with `==` / `!=` (and `switch` case matching).
 fn comparable_eq(a: &Ty, b: &Ty) -> bool {
+    if (*a == Ty::Mixed || *b == Ty::Mixed) && *a != Ty::Void && *b != Ty::Void {
+        return true;
+    }
     (a.is_numeric() && b.is_numeric())
         || (a == b && matches!(a, Ty::String | Ty::Bool | Ty::Named(_)))
 }
@@ -5082,7 +5249,7 @@ fn invalidate_writes(statements: &[ast::Stmt], ctx: &mut FnCtx) {
             | ast::Stmt::AssignOp { target, .. }
             | ast::Stmt::IncDec { target, .. } => {
                 if let Some(slot) = ctx.slot_of(target.root_name()) {
-                    ctx.flow.types.remove(&slot);
+                    ctx.flow.forget(slot);
                 }
             }
             ast::Stmt::Block(body, _)
@@ -5111,7 +5278,7 @@ fn invalidate_writes(statements: &[ast::Stmt], ctx: &mut FnCtx) {
             }
             ast::Stmt::Foreach { value, body, .. } => {
                 if let Some(slot) = ctx.slot_of(value) {
-                    ctx.flow.types.remove(&slot);
+                    ctx.flow.forget(slot);
                 }
                 invalidate_writes(body, ctx);
             }

@@ -26,6 +26,26 @@ use std::time::{Duration, Instant};
 
 /// The runtime C source, embedded so the `pxr` binary is self contained.
 pub const RUNTIME_SOURCE: &str = include_str!("../../../runtime/pxr_rt.c");
+const PHP_WORKER_SOURCE: &str = include_str!("../../../runtime/pxr_php_worker.php");
+
+fn runtime_source() -> String {
+    let mut source = String::from("const char pxr_php_worker_source[] =\n");
+    for chunk in PHP_WORKER_SOURCE
+        .trim_start_matches("<?php")
+        .as_bytes()
+        .chunks(96)
+    {
+        source.push('"');
+        for byte in chunk {
+            // Three-digit octal escapes cannot consume following source bytes.
+            write!(source, "\\{byte:03o}").unwrap();
+        }
+        source.push_str("\"\n");
+    }
+    source.push_str(";\n");
+    source.push_str(RUNTIME_SOURCE);
+    source
+}
 
 #[derive(Clone, Debug)]
 pub struct BuildOptions {
@@ -95,8 +115,13 @@ pub fn check_file(path: &Path) -> Result<Diagnostics, CompileError> {
 
 /// Resolve declaration-only modules and check a complete file-based program.
 pub fn check_path(path: &Path) -> (Option<TProgram>, Diagnostics) {
+    let (program, diagnostics, _) = check_project(path);
+    (program, diagnostics)
+}
+
+fn check_project(path: &Path) -> (Option<TProgram>, Diagnostics, Vec<MigrationFile>) {
     let mut loader = ModuleLoader::default();
-    loader.load(path, false, true, pxr_diag::Span::synthetic());
+    loader.load(path, false, true, true, pxr_diag::Span::synthetic());
     let mut program = None;
     if !loader.diags.has_errors() {
         let ast = pxr_ast::Program {
@@ -128,7 +153,180 @@ pub fn check_path(path: &Path) -> (Option<TProgram>, Diagnostics) {
     if diagnostics.has_errors() {
         program = None;
     }
-    (program, diagnostics)
+    let mut files = std::collections::BTreeMap::new();
+    for (_, path, source) in &loader.sources {
+        files.entry(path.clone()).or_insert_with(|| MigrationFile {
+            path: path.clone(),
+            dynamic: dynamic_source(source),
+            lines: source.lines().count(),
+        });
+    }
+    (program, diagnostics, files.into_values().collect())
+}
+
+/// A file's migration boundary; dynamic files are checked by PHP at runtime.
+#[derive(Clone, Debug)]
+pub struct MigrationFile {
+    pub path: PathBuf,
+    pub dynamic: bool,
+    pub lines: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct MigrationFunction {
+    pub name: String,
+    pub mixed_slots: usize,
+    pub concrete_slots: usize,
+    pub mixed_return: bool,
+    pub dynamic_calls: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct MigrationReport {
+    pub checked: bool,
+    pub files: Vec<MigrationFile>,
+    pub functions: Vec<MigrationFunction>,
+}
+
+fn has_mixed(ty: &pxr_types::Ty) -> bool {
+    match ty {
+        pxr_types::Ty::Mixed => true,
+        pxr_types::Ty::Array(element) => has_mixed(element),
+        _ => false,
+    }
+}
+
+/// Inspect the same graph and semantic analysis used by build/check. It never
+/// executes a dynamic file or runs PHP to discover exports.
+pub fn migration_report(path: &Path) -> (MigrationReport, Diagnostics) {
+    let (program, diagnostics, files) = check_project(path);
+    let mut report = MigrationReport {
+        checked: program.is_some() && !diagnostics.has_errors(),
+        files,
+        functions: Vec::new(),
+    };
+    if let Some(program) = program {
+        let module = pxr_codegen::lower_program(&program);
+        for function in program.funcs.iter().chain(std::iter::once(&program.main)) {
+            let mixed_slots = function.slots.iter().filter(|ty| has_mixed(ty)).count();
+            let dynamic_calls = module.functions.iter().find(|f| f.name == function.name)
+                .map(|f| f.body.iter().filter(|i| matches!(i, pxr_ir::Inst::Call { callee, .. } if callee == "pxr_php_call")).count()).unwrap_or(0);
+            report.functions.push(MigrationFunction {
+                name: function.display.clone(),
+                mixed_slots,
+                concrete_slots: function.slots.len() - mixed_slots,
+                mixed_return: has_mixed(&function.ret),
+                dynamic_calls,
+            });
+        }
+        report.functions.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    (report, diagnostics)
+}
+
+fn json_string(text: &str) -> String {
+    let mut result = String::from("\"");
+    for ch in text.chars() {
+        match ch {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            ch if ch < ' ' => {
+                write!(result, "\\u{:04x}", ch as u32).unwrap();
+            }
+            ch => result.push(ch),
+        }
+    }
+    result.push('"');
+    result
+}
+
+impl MigrationReport {
+    pub fn to_json(&self) -> String {
+        let files = self
+            .files
+            .iter()
+            .map(|file| {
+                format!(
+                    "{{\"path\":{},\"mode\":\"{}\",\"lines\":{}}}",
+                    json_string(&file.path.to_string_lossy()),
+                    if file.dynamic { "php" } else { "native" },
+                    file.lines
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let functions = self.functions.iter().map(|function| format!("{{\"name\":{},\"mixed_slots\":{},\"concrete_slots\":{},\"mixed_return\":{},\"dynamic_calls\":{}}}",
+            json_string(&function.name), function.mixed_slots, function.concrete_slots, function.mixed_return, function.dynamic_calls)).collect::<Vec<_>>().join(",");
+        format!(
+            "{{\"schema_version\":1,\"checked\":{},\"files\":[{}],\"functions\":[{}]}}",
+            self.checked, files, functions
+        )
+    }
+    pub fn to_text(&self) -> String {
+        let mut text = format!(
+            "Migration report: {}\n",
+            if self.checked {
+                "native code checks passed"
+            } else {
+                "native code has errors"
+            }
+        );
+        for file in &self.files {
+            writeln!(
+                text,
+                "  {}  {} ({} lines)",
+                if file.dynamic { "PHP   " } else { "native" },
+                file.path.display(),
+                file.lines
+            )
+            .unwrap();
+        }
+        for function in &self.functions {
+            writeln!(
+                text,
+                "  {}: {} concrete slots, {} mixed slots, {} dynamic calls{}",
+                function.name,
+                function.concrete_slots,
+                function.mixed_slots,
+                function.dynamic_calls,
+                if function.mixed_return {
+                    ", mixed return"
+                } else {
+                    ""
+                }
+            )
+            .unwrap();
+        }
+        text.push_str("PHP boundaries are not statically checked; their runtime dependencies are resolved by PHP.\n");
+        text
+    }
+}
+
+fn dynamic_source(source: &str) -> bool {
+    let mut rest = source.trim_start();
+    if let Some(source) = rest.strip_prefix("<?php") {
+        rest = source;
+    }
+    loop {
+        rest = rest.trim_start();
+        if rest.starts_with("//") || rest.starts_with('#') {
+            let (line, tail) = rest.split_once('\n').unwrap_or((rest, ""));
+            if line.trim_end() == "// @pxr-dynamic" {
+                return true;
+            }
+            rest = tail;
+        } else if rest.starts_with("/*") {
+            let Some((_, tail)) = rest.split_once("*/") else {
+                return false;
+            };
+            rest = tail;
+        } else {
+            return false;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -150,9 +348,65 @@ impl ModuleLoader {
         );
     }
 
-    fn load(&mut self, requested: &Path, once: bool, entry: bool, site: pxr_diag::Span) {
+    fn resolve_runtime_include(&mut self, statement: &mut pxr_ast::Stmt, file: &Path) {
+        if let pxr_ast::Stmt::Require {
+            path,
+            once,
+            required,
+            dir_relative,
+            span,
+        } = statement
+        {
+            let directory = file.parent().unwrap();
+            let dependency = if *dir_relative {
+                PathBuf::from(format!("{}{path}", directory.display()))
+            } else {
+                directory.join(path)
+            };
+            if dependency.as_os_str().as_encoded_bytes().contains(&0) {
+                self.error(*span, "module paths cannot contain NUL bytes");
+                return;
+            }
+            let dynamic = std::fs::read_to_string(&dependency).is_ok_and(|s| dynamic_source(&s));
+            if dynamic || (!*required && !dependency.exists()) {
+                let before = self.items.len();
+                self.load(&dependency, *once, *required, false, *span);
+                if self.items.len() == before + 1 {
+                    *statement = self.items.pop().unwrap();
+                }
+            }
+            return;
+        }
+        for body in statement.bodies_mut() {
+            for statement in body {
+                self.resolve_runtime_include(statement, file);
+            }
+        }
+    }
+
+    fn load(
+        &mut self,
+        requested: &Path,
+        once: bool,
+        required: bool,
+        entry: bool,
+        site: pxr_diag::Span,
+    ) {
         let path = match requested.canonicalize() {
             Ok(path) => path,
+            Err(_) if !required => {
+                let path = if requested.is_absolute() {
+                    requested.to_path_buf()
+                } else {
+                    std::env::current_dir().unwrap_or_default().join(requested)
+                };
+                self.items.push(pxr_ast::Stmt::PhpInclude {
+                    path: path.to_string_lossy().into_owned(),
+                    mode: u8::from(once),
+                    span: site,
+                });
+                return;
+            }
             Err(error) => {
                 self.error(
                     site,
@@ -161,13 +415,6 @@ impl ModuleLoader {
                 return;
             }
         };
-        if once && self.seen.contains(&path) {
-            return;
-        }
-        if self.active.contains(&path) || self.active.len() >= 128 {
-            self.error(site, format!("cyclic or excessively deep module dependency at `{}`; use require_once for shared dependencies", path.display()));
-            return;
-        }
         let source = match read_source(&path) {
             Ok(source) => source,
             Err(_) => {
@@ -177,6 +424,22 @@ impl ModuleLoader {
         };
         let offset = self.next_offset + 1;
         self.next_offset = offset + source.len();
+        if dynamic_source(&source) {
+            self.sources.push((offset, path.clone(), source));
+            self.items.push(pxr_ast::Stmt::PhpInclude {
+                path: path.to_string_lossy().into_owned(),
+                mode: u8::from(once) + if required { 2 } else { 0 },
+                span: site,
+            });
+            return;
+        }
+        if once && self.seen.contains(&path) {
+            return;
+        }
+        if self.active.contains(&path) || self.active.len() >= 128 {
+            self.error(site, format!("cyclic or excessively deep module dependency at `{}`; use require_once for shared dependencies", path.display()));
+            return;
+        }
         let (program, diagnostics) = pxr_parser::parse_at(&source, offset);
         self.sources.push((offset, path.clone(), source));
         let failed = diagnostics.has_errors();
@@ -188,32 +451,40 @@ impl ModuleLoader {
         self.active.insert(path.clone());
         let mut executable = false;
         if let Some(program) = program {
-            for item in program.items {
+            for mut item in program.items {
+                for body in item.bodies_mut() {
+                    for statement in body {
+                        self.resolve_runtime_include(statement, &path);
+                    }
+                }
                 match item {
                     pxr_ast::Stmt::Require {
                         path: dependency,
                         once,
+                        required,
                         dir_relative,
                         span,
                     } => {
-                        if executable {
-                            self.error(
-                                span,
-                                "module dependencies must precede executable top-level statements",
-                            );
-                            continue;
-                        }
-                        if dependency.contains('\0') {
-                            self.error(span, "module paths cannot contain NUL bytes");
-                            continue;
-                        }
                         let directory = path.parent().unwrap();
                         let dependency = if dir_relative {
                             PathBuf::from(format!("{}{dependency}", directory.display()))
                         } else {
                             directory.join(dependency)
                         };
-                        self.load(&dependency, once, false, span);
+                        let dynamic =
+                            std::fs::read_to_string(&dependency).is_ok_and(|s| dynamic_source(&s));
+                        if executable && !dynamic && (required || dependency.exists()) {
+                            self.error(
+                                span,
+                                "module dependencies must precede executable top-level statements",
+                            );
+                            continue;
+                        }
+                        if dependency.as_os_str().as_encoded_bytes().contains(&0) {
+                            self.error(span, "module paths cannot contain NUL bytes");
+                            continue;
+                        }
+                        self.load(&dependency, once, required, false, span);
                     }
                     pxr_ast::Stmt::FnDecl(_)
                     | pxr_ast::Stmt::ClassDecl(_)
@@ -451,50 +722,44 @@ fn cache_dir() -> PathBuf {
     std::env::temp_dir().join("pxr-cache")
 }
 
-/// Compile the embedded runtime to a cached object file, reusing it when the
-/// source and compiler are unchanged.
+/// Compile privately and publish a complete cache object atomically. Parallel
+/// builds must never link a partially written object or compile a partial source.
 fn compile_runtime(cc: &str, workspace: &WorkDir) -> Result<PathBuf, BuildError> {
     let dir = cache_dir();
-    std::fs::create_dir_all(&dir).map_err(BuildError::Io)?;
-    let hash = fnv1a(RUNTIME_SOURCE.as_bytes());
-    let obj = dir.join(format!("pxr_rt-{hash:016x}.o"));
-    if obj.exists() {
-        return Ok(obj);
+    let source = runtime_source();
+    let hash = fnv1a(format!("{cc}\n{source}").as_bytes());
+    let cached = dir.join(format!("pxr_rt-{hash:016x}.o"));
+    if cached.is_file() {
+        return Ok(cached);
     }
 
-    let c_path = dir.join(format!("pxr_rt-{hash:016x}.c"));
-    write_file(&c_path, RUNTIME_SOURCE).map_err(BuildError::Io)?;
-
-    let out = run_tool(
+    let c_path = workspace.path.join("pxr_rt.c");
+    let object = workspace.path.join("pxr_rt.o");
+    write_file(&c_path, &source).map_err(BuildError::Io)?;
+    run_tool(
         Command::new(cc)
             .arg("-c")
             .arg("-O2")
             .arg("-std=c11")
             .arg("-o")
-            .arg(&obj)
+            .arg(&object)
             .arg(&c_path),
         "compiling the PXR runtime",
-    );
-    match out {
-        Ok(()) => Ok(obj),
-        Err(e) => {
-            // Fall back to a private copy in the per-build workspace when the
-            // cache directory is not writable.
-            let obj = workspace.path.join("pxr_rt.o");
-            run_tool(
-                Command::new(cc)
-                    .arg("-c")
-                    .arg("-O2")
-                    .arg("-std=c11")
-                    .arg("-o")
-                    .arg(&obj)
-                    .arg(&c_path),
-                "compiling the PXR runtime",
-            )?;
-            let _ = e;
-            Ok(obj)
+    )?;
+
+    // A failed/unwritable cache is optional; the private object still works.
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let staged = dir.join(format!(
+            "pxr_rt-{hash:016x}-{}-{}.tmp",
+            std::process::id(),
+            rand_suffix()
+        ));
+        if std::fs::copy(&object, &staged).is_ok() && std::fs::rename(&staged, &cached).is_ok() {
+            return Ok(cached);
         }
+        let _ = std::fs::remove_file(staged);
     }
+    Ok(object)
 }
 
 fn link(

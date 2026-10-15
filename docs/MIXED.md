@@ -1,95 +1,109 @@
-# Mixed values and guard narrowing — M4.1–M4.3
+# Mixed values and narrowing — M4
 
-`mixed` is an explicit opt-in to runtime value tags. Concrete variables and
-functions retain their existing static checks. The current implementation supports `int`,
-`float`, `bool`, byte-string values, and `null`; M4 remains in progress.
+`mixed` opts into runtime type tags while concrete declarations keep their
+static checks. It can hold null, integers, floats, booleans, byte strings,
+arrays, and compiled objects or PHP object handles.
 
 ```php
 <?php
 function boxed(mixed $value): mixed { return $value; }
-
 function describe(mixed $value): string {
-    if (is_int($value)) {
-        return "integer: " . ($value + 1);
-    }
+    if (is_int($value)) { return 'integer: ' . ($value + 1); }
+    if (is_array($value)) { return 'array: ' . count($value); }
     return strval($value);
 }
-
-echo describe(42) . "\n";
+echo describe([1, 2]) . "\n";
 $value = boxed(1);
-$value = "now a string";
+$value = 'now a string';
 echo $value . "\n";
 ```
 
-These declarations and expressions also run under PHP. Local PXR annotations
-such as `$value: mixed = 1;` provide another opt-in, but are a PXR extension.
-Function parameter and return annotations remain required.
+These declarations work in PHP. PXR also accepts local annotations such as
+`$value: mixed = 1;`. Compiled parameters and returns still need annotations;
+untyped legacy functions run through the [PHP boundary](INTEROP.md).
 
-## What works
+## Storage and containers
 
-* Scalars are boxed automatically when assigned/passed/returned to a `mixed`
-  destination. Mixed variables can subsequently hold a different supported value type.
-  Parameters, returns, instance/static properties, and constructor arguments use
-  the same representation rules. Constant scalar and null property defaults are supported.
-* `is_int`, `is_float`, `is_bool`, `is_string`, `is_scalar`, `is_array`,
-  `is_object`, and `is_null` inspect values. Concrete arguments are evaluated even
-  when their type makes the result statically known. Null satisfies `is_null`
-  and fails `is_scalar`; arrays and objects cannot yet be boxed.
-* `intval`, `floatval`, `strval`, and `boolval` explicitly produce concrete
-  scalar values. Other typed builtins retain their existing argument requirements.
-* `echo`, `print`, concatenation, interpolation, truthiness, `&&`, `||`, and `!`
-  support mixed values. `.=` stores a newly boxed string without changing aliases
-  to the previous boxed value.
-* Strict `===`/`!==` compares runtime value tags and values. Strings compare by
-  bytes, including embedded NULs; integers and floats remain distinct tags.
-* `match` can compare a mixed subject to concrete scalar or null arm conditions.
-  Branches can combine mixed expressions with scalar results. Heterogeneous
-  branches without an existing mixed expression still need explicit boxing.
-* `null` literals produce mixed values. `??` and `??=` evaluate the fallback
-  only for null/unset values, preserving false, zero, and empty strings. Mixed
-  instance/static properties and array elements support the same behavior.
-* Arrays can hold boxed scalar/null values under the homogeneous element type `mixed`:
-  `$values = [boxed(1), boxed("two")];`. Append, element replacement, copying,
-  iteration, and existing array transforms preserve tags and value semantics.
+Scalars, arrays, and objects box automatically at mixed assignments, arguments,
+returns, constructor arguments, and instance/static properties. Null literals
+already have type mixed. Constant scalar, null, and array property defaults work.
 
-## Limits and next steps
+Arrays retain PHP value semantics when copied, passed, returned, nested,
+iterated, or transformed. Array payloads normalize their elements to boxes;
+objects inside them retain reference identity. Assigning a mixed object shares
+that object. Native object string conversion dispatches its public `__toString`.
 
-This slice does not box arrays or objects. `array<T>` is not implicitly
-converted to `array<mixed>`; box its elements explicitly. Untyped function
-inference, union types, nullable types, runtime PHP includes, and a migration
-report are still planned.
+A concrete `array<T>` can become `array<mixed>`. Heterogeneous literals are
+accepted at explicit mixed/array-of-mixed boundaries, including mixed parameters
+and returns and arguments to legacy functions. Without a mixed boundary,
+inferred arrays keep their homogeneous element checks. Arbitrary recursive
+array-type conversions are not implicit.
 
-Scalar predicates narrow local mixed variables and parameters. Null predicates
-and strict comparisons with null also constrain surviving paths. Inside
-`if (is_int($value))`, integer operations and typed calls can use `$value`
-directly. Negation, surviving paths after early returns, `elseif`/`else`,
-short-circuit boolean expressions, ternaries, and successful strict scalar
-comparisons also propagate facts. Assignments invalidate old guards; reachable
-branch joins retain only facts valid on every surviving path. Guarded numeric
-compound assignments and increments preserve mixed storage while updating the
-known scalar result type.
+```php
+function record(): mixed { return ['name' => 'item', 'count' => 2]; }
+$data = record();
+if (is_array($data)) { echo $data['name'] . ':' . $data['count']; }
+```
 
-Loop analysis discards facts for values that can be rebound across iterations.
-While/for guards can establish new facts for each body execution. It is
-conservative: a safe operation may still require another guard or an explicit
-conversion if its type cannot be proved across loop paths. Guards currently
-refine local slots, not repeated property or array-element reads; copy such a
-value into a local variable before guarding it.
+## Operations
 
-Unguarded mixed arithmetic, ordering, and loose comparisons are rejected with
-`E0274`; proven concrete scalar values use the existing typed operators.
-Implicit conversion from mixed to a concrete parameter/return/property type is
-also rejected; use the explicit conversion functions. Read potentially missing
-mixed array keys through `??`; direct missing-key reads have no valid box and
-fail when used as mixed values. Typed operations such as
-`strlen` require a concrete argument (`strlen(strval($value))`). Numeric string
-conversions reuse the existing runtime's conversion semantics; this slice does
-not claim full PHP dynamic-coercion compatibility.
+* Predicates: `is_int`, `is_float`, `is_bool`, `is_string`, `is_scalar`,
+  `is_array`, `is_object`, and `is_null`. Arguments always evaluate.
+* Explicit scalar conversions: `intval`, `floatval`, `strval`, `boolval`.
+  Echo, print, concatenation, interpolation, truthiness, and boolean operators
+  also accept mixed values. Arrays stringify with a warning; objects need
+  `__toString` to stringify.
+* Arithmetic `+ - * / %`, numeric negation, bitwise `& | ^ ~ << >>`, and
+  corresponding compound assignments use runtime tags. Numeric strings work;
+  invalid operands, zero divisors, and negative shifts fail at runtime. Integer
+  overflow promotes to float. Dynamic integer division preserves an integer
+  result when division is exact. Array `+` performs a key-preserving union.
+* `===`/`!==` distinguish tags and compare strings by bytes, arrays by ordered
+  keys and recursively strict values, and objects by identity. Loose comparison,
+  ordering, spaceship, and mixed switch subjects use runtime PHP-style rules.
+* `match` compares a mixed subject strictly. Branches can combine mixed and
+  concrete values; unrelated concrete branch types still need explicit boxing.
+* `??`/`??=` test both missing keys and boxed nulls. False, zero, and empty
+  strings retain their values; fallback expressions are lazy. Receivers and keys
+  evaluate once. Uninitialized mixed properties can be coalesced safely.
 
-The boxes are immutable and use the existing process arena; memory reclamation
-remains M6. Compiled mixed programs run independently of PHP.
+Mixed arithmetic results remain mixed. Assigning one to a concrete destination
+requires a guard or explicit conversion; concrete arithmetic keeps its original
+static ABI and overflow rules. `**` is outside the current compiled subset.
 
-See [`examples/nulls.php`](../examples/nulls.php) for null storage, conversions,
-strict matching, and lazy coalescing. A variable inferred from null has type
-`mixed`, so it can later hold a supported scalar. Concrete scalar/class types
-remain non-nullable; nullable type annotations are still planned.
+## Narrowing
+
+Scalar predicates narrow local variables and parameters. `is_array` narrows to
+`array<mixed>`, enabling count, indexing, append, mutation, iteration, and typed
+array transforms. A successful `instanceof` check against a compiled class or
+interface enables its properties and methods. `is_object` alone does not prove
+a particular class. Null checks constrain surviving paths.
+
+Negation, elseif/else, early returns, short-circuit booleans, ternaries, and
+successful strict scalar comparisons propagate facts. Assignments invalidate
+previous facts; joins retain only facts valid on every reachable path. Storage
+stays boxed even when a read narrows. Numeric increments/decrements require a
+proven numeric type.
+
+Loop analysis discards facts for values that may be rebound across iterations;
+while/for guards can establish fresh body facts. It remains conservative.
+Property and array-element reads do not retain guards: copy a value into a local
+before guarding it. Most builtins retain concrete argument requirements.
+
+## Boundaries
+
+Compiled code still excludes union/nullable annotations, resources, references,
+and arbitrary dynamic member names. Concrete types remain non-nullable. Read
+potentially missing mixed array keys through `??`; using a direct missing-key
+read as a mixed value fails rather than fabricating a box. Exceptions and broad
+PHP language/library support are available inside explicitly marked PHP files.
+
+PHP object handles can be passed back to legacy functions, compared, or
+stringified; their methods/properties are accessed inside PHP helpers. Native
+objects cannot cross into PHP. See [interop rules](INTEROP.md).
+
+Boxes and copies use the process arena; ownership and reclamation remain M6.
+Mixed programs that do not execute a PHP boundary run without PHP. See
+[`examples/containers.php`](../examples/containers.php),
+[`examples/nulls.php`](../examples/nulls.php), and
+[`examples/migration/main.php`](../examples/migration/main.php).

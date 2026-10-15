@@ -46,16 +46,18 @@ and whose output the test suite asserts is byte‑identical.
 
 ## Remaining observable differences
 
-These are the **only** places where a program PXR accepts computes something
-different from PHP. Both stem from the absence of a dynamic `null`/`int|float`
-value type.
+Concrete code retains the following differences. Mixed runtime tags handle
+null and promoted numeric results without changing the ABI of concrete values.
+The explicit interpreter boundary has additional scope/data rules below.
 
 | Behaviour | PHP | PXR | Tracking |
 | --- | --- | --- | --- |
-| Integer overflow (`PHP_INT_MAX + 1`) | promotes to `float` | wraps (two's complement `int`) | needs an `int\|float` value type |
-| Reading a missing array key | warning, value `null` | value `0` / `""` | needs `null`; `??` correctly detects absence |
+| Integer overflow (`PHP_INT_MAX + 1`) | promotes to `float` | concrete `int` wraps; mixed promotes | concrete ABI remains fixed-width |
+| Reading a missing array key | warning, value `null` | value `0` / `""` | mixed reads fail without a box; use `??` |
 
-Everything else that differs is a **loud compile error**, listed below.
+Unsupported native syntax produces compile errors. Opted-in mixed operand and
+interop errors can also fail at runtime. Native warning text and diagnostic
+formatting are not a complete emulation of PHP configuration.
 
 ## Not implemented yet — rejected at compile time
 
@@ -67,23 +69,24 @@ behavioural divergence.
 | --- | --- |
 | Untyped parameters / missing return type | **Error** `E0202`, `E0204` — PXR requires types |
 | Bare `array` type hint | **Error** — write the element type, `array<T>` (a PXR extension) |
-| A concrete variable changing type (`$x = 1; $x = "s";`) | **Error** — opt into scalar `mixed` to allow scalar type changes |
+| A concrete variable changing type (`$x = 1; $x = "s";`) | **Error** — opt into `mixed` to allow type changes |
 | Complex interpolation: `"$a[0]"`, `"$a[$k]"`, `"{$a[0]}"`, `"$obj->p"`, `"${name}"` | **Error** `E0008` — simple `"$name"` / `"{$name}"` work; write these as a concatenation instead |
-| `null`, nullable types | **Error** `E0209` |
+| Nullable type annotations | Not yet; null literals work through mixed storage |
 | Assignment as an expression (`$a = $b = 1`, `f($x++)`) | **Error** — `++`/`--`/`=` are statement‑only |
 | Keyed `foreach ($a as $k => $v)` | **Error** `E0242` |
 | `echo` / `print` an array, `(string)$array` | **Error** `E0240` — PHP prints `Array` *and* a warning to stdout, which PXR does not reproduce |
 | Nested assignment `$a[0][1] = x` | **Error** `E0248` |
 | `**` (exponentiation) | **Error** `E0257` |
-| `+` with numeric strings (`"1" + 2`) | **Error** — convert with `intval()` / `floatval()` |
-| Heterogeneous arrays (mixed value types) | **Error** — PXR arrays are homogeneous (`array<T>`); e.g. `array_merge` of an `array<int>` and an `array<string>` is `E0253` |
+| `+` with numeric strings (`"1" + 2`) | **Error** for concrete operands; numeric strings work through mixed operators |
+| Heterogeneous arrays | Use mixed/array-of-mixed boundaries; unrelated homogeneous array types still cannot merge implicitly |
 | Wrong argument type (non‑strict mode coercion) | **Error** `E0231` |
-| Undefined variable / function | **Error** `E0220` / `E0232` |
+| Undefined variable / function | `E0220` / `E0232` in native-only code; unbound calls resolve at runtime when a PHP boundary is declared |
 | Leading‑zero octal literal (`0755`) | **Warning** `W0001`, read as decimal |
 | Functions that return `string|false` / `int|false` (`strpos`, `strstr`, `base64_decode`, `hex2bin`, `substr_compare`, …) | Not yet — needs a union / `false` value type; only the never-failing encoders above are provided |
 | `number_format` | Not yet |
 | Traits, enums, closures | Not yet |
-| Dynamic/runtime `include`/`require`, `global`, function-local `static`, references `&` | Not yet; literal top-level `require`/`require_once` of declarations is supported |
+| Runtime include/require | Supported for explicitly marked PHP files; see [interop](INTEROP.md) |
+| `global`, function-local `static`, references `&` | Available inside PHP boundaries; compiled syntax remains restricted |
 | Exceptions, generators, attributes | Not yet |
 
 ### Notes
@@ -100,8 +103,8 @@ negating `PHP_INT_MIN` — e.g. `abs(1 << 63)` — which PHP also promotes to
 `float`). PXR's `int` is a fixed 64‑bit value and wraps on overflow. Faithfully
 promoting to `float` requires the result of `int op int` to be a union type
 (`int|float`), which is a language‑design change tracked for a later milestone.
-Until then integer arithmetic is the one place a PXR result can differ, and it is
-documented rather than silent.
+Mixed arithmetic now supplies runtime integer/float tags and promotes overflow;
+concrete `int` operations retain their fixed-width ABI.
 
 **Numeric strings.** Comparison is numeric‑aware like PHP: `"10" < "9"` is
 false, `"1" == "01"` is true, `"1" === "01"` is false, and `switch` follows the
@@ -210,8 +213,9 @@ etc.) is therefore a loud `E0253` error, as is `array_pad` with a value that is
 not assignable to the element type. An empty literal `[]` (element type `null`)
 unifies with any element type. See the "Not implemented yet" table.
 
-**Missing array keys.** PHP warns and yields `null`. PXR has no `null` yet, so a
-direct read yields the zero value; `??` / `??=` detect absence correctly.
+**Missing array keys.** PHP warns and yields `null`. A direct read from a concrete array yields its zero value; a direct missing
+mixed read fails when used because it has no box. `??` / `??=` detect missing
+keys and actual null values correctly.
 
 **Classes, inheritance & polymorphism.** Single inheritance (`extends`), method
 overriding, `parent::__construct` / `parent::method`, member visibility (`public`,
@@ -254,31 +258,28 @@ names and class references do not. Imports apply only to their file and namespac
 block. Grouped imports, constant imports, autoloading, and dynamic names remain
 unsupported.
 
-Literal `require`/`require_once` dependencies are resolved at compile time and must
-precede executable top-level statements. Dependencies can contain declarations
-and further dependencies, but cannot execute top-level statements. Relative paths
-resolve from the containing file, independent of the process working directory or
-PHP `include_path`. Use `__DIR__ . "/file.php"` for an unambiguous shared PHP/PXR
-path. Missing files and unsupported dependency forms fail compilation (`E0273`).
-This is a static module resolver; runtime inclusion of untyped PHP remains M4.
+Unmarked literal includes/requires load declarations at compile time and precede
+native executable statements. Leading `// @pxr-dynamic` marks legacy files for
+runtime PHP include/include_once/require/require_once, including conditional and
+function-local includes. Calls into legacy PHP return mixed values. Native paths
+resolve from the containing file; legacy dependencies follow PHP's own rules.
+See [`MODULES.md`](MODULES.md) and [`INTEROP.md`](INTEROP.md).
 
-**Scalar and null mixed values.** `mixed` annotations accept scalar values (`int`, `float`,
-`bool`, `string`) and null using runtime tags. Printing, truthiness, conversions,
-concatenation, strict comparisons, and scalar `match` cases are supported. Type
-predicates work on boxed scalars and concrete values. Guards narrow local mixed
-variables and parameters; assignments and control-flow joins invalidate stale
-facts. Concrete variables still cannot change type unless opted into
-`mixed`. Typed-only operations require explicit scalar conversion.
+**Mixed values.** Mixed annotations accept null, scalars, arrays, and compiled
+objects or PHP handles. Arrays retain value semantics; objects retain identity.
+Predicates and scalar/array/instanceof guards refine locals and parameters;
+assignments and joins invalidate stale facts. Native `__toString` dispatch and
+PHP handle stringification are supported. Concrete destinations require a guard
+or explicit conversion.
 
-Null supports strict comparisons, predicates, conversions, and lazy `??`/`??=`
-on variables, mixed properties, and array elements. Concrete types remain
-non-nullable. This is a subset of PHP's broader `mixed`: arrays and objects
-cannot yet be boxed. Unguarded mixed arithmetic, ordering, and loose comparisons fail at
-compile time (`E0274`); guarded concrete scalars use the typed operators. Mixed parameters and returns still require explicit
-annotations. Existing scalar numeric conversion semantics are reused; broader
-PHP coercion fidelity and refinements of repeated property/element reads remain
-future work. See
-[`MIXED.md`](MIXED.md).
+Dynamic arithmetic, numeric strings, overflow promotion, array union, bitwise
+operators, loose/strict comparison, ordering, mixed switch, null coalescing, and
+strict match are tested against PHP. Most other builtins keep concrete argument
+checks. Union/nullable annotations, direct dynamic member access, resources and
+references in native code, and full PHP coercion coverage remain outside the
+compiled subset. PHP boundaries handle broader language/library behavior but
+reject resources, references, callbacks, and native objects crossing the wire.
+See [`MIXED.md`](MIXED.md).
 
 **Fail loud, never silent.** Features not yet implemented (such as
 keyed `foreach`, nested array assignment, complex interpolation forms)
@@ -286,6 +287,6 @@ produce a compile error with a specific code — never a silently different prog
 
 ## Runtime independence
 
-A compiled PXR executable links only the system C library (verified with
-`otool -L` on macOS). It does **not** embed or require the PHP interpreter, Zend
-engine, or any PHP extension. See [`RUNTIME.md`](RUNTIME.md).
+Native PXR executables link only the system C library. Native-only programs,
+including mixed operations, do not require PHP. Executing an explicit PHP
+boundary starts a persistent PHP CLI worker; it does not embed Zend or a SAPI. See [`RUNTIME.md`](RUNTIME.md).

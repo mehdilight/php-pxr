@@ -15,6 +15,7 @@
  *     with the system C compiler on demand, then cached.
  */
 
+#define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <math.h>
 #include <stddef.h>
@@ -22,6 +23,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 /* ------------------------------------------------------------------ arena */
 
@@ -332,8 +336,8 @@ static int pxr_is_space(int c) {
  * is bounded by the string's length, so embedded NULs terminate it exactly as
  * they do for PHP.
  */
-static int pxr_scan_numeric(const pxr_str *s, int *is_int, long long *iv,
-                            double *dv) {
+static int pxr_scan_numeric_mode(const pxr_str *s, int *is_int, long long *iv,
+                            double *dv, int allow_trailing) {
     if (!s) {
         return 0;
     }
@@ -384,7 +388,8 @@ static int pxr_scan_numeric(const pxr_str *s, int *is_int, long long *iv,
         p++;
     }
     if (p != endp) {
-        return 0;
+        if (!allow_trailing) return 0;
+        fputs("Warning: A non-numeric value encountered\n", stderr);
     }
     if (!dot && !exp) {
         errno = 0;
@@ -400,6 +405,10 @@ static int pxr_scan_numeric(const pxr_str *s, int *is_int, long long *iv,
     *is_int = 0;
     *dv = strtod(start, NULL);
     return 1;
+}
+
+static int pxr_scan_numeric(const pxr_str *s, int *is_int, long long *iv, double *dv) {
+    return pxr_scan_numeric_mode(s, is_int, iv, dv, 0);
 }
 
 /*
@@ -497,7 +506,9 @@ typedef enum {
     PXR_TAG_FLOAT = 2,
     PXR_TAG_BOOL = 3,
     PXR_TAG_STR = 4,
-    PXR_TAG_ARR = 5
+    PXR_TAG_ARR = 5,
+    PXR_TAG_OBJ = 6,
+    PXR_TAG_MIXED = 7
 } pxr_tag;
 
 typedef struct {
@@ -511,7 +522,24 @@ typedef struct {
     pxr_ent *ents;
     size_t   len;
     size_t   cap;
+    int64_t identity; /* negative native lineage; positive retained PHP array */
+    int shared;      /* an observed copy needs a fresh lineage on mutation */
 } pxr_array;
+
+static int64_t pxr_array_identity = -1;
+static int64_t pxr_array_fresh_identity(void) {
+    if (pxr_array_identity == INT64_MIN) pxr_oom();
+    return pxr_array_identity--;
+}
+static void pxr_array_share(pxr_array *source, pxr_array *copy) {
+    source->shared = 1;
+    copy->identity = source->identity; copy->shared = 1;
+}
+static int pxr_array_is_list(const pxr_array *array) {
+    for (size_t i = 0; i < array->len; i++)
+        if (array->ents[i].ks || array->ents[i].ki != (int64_t)i) return 0;
+    return 1;
+}
 
 /*
  * PHP converts a *canonical* decimal-integer string key to an `int` key, so
@@ -609,12 +637,14 @@ void *pxr_array_new(void) {
     a->ents = NULL;
     a->len = 0;
     a->cap = 0;
+    a->identity = pxr_array_fresh_identity(); a->shared = 0;
     return a;
 }
 
 void pxr_array_set(void *p, long long ktag, long long ki, const pxr_str *ks,
                    long long vt, long long bits) {
     pxr_array *a = (pxr_array *)p;
+    if (a->shared || a->identity > 0) { a->identity = pxr_array_fresh_identity(); a->shared = 0; }
     pxr_norm_key(&ktag, &ki, &ks);
     long idx = pxr_array_find(a, ktag, ki, ks);
     if (idx >= 0) {
@@ -684,6 +714,8 @@ long long pxr_array_val_bits_at(void *p, long long i) {
  * arrays are copied recursively. Cycles cannot occur because PXR has no
  * references.
  */
+void *pxr_mixed_copy(void *p);
+
 void *pxr_array_copy(void *p) {
     pxr_array *s = (pxr_array *)p;
     pxr_array *d = (pxr_array *)pxr_array_new();
@@ -695,6 +727,8 @@ void *pxr_array_copy(void *p) {
         int64_t bits = src->bits;
         if (src->vt == PXR_TAG_ARR && bits) {
             bits = (int64_t)(intptr_t)pxr_array_copy((void *)(intptr_t)bits);
+        } else if (src->vt == PXR_TAG_MIXED && bits) {
+            bits = (int64_t)(intptr_t)pxr_mixed_copy((void *)(intptr_t)bits);
         }
         d->ents[d->len].vt = src->vt;
         d->ents[d->len].bits = bits;
@@ -702,6 +736,7 @@ void *pxr_array_copy(void *p) {
         d->ents[d->len].ki = src->ki;
         d->len++;
     }
+    pxr_array_share(s, d);
     return d;
 }
 
@@ -1121,11 +1156,14 @@ void *pxr_str_split(const pxr_str *s, long long length) {
  * arrays are deep-copied so value semantics hold. */
 void *pxr_array_values(void *p) {
     pxr_array *s = (pxr_array *)p;
+    if (pxr_array_is_list(s)) return pxr_array_copy(s);
     pxr_array *d = (pxr_array *)pxr_array_new();
     for (size_t i = 0; i < s->len; i++) {
         int64_t bits = s->ents[i].bits;
         if (s->ents[i].vt == PXR_TAG_ARR && bits) {
             bits = (int64_t)(intptr_t)pxr_array_copy((void *)(intptr_t)bits);
+        } else if (s->ents[i].vt == PXR_TAG_MIXED && bits) {
+            bits = (int64_t)(intptr_t)pxr_mixed_copy((void *)(intptr_t)bits);
         }
         pxr_array_push(d, s->ents[i].vt, bits);
     }
@@ -1143,6 +1181,8 @@ void *pxr_array_reverse(void *p, long long preserve_keys) {
         int64_t bits = e->bits;
         if (e->vt == PXR_TAG_ARR && bits) {
             bits = (int64_t)(intptr_t)pxr_array_copy((void *)(intptr_t)bits);
+        } else if (e->vt == PXR_TAG_MIXED && bits) {
+            bits = (int64_t)(intptr_t)pxr_mixed_copy((void *)(intptr_t)bits);
         }
         if (preserve_keys) {
             if (e->ks != NULL) {
@@ -1171,6 +1211,9 @@ static int64_t pxr_val_bits_copy(long long vt, int64_t bits) {
     if (vt == PXR_TAG_ARR && bits) {
         return (int64_t)(intptr_t)pxr_array_copy((void *)(intptr_t)bits);
     }
+    if (vt == PXR_TAG_MIXED && bits) {
+        return (int64_t)(intptr_t)pxr_mixed_copy((void *)(intptr_t)bits);
+    }
     return bits;
 }
 
@@ -1197,6 +1240,16 @@ void *pxr_array_merge(void *pa, void *pb) {
     pxr_array_append(d, (const pxr_array *)pa);
     pxr_array_append(d, (const pxr_array *)pb);
     return d;
+}
+
+/* PHP's two-argument merge can reuse a packed nonempty input when the other
+ * is empty. Keep that comparison lineage even though storage copies eagerly. */
+void *pxr_array_merge_pair(void *pa, void *pb) {
+    pxr_array *a = pa, *b = pb, *source = NULL;
+    if (!a->len && pxr_array_is_list(b)) source = b;
+    if (!b->len && pxr_array_is_list(a)) source = a;
+    if (source) return pxr_array_copy(source);
+    return pxr_array_merge(a, b);
 }
 
 /* `array_slice($a, $offset, $length, $preserve_keys)`. `$has_length` is 0 when
@@ -1991,6 +2044,7 @@ long long pxr_printf(const pxr_str *fmt, void *args) {
 
 typedef struct {
     int64_t class_id;
+    int64_t remote_id; /* zero for native objects; positive for PHP handles */
     const pxr_str *class_name;
     size_t num_props;
     int64_t *tags;
@@ -2017,6 +2071,7 @@ void pxr_class_register(long long class_id, long long super_id) {
 void *pxr_object_new(long long class_id, const pxr_str *name, long long num_props) {
     pxr_object *obj = (pxr_object *)pxr_arena_alloc(sizeof(pxr_object));
     obj->class_id = (int64_t)class_id;
+    obj->remote_id = 0;
     obj->class_name = name;
     obj->num_props = (size_t)num_props;
     if (num_props > 0) {
@@ -2101,22 +2156,64 @@ void pxr_object_set_bits(void *p, long long prop_idx, long long tag, long long b
 
 
 
-/* Immutable tagged scalar and null boxes. Container/object boxing follows later. */
+/* Tagged mixed values: arrays copy by value; objects preserve identity. */
 typedef struct { int64_t tag; int64_t bits; } pxr_mixed;
+extern pxr_str *pxr_native_object_to_string(void *object);
+static pxr_str *pxr_php_stringify(const pxr_mixed *value);
+static void *pxr_php_binary(long long op, const pxr_mixed *left, const pxr_mixed *right);
 
 static const pxr_mixed *pxr_mixed_checked(const void *p) {
     const pxr_mixed *value = p;
-    if (!value || value->tag < 0 || value->tag > 4) {
+    if (!value || value->tag < 0 || value->tag > 6) {
         fprintf(stderr, "Fatal error: Uncaught Error: invalid or uninitialized mixed value\n");
         exit(255);
     }
     return value;
 }
 
+void *pxr_array_to_mixed(void *p);
+
 void *pxr_mixed_box(long long tag, long long bits) {
+    if (tag == PXR_TAG_ARR) bits = (int64_t)(intptr_t)pxr_array_to_mixed((void *)(intptr_t)bits);
     pxr_mixed *value = pxr_arena_alloc(sizeof(pxr_mixed));
     value->tag = tag; value->bits = bits;
     return value;
+}
+
+void *pxr_array_to_mixed(void *p) {
+    pxr_array *source = p;
+    pxr_array *copy = pxr_array_new();
+    for (size_t i = 0; i < source->len; i++) {
+        const pxr_ent *entry = &source->ents[i];
+        void *boxed = entry->vt == PXR_TAG_MIXED
+            ? pxr_mixed_copy((void *)(intptr_t)entry->bits)
+            : pxr_mixed_box(entry->vt, entry->bits);
+        pxr_array_set(copy, entry->ks ? PXR_TAG_STR : PXR_TAG_INT,
+            entry->ki, entry->ks, PXR_TAG_MIXED, (int64_t)(intptr_t)boxed);
+    }
+    pxr_array_share(source, copy);
+    return copy;
+}
+
+void *pxr_mixed_copy(void *p) {
+    const pxr_mixed *value = pxr_mixed_checked(p);
+    return value->tag == PXR_TAG_ARR ? pxr_mixed_box(value->tag, value->bits) : p;
+}
+
+static void *pxr_mixed_payload(const void *p, int tag) {
+    const pxr_mixed *value = pxr_mixed_checked(p);
+    if (value->tag != tag) {
+        fputs("Fatal error: mixed value does not satisfy its guarded type\n", stderr);
+        exit(255);
+    }
+    return (void *)(intptr_t)value->bits;
+}
+
+void *pxr_mixed_array(const void *p) { return pxr_mixed_payload(p, PXR_TAG_ARR); }
+void *pxr_mixed_object(const void *p) { return pxr_mixed_payload(p, PXR_TAG_OBJ); }
+long long pxr_mixed_instanceof(const void *p, long long class_id) {
+    const pxr_mixed *value = pxr_mixed_checked(p);
+    return value->tag == PXR_TAG_OBJ && pxr_instanceof((void *)(intptr_t)value->bits, class_id);
 }
 
 /* Coalescing may inspect an unset typed property without reading its value. */
@@ -2146,6 +2243,8 @@ static long long pxr_mixed_float_to_int(double value) {
 
 long long pxr_mixed_i64(const void *p) {
     const pxr_mixed *value = pxr_mixed_checked(p);
+    if (value->tag == PXR_TAG_ARR) return ((pxr_array *)(intptr_t)value->bits)->len != 0;
+    if (value->tag == PXR_TAG_OBJ) { fputs("Warning: Object could not be converted to int\n", stderr); return 1; }
     if (value->tag == 2) return pxr_mixed_float_to_int(pxr_bits_to_double(value->bits));
     if (value->tag == 4) return pxr_str_to_i64((const pxr_str *)(intptr_t)value->bits);
     return value->bits;
@@ -2153,6 +2252,8 @@ long long pxr_mixed_i64(const void *p) {
 
 double pxr_mixed_f64(const void *p) {
     const pxr_mixed *value = pxr_mixed_checked(p);
+    if (value->tag == PXR_TAG_ARR) return ((pxr_array *)(intptr_t)value->bits)->len != 0;
+    if (value->tag == PXR_TAG_OBJ) { fputs("Warning: Object could not be converted to float\n", stderr); return 1.0; }
     if (value->tag == 2) return pxr_bits_to_double(value->bits);
     if (value->tag == 4) return pxr_str_to_f64((const pxr_str *)(intptr_t)value->bits);
     return (double)value->bits;
@@ -2160,6 +2261,8 @@ double pxr_mixed_f64(const void *p) {
 
 long long pxr_mixed_bool(const void *p) {
     const pxr_mixed *value = pxr_mixed_checked(p);
+    if (value->tag == PXR_TAG_ARR) return ((pxr_array *)(intptr_t)value->bits)->len != 0;
+    if (value->tag == PXR_TAG_OBJ) return 1;
     if (value->tag == 2) return pxr_truthy_f64(pxr_bits_to_double(value->bits));
     if (value->tag == 4) return pxr_truthy_str((const pxr_str *)(intptr_t)value->bits);
     return value->bits != 0;
@@ -2167,6 +2270,17 @@ long long pxr_mixed_bool(const void *p) {
 
 pxr_str *pxr_mixed_str(const void *p) {
     const pxr_mixed *value = pxr_mixed_checked(p);
+    if (value->tag == PXR_TAG_ARR) {
+        fputs("Warning: Array to string conversion\n", stderr);
+        pxr_str *result = pxr_str_alloc(5); memcpy(result->data, "Array", 5); return result;
+    }
+    if (value->tag == PXR_TAG_OBJ) {
+        pxr_object *object = (pxr_object *)(intptr_t)value->bits;
+        if (object->remote_id) return pxr_php_stringify(value);
+        pxr_str *text = pxr_native_object_to_string(object);
+        if (text) return text;
+        fputs("Fatal error: Object could not be converted to string\n", stderr); exit(255);
+    }
     if (value->tag == 0) return pxr_str_alloc(0);
     return pxr_val_to_str(value->tag, value->bits);
 }
@@ -2176,7 +2290,474 @@ void pxr_mixed_print(const void *p) { pxr_print_str(pxr_mixed_str(p)); }
 long long pxr_mixed_identical(const void *a, const void *b) {
     const pxr_mixed *left = pxr_mixed_checked(a), *right = pxr_mixed_checked(b);
     if (left->tag != right->tag) return 0;
+    if (left->tag == PXR_TAG_ARR) {
+        const pxr_array *a = (const pxr_array *)(intptr_t)left->bits;
+        const pxr_array *b = (const pxr_array *)(intptr_t)right->bits;
+        if (a->identity == b->identity) return 1;
+        if (a->identity > 0 || b->identity > 0) {
+            const pxr_mixed *compared = pxr_php_binary(17, left, right);
+            return compared->bits != 0;
+        }
+        if (a->len != b->len) return 0;
+        for (size_t i = 0; i < a->len; i++) {
+            const pxr_ent *x = &a->ents[i], *y = &b->ents[i];
+            if ((x->ks == NULL) != (y->ks == NULL)) return 0;
+            if (x->ks ? !pxr_str_eq(x->ks, y->ks) : x->ki != y->ki) return 0;
+            if (!pxr_mixed_identical((void *)(intptr_t)x->bits, (void *)(intptr_t)y->bits)) return 0;
+        }
+        return 1;
+    }
     if (left->tag == 4) return pxr_str_eq((const pxr_str *)(intptr_t)left->bits, (const pxr_str *)(intptr_t)right->bits);
     if (left->tag == 2) return pxr_bits_to_double(left->bits) == pxr_bits_to_double(right->bits);
     return left->bits == right->bits;
+}
+
+/* Runtime arithmetic keeps the dynamic result tag (including integer overflow
+ * promotion), while concrete PXR arithmetic retains its existing static ABI. */
+static void pxr_mixed_type_error(void) {
+    fputs("Fatal error: Uncaught TypeError: Unsupported operand types\n", stderr);
+    exit(255);
+}
+static int64_t pxr_double_bits(double number) {
+    int64_t bits; memcpy(&bits, &number, sizeof(bits)); return bits;
+}
+static pxr_mixed pxr_mixed_number(const pxr_mixed *value) {
+    pxr_mixed result = *value;
+    if (value->tag == PXR_TAG_NULL || value->tag == PXR_TAG_BOOL) { result.tag = PXR_TAG_INT; return result; }
+    if (value->tag == PXR_TAG_INT || value->tag == PXR_TAG_FLOAT) return result;
+    if (value->tag == PXR_TAG_STR) {
+        int integer = 0; long long iv = 0; double dv = 0;
+        if (!pxr_scan_numeric_mode((const pxr_str *)(intptr_t)value->bits, &integer, &iv, &dv, 1)) pxr_mixed_type_error();
+        result.tag = integer ? PXR_TAG_INT : PXR_TAG_FLOAT;
+        result.bits = integer ? iv : pxr_double_bits(dv);
+        return result;
+    }
+    pxr_mixed_type_error();
+    return result;
+}
+static double pxr_mixed_number_f64(const pxr_mixed *value) {
+    return value->tag == PXR_TAG_FLOAT ? pxr_bits_to_double(value->bits) : (double)value->bits;
+}
+static pxr_mixed pxr_mixed_view(int64_t tag, int64_t bits) {
+    return tag == PXR_TAG_MIXED ? *pxr_mixed_checked((const void *)(intptr_t)bits) : (pxr_mixed){ tag, bits };
+}
+static int pxr_is_php_object(const pxr_mixed *value) {
+    return value->tag == PXR_TAG_OBJ && ((const pxr_object *)(intptr_t)value->bits)->remote_id != 0;
+}
+static int pxr_contains_php_object(const pxr_mixed *value, unsigned depth) {
+    if (depth > 128) { fputs("Fatal error: comparison nesting exceeds 128 levels\n", stderr); exit(255); }
+    if (pxr_is_php_object(value)) return 1;
+    if (value->tag == PXR_TAG_ARR) {
+        const pxr_array *array = (const pxr_array *)(intptr_t)value->bits;
+        if (array->identity > 0) return 1;
+        for (size_t i = 0; i < array->len; i++) {
+            pxr_mixed item = pxr_mixed_view(array->ents[i].vt, array->ents[i].bits);
+            if (pxr_contains_php_object(&item, depth + 1)) return 1;
+        }
+    }
+    return 0;
+}
+static void *pxr_php_binary(long long op, const pxr_mixed *left, const pxr_mixed *right);
+
+/* -1/0/1 are ordered; 2 denotes incomparable values (NaN, differing object
+ * classes, or array keys absent on the other side). Relational operators are
+ * false for incomparable pairs, while PHP's spaceship produces 1. */
+static int pxr_mixed_compare_depth(const pxr_mixed *left, const pxr_mixed *right, unsigned depth) {
+    if (depth > 128) { fputs("Fatal error: recursive comparison exceeds 128 levels\n", stderr); exit(255); }
+    int lt = (int)left->tag, rt = (int)right->tag;
+    if (pxr_is_php_object(left) || pxr_is_php_object(right)) {
+        if ((lt == PXR_TAG_OBJ && !pxr_is_php_object(left)) || (rt == PXR_TAG_OBJ && !pxr_is_php_object(right))) return 2;
+        fputs("Fatal error: comparison of PHP handles inside native object properties requires a PHP helper\n", stderr);
+        exit(255);
+    }
+    if (lt == PXR_TAG_BOOL || rt == PXR_TAG_BOOL) {
+        int a = pxr_mixed_bool(left), b = pxr_mixed_bool(right);
+        return a < b ? -1 : a > b;
+    }
+    if (lt == PXR_TAG_NULL || rt == PXR_TAG_NULL) {
+        if (lt == PXR_TAG_STR || rt == PXR_TAG_STR) {
+            const pxr_str *string = (const pxr_str *)(intptr_t)(lt == PXR_TAG_STR ? left->bits : right->bits);
+            return string->len == 0 ? 0 : (lt == PXR_TAG_NULL ? -1 : 1);
+        }
+        int a = pxr_mixed_bool(left), b = pxr_mixed_bool(right);
+        return a < b ? -1 : a > b;
+    }
+    if (lt == PXR_TAG_ARR && rt == PXR_TAG_ARR) {
+        const pxr_array *a = (const pxr_array *)(intptr_t)left->bits, *b = (const pxr_array *)(intptr_t)right->bits;
+        if (a->identity == b->identity) return 0;
+        if (a->len != b->len) return a->len < b->len ? -1 : 1;
+        for (size_t i = 0; i < a->len; i++) {
+            const pxr_ent *x = &a->ents[i];
+            long index = pxr_array_find((pxr_array *)b, x->ks ? PXR_TAG_STR : PXR_TAG_INT, x->ki, x->ks);
+            if (index < 0) return 2;
+            const pxr_ent *y = &b->ents[index];
+            pxr_mixed xv = pxr_mixed_view(x->vt, x->bits), yv = pxr_mixed_view(y->vt, y->bits);
+            int compared = pxr_mixed_compare_depth(&xv, &yv, depth + 1);
+            if (compared) return compared;
+        }
+        return 0;
+    }
+    if (lt == PXR_TAG_ARR || rt == PXR_TAG_ARR) {
+        return lt == PXR_TAG_ARR ? (rt == PXR_TAG_OBJ ? -1 : 1) : (lt == PXR_TAG_OBJ ? 1 : -1);
+    }
+    if (lt == PXR_TAG_OBJ && rt == PXR_TAG_OBJ) {
+        if (left->bits == right->bits) return 0;
+        const pxr_object *a = (const pxr_object *)(intptr_t)left->bits, *b = (const pxr_object *)(intptr_t)right->bits;
+        if (a->class_id != b->class_id) return 2;
+        for (size_t i = 0; i < a->num_props; i++) {
+            if (!a->tags[i] && !b->tags[i]) continue;
+            if (!a->tags[i] || !b->tags[i]) return 2;
+            pxr_mixed av = pxr_mixed_view(a->tags[i], a->bits[i]), bv = pxr_mixed_view(b->tags[i], b->bits[i]);
+            int compared = pxr_mixed_compare_depth(&av, &bv, depth + 1);
+            if (compared) return compared;
+        }
+        return 0;
+    }
+    if (lt == PXR_TAG_OBJ || rt == PXR_TAG_OBJ) {
+        if (lt == PXR_TAG_STR || rt == PXR_TAG_STR) {
+            const pxr_mixed *object = lt == PXR_TAG_OBJ ? left : right;
+            pxr_str *text = pxr_native_object_to_string((void *)(intptr_t)object->bits);
+            if (!text) return lt == PXR_TAG_OBJ ? 1 : -1;
+            pxr_mixed string = { PXR_TAG_STR, (int64_t)(intptr_t)text };
+            return lt == PXR_TAG_OBJ ? pxr_mixed_compare_depth(&string, right, depth + 1) : pxr_mixed_compare_depth(left, &string, depth + 1);
+        }
+        fputs("Notice: Object could not be converted to number\n", stderr);
+        pxr_mixed object_number = { PXR_TAG_INT, 1 };
+        return lt == PXR_TAG_OBJ ? pxr_mixed_compare_depth(&object_number, right, depth + 1) : pxr_mixed_compare_depth(left, &object_number, depth + 1);
+    }
+    if ((lt == PXR_TAG_FLOAT && isnan(pxr_bits_to_double(left->bits))) ||
+        (rt == PXR_TAG_FLOAT && isnan(pxr_bits_to_double(right->bits)))) return 2;
+    if (lt == PXR_TAG_STR && rt == PXR_TAG_STR) {
+        return (int)pxr_str_cmp_loose((const pxr_str *)(intptr_t)left->bits, (const pxr_str *)(intptr_t)right->bits);
+    }
+    pxr_mixed a = *left, b = *right;
+    if (lt == PXR_TAG_STR || rt == PXR_TAG_STR) {
+        const pxr_mixed *text = lt == PXR_TAG_STR ? left : right;
+        int integer = 0; long long iv = 0; double dv = 0;
+        if (!pxr_scan_numeric((const pxr_str *)(intptr_t)text->bits, &integer, &iv, &dv)) {
+            pxr_str *as = pxr_mixed_str(left), *bs = pxr_mixed_str(right);
+            return pxr_str_cmp(as, bs);
+        }
+        pxr_mixed number = {integer ? PXR_TAG_INT : PXR_TAG_FLOAT, integer ? iv : pxr_double_bits(dv)};
+        if (lt == PXR_TAG_STR) a = number; else b = number;
+    }
+    if (a.tag == PXR_TAG_INT && b.tag == PXR_TAG_INT) return a.bits < b.bits ? -1 : a.bits > b.bits;
+    double x = pxr_mixed_number_f64(&a), y = pxr_mixed_number_f64(&b);
+    if (isnan(x) || isnan(y)) return 2;
+    return x < y ? -1 : x > y;
+}
+
+void *pxr_mixed_negate(const void *p) {
+    pxr_mixed value = pxr_mixed_number(pxr_mixed_checked(p));
+    if (value.tag == PXR_TAG_FLOAT) {
+        return pxr_mixed_box(PXR_TAG_FLOAT, (int64_t)((uint64_t)value.bits ^ (UINT64_C(1) << 63)));
+    }
+    if (value.bits == INT64_MIN) return pxr_mixed_box(PXR_TAG_FLOAT, pxr_double_bits(-(double)value.bits));
+    return pxr_mixed_box(PXR_TAG_INT, -value.bits);
+}
+
+void *pxr_mixed_bit_not(const void *p) {
+    const pxr_mixed *value = pxr_mixed_checked(p);
+    if (value->tag == PXR_TAG_STR) {
+        const pxr_str *source = (const pxr_str *)(intptr_t)value->bits;
+        pxr_str *result = pxr_str_alloc(source->len);
+        for (size_t i = 0; i < source->len; i++) result->data[i] = (char)~(unsigned char)source->data[i];
+        return pxr_mixed_box(PXR_TAG_STR, (int64_t)(intptr_t)result);
+    }
+    if (value->tag != PXR_TAG_INT && value->tag != PXR_TAG_FLOAT) pxr_mixed_type_error();
+    return pxr_mixed_box(PXR_TAG_INT, ~pxr_mixed_i64(value));
+}
+
+void *pxr_mixed_binary(long long op, const void *lp, const void *rp) {
+    const pxr_mixed *left = pxr_mixed_checked(lp), *right = pxr_mixed_checked(rp);
+    if (op >= 10) {
+        if ((pxr_contains_php_object(left, 0) || pxr_contains_php_object(right, 0)) &&
+            !(left->tag == PXR_TAG_OBJ && !pxr_is_php_object(left)) &&
+            !(right->tag == PXR_TAG_OBJ && !pxr_is_php_object(right))) return pxr_php_binary(op, left, right);
+        int cmp = pxr_mixed_compare_depth(left, right, 0), result = 0;
+        switch (op) {
+            case 10: result = cmp == 0; break;
+            case 11: result = cmp != 0; break;
+            case 12: result = cmp == -1; break;
+            case 13: result = cmp == -1 || cmp == 0; break;
+            case 14: result = cmp == 1; break;
+            case 15: result = cmp == 1 || cmp == 0; break;
+            case 16: return pxr_mixed_box(PXR_TAG_INT, cmp == 2 ? 1 : cmp);
+            default: pxr_mixed_type_error();
+        }
+        return pxr_mixed_box(PXR_TAG_BOOL, result);
+    }
+    if (op == 0 && left->tag == PXR_TAG_ARR && right->tag == PXR_TAG_ARR) {
+        pxr_array *result = pxr_array_copy((void *)(intptr_t)left->bits);
+        result->identity = pxr_array_fresh_identity(); result->shared = 0;
+        const pxr_array *source = (const pxr_array *)(intptr_t)right->bits;
+        for (size_t i = 0; i < source->len; i++) {
+            const pxr_ent *entry = &source->ents[i];
+            int key_tag = entry->ks ? PXR_TAG_STR : PXR_TAG_INT;
+            if (pxr_array_find(result, key_tag, entry->ki, entry->ks) < 0) {
+                pxr_array_set(result, key_tag, entry->ki, entry->ks, entry->vt, pxr_val_bits_copy(entry->vt, entry->bits));
+            }
+        }
+        return pxr_mixed_box(PXR_TAG_ARR, (int64_t)(intptr_t)result);
+    }
+    if (op >= 5 && op <= 7 && left->tag == PXR_TAG_STR && right->tag == PXR_TAG_STR) {
+        const pxr_str *a = (const pxr_str *)(intptr_t)left->bits, *b = (const pxr_str *)(intptr_t)right->bits;
+        size_t length = op == 6 ? (a->len > b->len ? a->len : b->len) : (a->len < b->len ? a->len : b->len);
+        pxr_str *result = pxr_str_alloc(length);
+        for (size_t i = 0; i < length; i++) {
+            unsigned char x = i < a->len ? (unsigned char)a->data[i] : 0, y = i < b->len ? (unsigned char)b->data[i] : 0;
+            result->data[i] = (char)(op == 5 ? x & y : op == 6 ? x | y : x ^ y);
+        }
+        return pxr_mixed_box(PXR_TAG_STR, (int64_t)(intptr_t)result);
+    }
+    pxr_mixed a = pxr_mixed_number(left), b = pxr_mixed_number(right);
+    if (op == 4 || (op >= 5 && op <= 9)) {
+        long long x = pxr_mixed_i64(&a), y = pxr_mixed_i64(&b), result = 0;
+        switch (op) {
+            case 4: result = pxr_mod(x, y); break;
+            case 5: result = x & y; break;
+            case 6: result = x | y; break;
+            case 7: result = x ^ y; break;
+            case 8: result = pxr_shl(x, y); break;
+            case 9: result = pxr_shr(x, y); break;
+        }
+        return pxr_mixed_box(PXR_TAG_INT, result);
+    }
+    if (a.tag == PXR_TAG_INT && b.tag == PXR_TAG_INT) {
+        int64_t result = 0; int overflow = 1;
+        if (op == 0) overflow = __builtin_add_overflow(a.bits, b.bits, &result);
+        if (op == 1) overflow = __builtin_sub_overflow(a.bits, b.bits, &result);
+        if (op == 2) overflow = __builtin_mul_overflow(a.bits, b.bits, &result);
+        if (op == 3) {
+            if (!b.bits) pxr_div_error();
+            if (!(a.bits == INT64_MIN && b.bits == -1) && a.bits % b.bits == 0) {
+                result = a.bits / b.bits; overflow = 0;
+            }
+        }
+        if (!overflow) return pxr_mixed_box(PXR_TAG_INT, result);
+    }
+    double x = pxr_mixed_number_f64(&a), y = pxr_mixed_number_f64(&b), result = 0;
+    switch (op) {
+        case 0: result = x + y; break;
+        case 1: result = x - y; break;
+        case 2: result = x * y; break;
+        case 3: result = pxr_div(x, y); break;
+        default: pxr_mixed_type_error();
+    }
+    return pxr_mixed_box(PXR_TAG_FLOAT, pxr_double_bits(result));
+}
+
+/* -------------------------------------------------- PHP interpreter bridge
+ * A lazily started, persistent CLI worker. No shell, temporary PHP file, or
+ * stdout protocol: responses travel on a dedicated pipe (child descriptor 3).
+ * Only programs that execute a dynamic include/call require PHP on PATH.
+ */
+extern const char pxr_php_worker_source[];
+static FILE *pxr_php_input = NULL, *pxr_php_output = NULL;
+static pid_t pxr_php_pid = -1;
+
+static void pxr_php_fail(const char *message) {
+    fprintf(stderr, "Fatal error: PHP interop: %s\n", message);
+    exit(255);
+}
+
+static void pxr_php_cleanup(void) {
+    if (pxr_php_input) { fclose(pxr_php_input); pxr_php_input = NULL; }
+    if (pxr_php_output) { fclose(pxr_php_output); pxr_php_output = NULL; }
+    if (pxr_php_pid > 0) {
+        int status;
+        while (waitpid(pxr_php_pid, &status, 0) < 0 && errno == EINTR) {}
+        pxr_php_pid = -1;
+    }
+}
+
+static void pxr_php_start(void) {
+    if (pxr_php_input) return;
+    int requests[2], responses[2];
+    if (pipe(requests) < 0) pxr_php_fail("could not open request pipe");
+    if (pipe(responses) < 0) { close(requests[0]); close(requests[1]); pxr_php_fail("could not open response pipe"); }
+    fflush(NULL);
+    pxr_php_pid = fork();
+    if (pxr_php_pid == 0) {
+        if (dup2(requests[0], STDIN_FILENO) < 0 || dup2(responses[1], 3) < 0) _exit(127);
+        int fds[] = {requests[0], requests[1], responses[0], responses[1]};
+        for (size_t i = 0; i < 4; i++) if (fds[i] > 3) close(fds[i]);
+        const char *php = getenv("PXR_PHP");
+        if (!php || !php[0]) php = "php";
+        execlp(php, php, "-d", "output_buffering=0", "-d", "display_errors=stderr",
+            "-r", pxr_php_worker_source, (char *)NULL);
+        fputs("Fatal error: PHP interop needs a PHP CLI executable; set PXR_PHP or install php on PATH\n", stderr);
+        _exit(127);
+    }
+    close(requests[0]); close(responses[1]);
+    if (pxr_php_pid < 0) { close(requests[1]); close(responses[0]); pxr_php_fail("could not start PHP worker"); }
+    pxr_php_input = fdopen(requests[1], "wb");
+    pxr_php_output = fdopen(responses[0], "rb");
+    if (!pxr_php_input || !pxr_php_output) pxr_php_fail("could not open worker streams");
+    signal(SIGPIPE, SIG_IGN);
+    atexit(pxr_php_cleanup);
+}
+
+static void pxr_php_write(const void *data, size_t length) {
+    if (length && fwrite(data, 1, length, pxr_php_input) != length) pxr_php_fail("PHP worker closed its request stream");
+}
+static void pxr_php_byte(unsigned char value) { pxr_php_write(&value, 1); }
+static void pxr_php_u64(uint64_t value) {
+    unsigned char bytes[8];
+    for (unsigned i = 0; i < 8; i++) bytes[i] = (unsigned char)(value >> (i * 8));
+    pxr_php_write(bytes, 8);
+}
+static void pxr_php_string(const pxr_str *value) {
+    pxr_php_u64(value->len); pxr_php_write(value->data, value->len);
+}
+static void pxr_php_read(void *data, size_t length) {
+    if (!length || fread(data, 1, length, pxr_php_output) == length) return;
+    int status = 0;
+    pid_t child;
+    do { child = waitpid(pxr_php_pid, &status, 0); } while (child < 0 && errno == EINTR);
+    pxr_php_pid = -1;
+    if (child > 0 && WIFEXITED(status)) exit(WEXITSTATUS(status));
+    if (child > 0 && WIFSIGNALED(status)) exit(128 + WTERMSIG(status));
+    pxr_php_fail("PHP worker exited before returning a value");
+}
+static unsigned char pxr_php_read_byte(void) {
+    unsigned char value; pxr_php_read(&value, 1); return value;
+}
+static uint64_t pxr_php_read_u64(void) {
+    unsigned char bytes[8]; pxr_php_read(bytes, 8);
+    uint64_t value = 0;
+    for (unsigned i = 0; i < 8; i++) value |= (uint64_t)bytes[i] << (i * 8);
+    return value;
+}
+static pxr_str *pxr_php_read_string(void) {
+    uint64_t length = pxr_php_read_u64();
+    if (length > SIZE_MAX - sizeof(pxr_str) - 16) pxr_php_fail("invalid string length from PHP worker");
+    pxr_str *value = pxr_str_alloc((size_t)length);
+    pxr_php_read(value->data, (size_t)length);
+    return value;
+}
+static void pxr_php_send_value(const pxr_mixed *value, unsigned depth) {
+    if (depth > 128) pxr_php_fail("interop nesting exceeds 128 levels");
+    pxr_php_byte((unsigned char)value->tag);
+    switch (value->tag) {
+        case PXR_TAG_NULL: break;
+        case PXR_TAG_INT: case PXR_TAG_FLOAT: pxr_php_u64((uint64_t)value->bits); break;
+        case PXR_TAG_BOOL: pxr_php_byte(value->bits != 0); break;
+        case PXR_TAG_STR: pxr_php_string((const pxr_str *)(intptr_t)value->bits); break;
+        case PXR_TAG_ARR: {
+            const pxr_array *array = (const pxr_array *)(intptr_t)value->bits;
+            pxr_php_u64((uint64_t)array->identity);
+            if (array->identity > 0) break;
+            ((pxr_array *)array)->shared = 1;
+            pxr_php_u64(array->len);
+            for (size_t i = 0; i < array->len; i++) {
+                const pxr_ent *entry = &array->ents[i];
+                pxr_php_byte(entry->ks ? PXR_TAG_STR : PXR_TAG_INT);
+                if (entry->ks) pxr_php_string(entry->ks); else pxr_php_u64((uint64_t)entry->ki);
+                pxr_php_send_value(pxr_mixed_checked((const void *)(intptr_t)entry->bits), depth + 1);
+            }
+            break;
+        }
+        case PXR_TAG_OBJ: {
+            const pxr_object *object = (const pxr_object *)(intptr_t)value->bits;
+            if (!object->remote_id) pxr_php_fail("native objects cannot cross into PHP; pass scalar or array data");
+            pxr_php_u64((uint64_t)object->remote_id);
+            break;
+        }
+        default: pxr_php_fail("invalid outgoing value tag");
+    }
+}
+
+typedef struct pxr_php_handle {
+    int64_t id;
+    pxr_object *object;
+    struct pxr_php_handle *next;
+} pxr_php_handle;
+static pxr_php_handle *pxr_php_handles = NULL;
+
+static void *pxr_php_receive_value(unsigned depth) {
+    if (depth > 128) pxr_php_fail("interop nesting exceeds 128 levels");
+    int tag = pxr_php_read_byte();
+    int64_t bits = 0;
+    switch (tag) {
+        case PXR_TAG_NULL: break;
+        case PXR_TAG_INT: case PXR_TAG_FLOAT: bits = (int64_t)pxr_php_read_u64(); break;
+        case PXR_TAG_BOOL: bits = pxr_php_read_byte() != 0; break;
+        case PXR_TAG_STR: bits = (int64_t)(intptr_t)pxr_php_read_string(); break;
+        case PXR_TAG_ARR: {
+            int64_t identity = (int64_t)pxr_php_read_u64();
+            if (identity <= 0) pxr_php_fail("invalid PHP array handle");
+            uint64_t count = pxr_php_read_u64();
+            pxr_array *array = pxr_array_new();
+            for (uint64_t i = 0; i < count; i++) {
+                int key_tag = pxr_php_read_byte();
+                pxr_str *key = NULL; int64_t index = 0;
+                if (key_tag == PXR_TAG_STR) key = pxr_php_read_string();
+                else if (key_tag == PXR_TAG_INT) index = (int64_t)pxr_php_read_u64();
+                else pxr_php_fail("invalid array key tag from PHP worker");
+                void *item = pxr_php_receive_value(depth + 1);
+                pxr_array_set(array, key_tag, index, key, PXR_TAG_MIXED, (int64_t)(intptr_t)item);
+            }
+            array->identity = identity;
+            bits = (int64_t)(intptr_t)array;
+            break;
+        }
+        case PXR_TAG_OBJ: {
+            int64_t id = (int64_t)pxr_php_read_u64();
+            pxr_str *name = pxr_php_read_string();
+            pxr_php_handle *handle;
+            for (handle = pxr_php_handles; handle && handle->id != id; handle = handle->next) {}
+            if (!handle) {
+                handle = pxr_arena_alloc(sizeof(*handle));
+                handle->id = id; handle->object = pxr_object_new(-1, name, 0);
+                handle->object->remote_id = id;
+                handle->next = pxr_php_handles; pxr_php_handles = handle;
+            }
+            bits = (int64_t)(intptr_t)handle->object;
+            break;
+        }
+        default: pxr_php_fail("invalid incoming value tag");
+    }
+    // The array decoder already produced normalized boxes; avoid copying it.
+    pxr_mixed *value = pxr_arena_alloc(sizeof(*value));
+    value->tag = tag; value->bits = bits;
+    return value;
+}
+static void *pxr_php_response(void) {
+    if (fflush(pxr_php_input) != 0) pxr_php_fail("could not send request to PHP worker");
+    unsigned char status = pxr_php_read_byte();
+    if (status == 1) {
+        pxr_str *message = pxr_php_read_string();
+        fputs("Fatal error: PHP interop: ", stderr);
+        fwrite(message->data, 1, message->len, stderr); fputc('\n', stderr);
+        exit(255);
+    }
+    if (status != 0) pxr_php_fail("invalid response status from PHP worker");
+    return pxr_php_receive_value(0);
+}
+void pxr_php_include(const pxr_str *path, long long mode) {
+    pxr_php_start(); fflush(stdout);
+    pxr_php_byte('I'); pxr_php_byte((unsigned char)mode); pxr_php_string(path);
+    (void)pxr_php_response();
+}
+void *pxr_php_call(const pxr_str *name, const pxr_str *fallback, void *arguments) {
+    pxr_php_start(); fflush(stdout);
+    pxr_php_byte('C'); pxr_php_string(name); pxr_php_string(fallback);
+    pxr_mixed boxed = { PXR_TAG_ARR, (int64_t)(intptr_t)arguments };
+    pxr_php_send_value(&boxed, 0);
+    return pxr_php_response();
+}
+
+static void *pxr_php_binary(long long op, const pxr_mixed *left, const pxr_mixed *right) {
+    pxr_php_start(); fflush(stdout);
+    pxr_php_byte('B'); pxr_php_byte((unsigned char)op);
+    pxr_php_send_value(left, 0); pxr_php_send_value(right, 0);
+    return pxr_php_response();
+}
+
+static pxr_str *pxr_php_stringify(const pxr_mixed *value) {
+    pxr_php_start(); fflush(stdout);
+    pxr_php_byte('S'); pxr_php_send_value(value, 0);
+    const pxr_mixed *result = pxr_mixed_checked(pxr_php_response());
+    return (pxr_str *)(intptr_t)result->bits;
 }

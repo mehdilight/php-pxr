@@ -19,14 +19,14 @@ Two commitments make this practical rather than a rewrite‑everything exercise:
    (`pxr build main.php`), so the same file can be run by PHP or compiled by PXR.
 2. **The migration is gradual.** Modern PHP is already mostly typed
    (`function f(int $x): string`). PXR accepts that syntax directly and adds
-   strictness; M4 is adding an explicit `mixed` escape hatch, starting with
-   scalar/null values and guard narrowing, followed by broader values and dynamic interop.
+   strictness; M4 supplies mixed values, guard narrowing, explicit legacy PHP
+   boundaries, and a migration report.
 
 ## Design principles
 
-* **Fail at compile time, not silently at run time.** If PXR cannot preserve
-  PHP's behaviour for a construct, it emits a diagnostic (`E0xxx`) instead of
-  compiling something subtly different. Every such decision is listed in
+* **Make boundaries explicit.** Concrete code receives static diagnostics
+  (`E0xxx`); opted-in mixed operations check runtime tags. Marked legacy files
+  execute in PHP, never as a silent fallback from a compiler error. Every such decision is listed in
   [`COMPATIBILITY.md`](COMPATIBILITY.md).
 * **No feature is claimed until it works and passes tests.** The README and
   milestone docs are written to match the code and the test suite.
@@ -35,7 +35,8 @@ Two commitments make this practical rather than a rewrite‑everything exercise:
 * **Small, composable stages.** Each compiler stage is a crate with a narrow,
   testable interface. The IR carries enough type information that later stages
   never re‑derive it.
-* **The runtime is ours and small.** Compiled programs run without PHP; the
+* **The runtime is ours and small.** Native-only programs run without PHP; opted-in legacy boundaries use a CLI
+  worker. The
   runtime is a thin, auditable C library today and grows deliberately
   ([`RUNTIME.md`](RUNTIME.md)).
 
@@ -47,7 +48,7 @@ today     typed scalars, arrays, control flow, LLVM backend, tests, benchmarks
   ├─ M1  arrays, loops, switch/match, compound ops        ✅ done
   ├─ M2  owned strings + a real standard library          ✅ done
   ├─ M3  classes, namespaces, compile-time modules        ✅ done
-  ├─ M4  scalar/null mixed + narrowing; interop next           🚧 in progress
+  ├─ M4  mixed values, narrowing, PHP interop, report          ✅ done
   ├─ M5  generics + inference                             (zero-cost abstraction)
   ├─ M6  ownership & borrowing, no leaks                  (memory safety)
   ├─ M7  async/await + structured tasks, then threads     (I/O + parallelism)

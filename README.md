@@ -13,17 +13,16 @@ pxr run   main.php             # compile in a temp dir and run
 pxr check main.php             # type-check only, no code generation
 ```
 
-The same `main.php` can still be run by the traditional interpreter for
-comparison; PXR programs themselves run **without PHP**, linking only the small
-PXR runtime.
+The same `main.php` can still run under PHP for comparison. Native programs link
+only the small PXR runtime; explicitly marked legacy boundaries use a PHP CLI
+worker when they execute.
 
-> **Project status: milestone 4 in progress — gradual migration.**
-> Milestones 1–3 are complete. M4 now provides opt-in scalar `mixed`
-> values, runtime type predicates, conversions, strict comparisons, and guard-based
-> narrowing for local mixed variables. Container/object/null boxing and runtime
-> PHP interop remain planned.
-> Classes, namespaces, and declaration-only compile-time modules are available.
-> See [`docs/MILESTONES.md`](docs/MILESTONES.md) and [`docs/MIXED.md`](docs/MIXED.md).
+> **Project status: milestones 1–4 complete.**
+> M4 adds mixed scalar/null/array/object values, guard narrowing, dynamic
+> operators, runtime PHP include/call boundaries, and a migration report.
+> `examples/migration/main.php` runs a typed native entry point with untyped PHP.
+> Next is M5: generics and inference. See [`docs/MILESTONES.md`](docs/MILESTONES.md),
+> [`docs/MIXED.md`](docs/MIXED.md), and [`docs/INTEROP.md`](docs/INTEROP.md).
 
 ---
 
@@ -31,7 +30,8 @@ PXR runtime.
 
 Requirements: a Rust toolchain (to build the compiler) and a C compiler on
 `PATH` (`clang`; PXR uses it to drive the LLVM backend and link). PHP is **not**
-required to run compiled programs.
+required for native-only programs. Executing a marked legacy PHP boundary
+requires a PHP 8+ CLI executable.
 
 ```sh
 cargo build --release            # builds target/release/pxr
@@ -70,6 +70,7 @@ migration path possible.
 | --- | --- |
 | `pxr build <file.php> [-o <out>] [--opt 0-3] [--keep-llvm]` | Compile to a native executable |
 | `pxr run <file.php> [--args...]` | Compile to a temporary executable and run it |
+| `pxr migration-report <file.php> [--json]` | Show native/PHP files, mixed slots, and dynamic call sites |
 | `pxr check <file.php>` | Lex, parse, type-check; report errors only |
 | `pxr emit-ir <file.php>` | Print the optimized PXR IR |
 | `pxr emit-llvm <file.php>` | Print the generated LLVM IR |
@@ -113,9 +114,11 @@ migration path possible.
   single inheritance, dynamic dispatch, `parent::`, `instanceof`, and abstract
   classes and methods, interface contracts, calls through interface types, and
   static properties/methods via `Class::`, `self::`, and `parent::`.
-* **Gradual typing (M4.1–M4.3)** — opt-in scalar/null `mixed` parameters, returns, variables,
-  and properties; `is_*` checks, guarded scalar narrowing, conversions, strict
-  comparisons, lazy null coalescing, and arrays of boxed scalar/null values.
+* **Gradual migration (M4)** — mixed scalars, nulls, arrays and objects;
+  scalar/array/instanceof guards, conversions, dynamic arithmetic/comparison,
+  value copies, lazy coalescing, and native/PHP `__toString` dispatch. Marked
+  legacy PHP files run through persistent include/call interop. The migration
+  report distinguishes native and interpreted parts without executing PHP.
 * **Modules** — braced and unbraced namespaces, qualified names, class/namespace
   aliases, `use function`, and compile-time `require`/`require_once` dependencies
   with diagnostics pointing to the originating file.
@@ -136,14 +139,14 @@ $ php examples/compat.php | diff - <(pxr run examples/compat.php) && echo IDENTI
 IDENTICAL
 ```
 
-Where PXR cannot preserve PHP behaviour it **fails at compile time** instead of
-silently changing semantics, and the differences are documented in
+Concrete code receives static diagnostics; mixed operations check runtime tags,
+and marked legacy files run in PHP. The boundary and differences are documented in
 [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md). Highlights:
 
 * Parameters and return types are **required** (PXR is statically typed).
 * Using an undefined variable is an **error**, not a warning + `null`.
-* Integer overflow **wraps** (two's complement) instead of promoting to `float`.
-* `null` is **not implemented yet** and is rejected at compile time.
+* Concrete integer overflow wraps; mixed arithmetic promotes to float.
+* Null uses mixed storage; concrete types remain non-nullable.
 
 ## Benchmarks
 
@@ -191,14 +194,13 @@ automatically when no C compiler is available.
 ## Not implemented yet
 
 Tracked honestly in [`docs/ROADMAP.md`](docs/ROADMAP.md). The larger items:
-keyed `foreach`, `echo` of arrays, nested array assignment, `null`/nullable
-types, integer‑overflow → `float` promotion, late static binding (`static::`),
+keyed `foreach`, `echo` of arrays, nested array assignment, nullable
+annotations, overflow promotion for concrete `int` arithmetic, late static binding (`static::`),
 generics,
 ownership & borrowing, the complex string‑interpolation forms (`"$a[0]"`,
 `"{$expr}"`, `"${name}"`, `"$obj->p"`; the simple `"$name"` / `"{$name}"` work),
-exceptions, runtime `include`/`require` interop, C interop (`extern`), async/await and concurrency
-(planned for M7; see [`docs/ASYNC.md`](docs/ASYNC.md)), and the
-full dynamic `mixed` support for gradual migration.
+native exceptions, C interop (`extern`), async/await and concurrency
+(planned for M7; see [`docs/ASYNC.md`](docs/ASYNC.md)), and broader PHP language/library coverage in compiled code.
 
 ## License
 

@@ -19,8 +19,44 @@ pub fn lower_program(prog: &TProgram) -> Module {
     for f in &prog.funcs {
         m.function(lower_func(f));
     }
+    m.function(lower_stringifier(&prog.stringifiers));
     m.function(lower_main(&prog.main, &prog.class_registrations));
     m
+}
+
+fn lower_stringifier(stringifiers: &[(u32, String)]) -> Function {
+    let object_ty = Ty::Named("__pxr_object".into());
+    let mut lower = Lowerer::new(Function::new(
+        "pxr_native_object_to_string",
+        "native __toString dispatch",
+        vec![object_ty],
+        Ty::String,
+    ));
+    let class = lower.rt_call("pxr_object_get_class_id", vec![0], Ty::Int);
+    for (id, method) in stringifiers {
+        let expected = lower.emit_const(Literal::Int(*id as i64));
+        let matches = lower.bin(IBinOp::Eq, class, &Ty::Int, expected, &Ty::Int, &Ty::Bool);
+        let body = lower.fresh_label();
+        let next = lower.fresh_label();
+        lower.terminator(Inst::Branch {
+            cond: matches,
+            then_label: body,
+            else_label: next,
+        });
+        lower.switch_to(body);
+        let result = lower.rt_call(method, vec![0], Ty::String);
+        lower.terminator(Inst::Ret {
+            ty: Ty::String,
+            src: Some(result),
+        });
+        lower.switch_to(next);
+    }
+    let null = lower.emit_const(Literal::Null);
+    lower.terminator(Inst::Ret {
+        ty: Ty::String,
+        src: Some(null),
+    });
+    lower.into_function()
 }
 
 fn lower_main(tf: &TFunc, class_registrations: &[(u32, u32)]) -> Function {
@@ -211,6 +247,11 @@ impl Lowerer {
 
     fn lower_stmt(&mut self, stmt: &TStmt) {
         match stmt {
+            TStmt::PhpInclude { path, mode } => {
+                let path = self.emit_const(Literal::Str(path.as_bytes().to_vec()));
+                let mode = self.emit_const(Literal::Int(*mode as i64));
+                self.rt_call("pxr_php_include", vec![path, mode], Ty::Void);
+            }
             TStmt::Block(body) => self.lower_stmts(body),
             TStmt::Echo(exprs) => {
                 for e in exprs {
@@ -430,6 +471,14 @@ impl Lowerer {
                 expr,
             } => {
                 let a = self.lower_expr(expr);
+                if *operand_ty == Ty::Mixed {
+                    if *op == pxr_sema::TUnOp::Neg {
+                        return self.rt_call("pxr_mixed_negate", vec![a], Ty::Mixed);
+                    }
+                    if *op == pxr_sema::TUnOp::BitNot {
+                        return self.rt_call("pxr_mixed_bit_not", vec![a], Ty::Mixed);
+                    }
+                }
                 let (a, op_ty) = match op {
                     pxr_sema::TUnOp::Not => (self.to_bool(a, operand_ty), Ty::Bool),
                     pxr_sema::TUnOp::Neg => (a, operand_ty.clone()),
@@ -530,7 +579,8 @@ impl Lowerer {
                 if let Some((ctor_mangled, ctor_args, _)) = ctor {
                     let mut args = vec![obj];
                     for arg in ctor_args {
-                        args.push(self.lower_expr(arg));
+                        let value = self.lower_expr(arg);
+                        args.push(self.maybe_copy_array(value, &arg.ty()));
                     }
                     self.emit(Inst::Call {
                         dst: None,
@@ -548,7 +598,12 @@ impl Lowerer {
             } => {
                 let obj = self.lower_expr(expr);
                 let target_cid = self.emit_const(Literal::Int(*target_class_id as i64));
-                let res = self.rt_call("pxr_instanceof", vec![obj, target_cid], Ty::Int);
+                let function = if expr.ty() == Ty::Mixed {
+                    "pxr_mixed_instanceof"
+                } else {
+                    "pxr_instanceof"
+                };
+                let res = self.rt_call(function, vec![obj, target_cid], Ty::Int);
                 self.to_bool(res, &Ty::Int)
             }
         }
@@ -564,10 +619,19 @@ impl Lowerer {
         if from == to {
             return v;
         }
-        if *to == Ty::Mixed && from.is_scalar() {
+        if *to == Ty::Mixed && *from != Ty::Void {
             let tag = self.emit_const(Literal::Int(Self::tag_of(from)));
             let bits = self.encode_bits(v, from);
             return self.rt_call("pxr_mixed_box", vec![tag, bits], Ty::Mixed);
+        }
+        if let (Ty::Array(element), Ty::Array(target)) = (from, to) {
+            if **target == Ty::Mixed && **element != Ty::Mixed {
+                return self.rt_call("pxr_array_to_mixed", vec![v], to.clone());
+            }
+        }
+        if matches!(from, Ty::Array(_) | Ty::Named(_)) && *to == Ty::Bool {
+            let boxed = self.cast(v, from, &Ty::Mixed);
+            return self.cast(boxed, &Ty::Mixed, to);
         }
         if *from == Ty::Mixed {
             let function = match to {
@@ -575,6 +639,8 @@ impl Lowerer {
                 Ty::Float => "pxr_mixed_f64",
                 Ty::String => "pxr_mixed_str",
                 Ty::Bool => "pxr_mixed_bool",
+                Ty::Array(_) => "pxr_mixed_array",
+                Ty::Named(_) => "pxr_mixed_object",
                 _ => panic!("unsupported mixed conversion to {to}"),
             };
             let result_ty = if *to == Ty::Bool { Ty::Int } else { to.clone() };
@@ -626,6 +692,44 @@ impl Lowerer {
         }
     }
 
+    fn mixed_op(op: pxr_sema::TBinOp) -> Option<i64> {
+        use pxr_sema::TBinOp::*;
+        Some(match op {
+            Add => 0,
+            Sub => 1,
+            Mul => 2,
+            Div => 3,
+            Mod => 4,
+            BitAnd => 5,
+            BitOr => 6,
+            BitXor => 7,
+            Shl => 8,
+            Shr => 9,
+            Eq => 10,
+            NotEq => 11,
+            Lt => 12,
+            LtEq => 13,
+            Gt => 14,
+            GtEq => 15,
+            Spaceship => 16,
+            _ => return None,
+        })
+    }
+
+    fn lower_mixed_binary(
+        &mut self,
+        op: pxr_sema::TBinOp,
+        left: Value,
+        left_ty: &Ty,
+        right: Value,
+        right_ty: &Ty,
+    ) -> Value {
+        let left = self.cast(left, left_ty, &Ty::Mixed);
+        let right = self.cast(right, right_ty, &Ty::Mixed);
+        let op = self.emit_const(Literal::Int(Self::mixed_op(op).unwrap()));
+        self.rt_call("pxr_mixed_binary", vec![op, left, right], Ty::Mixed)
+    }
+
     fn lower_bin(
         &mut self,
         op: pxr_sema::TBinOp,
@@ -636,6 +740,13 @@ impl Lowerer {
         rhs: &TExpr,
     ) -> Value {
         use pxr_sema::TBinOp as B;
+        if (*lhs_ty == Ty::Mixed || *rhs_ty == Ty::Mixed) && Self::mixed_op(op).is_some() {
+            let left = self.lower_expr(lhs);
+            let right = self.lower_expr(rhs);
+            let result = self.lower_mixed_binary(op, left, lhs_ty, right, rhs_ty);
+            return self.cast(result, &Ty::Mixed, result_ty);
+        }
+
         match op {
             B::And | B::Or => self.lower_short_circuit(op, lhs_ty, lhs, rhs_ty, rhs),
             B::Concat => {
@@ -699,6 +810,11 @@ impl Lowerer {
                     return self.bin(iop, cmp, &Ty::Int, zero, &Ty::Int, &Ty::Bool);
                 }
                 let iop = if want_eq { IBinOp::Eq } else { IBinOp::NotEq };
+                if strict && (lhs_ty.is_array() || matches!(lhs_ty, Ty::Named(_))) {
+                    let a = self.cast(a, lhs_ty, &Ty::Mixed);
+                    let b = self.cast(b, rhs_ty, &Ty::Mixed);
+                    return self.bin(iop, a, &Ty::Mixed, b, &Ty::Mixed, &Ty::Bool);
+                }
                 if lhs_ty.is_numeric() && rhs_ty.is_numeric() && lhs_ty != rhs_ty {
                     let (a, b, ty) = self.unify_numeric(a, lhs_ty, b, rhs_ty);
                     return self.bin(iop, a, &ty, b, &ty, &Ty::Bool);
@@ -903,7 +1019,7 @@ impl Lowerer {
         if a == b {
             return a.clone();
         }
-        if (*a == Ty::Mixed && b.is_scalar()) || (*b == Ty::Mixed && a.is_scalar()) {
+        if (*a == Ty::Mixed && *b != Ty::Void) || (*b == Ty::Mixed && *a != Ty::Void) {
             return Ty::Mixed;
         }
         if a.is_numeric() && b.is_numeric() {
@@ -1270,6 +1386,9 @@ impl Lowerer {
     /// at every place an array value is stored into a location, passed to a
     /// function, embedded in another array, or taken as a `foreach` value.
     fn maybe_copy_array(&mut self, v: Value, ty: &Ty) -> Value {
+        if *ty == Ty::Mixed {
+            return self.rt_call("pxr_mixed_copy", vec![v], Ty::Mixed);
+        }
         if !ty.is_array() {
             return v;
         }
@@ -1362,6 +1481,7 @@ impl Lowerer {
         match target {
             TTarget::MixedVar { slot, .. } => {
                 let value = self.cast(v, &ty, &Ty::Mixed);
+                let value = self.maybe_copy_array(value, &Ty::Mixed);
                 self.emit(Inst::SlotSet {
                     slot: *slot,
                     src: value,
@@ -1481,6 +1601,10 @@ impl Lowerer {
         rv: Value,
     ) -> (Value, Ty) {
         use pxr_sema::TBinOp as B;
+        if (*lt == Ty::Mixed || *rt == Ty::Mixed) && Self::mixed_op(op).is_some() {
+            return (self.lower_mixed_binary(op, lv, lt, rv, rt), Ty::Mixed);
+        }
+
         match op {
             B::Concat => {
                 let a = self.to_string(lv, lt);
@@ -1606,6 +1730,7 @@ impl Lowerer {
                 self.switch_to(set_l);
                 let v = self.lower_expr(value);
                 let v = self.cast(v, &value.ty(), ty);
+                let v = self.maybe_copy_array(v, ty);
                 if let Some((obj, idx)) = property {
                     let tag = self.emit_const(Literal::Int(Self::tag_of(ty)));
                     let bits = self.encode_bits(v, ty);
@@ -1655,6 +1780,7 @@ impl Lowerer {
                     v = self.cast(v, &vt, ty);
                 }
                 let vtag = self.emit_const(Literal::Int(Self::tag_of(ty)));
+                let v = self.maybe_copy_array(v, ty);
                 let bits = self.encode_bits(v, ty);
                 self.array_set(arr, ktag, kint, kstr, vtag, bits);
                 self.terminator(Inst::Jump(skip_l));
@@ -1863,7 +1989,16 @@ impl Lowerer {
                 let tv = self.lower_expr(t);
                 // PHP's `switch` compares loosely; numeric strings compare by
                 // value (`"1" == "01"`).
-                let eq = if *subject_ty == Ty::String && c.test_ty == Ty::String {
+                let eq = if *subject_ty == Ty::Mixed || c.test_ty == Ty::Mixed {
+                    let result = self.lower_mixed_binary(
+                        pxr_sema::TBinOp::Eq,
+                        sval,
+                        subject_ty,
+                        tv,
+                        &c.test_ty,
+                    );
+                    self.cast(result, &Ty::Mixed, &Ty::Bool)
+                } else if *subject_ty == Ty::String && c.test_ty == Ty::String {
                     let cmp = self.str_cmp_loose(sval, tv);
                     let zero = self.emit_const(Literal::Int(0));
                     self.bin(IBinOp::Eq, cmp, &Ty::Int, zero, &Ty::Int, &Ty::Bool)
@@ -1900,6 +2035,21 @@ impl Lowerer {
 
     fn lower_call(&mut self, callee: &Callee, ret: &Ty, args: &[TExpr], arg_tys: &[Ty]) -> Value {
         match callee {
+            Callee::Php { name, fallback } => {
+                let name = self.emit_const(Literal::Str(name.as_bytes().to_vec()));
+                let fallback = self.emit_const(Literal::Str(
+                    fallback.as_deref().unwrap_or("").as_bytes().to_vec(),
+                ));
+                let arguments = self.rt_call("pxr_array_new", vec![], Ty::array(Ty::Mixed));
+                for argument in args {
+                    let value = self.lower_expr(argument);
+                    let boxed = self.cast(value, &argument.ty(), &Ty::Mixed);
+                    let tag = self.emit_const(Literal::Int(7));
+                    let bits = self.encode_bits(boxed, &Ty::Mixed);
+                    self.array_push(arguments, tag, bits);
+                }
+                self.rt_call("pxr_php_call", vec![name, fallback, arguments], Ty::Mixed)
+            }
             Callee::User {
                 mangled, params, ..
             } => {
@@ -1992,10 +2142,16 @@ impl Lowerer {
             Intval => match arg_tys[0] {
                 Ty::Mixed => self.cast(a[0], &Ty::Mixed, &Ty::Int),
                 Ty::Int => a[0],
-                Ty::Float => self.cast(a[0], &Ty::Float, &Ty::Int),
+                Ty::Float => {
+                    let boxed = self.cast(a[0], &Ty::Float, &Ty::Mixed);
+                    self.cast(boxed, &Ty::Mixed, &Ty::Int)
+                }
                 Ty::Bool => self.cast(a[0], &Ty::Bool, &Ty::Int),
                 Ty::String => self.cast(a[0], &Ty::String, &Ty::Int),
-                _ => a[0],
+                _ => {
+                    let boxed = self.cast(a[0], &arg_tys[0], &Ty::Mixed);
+                    self.cast(boxed, &Ty::Mixed, &Ty::Int)
+                }
             },
             Floatval => match arg_tys[0] {
                 Ty::Mixed => self.cast(a[0], &Ty::Mixed, &Ty::Float),
@@ -2003,7 +2159,10 @@ impl Lowerer {
                 Ty::Int => self.cast(a[0], &Ty::Int, &Ty::Float),
                 Ty::Bool => self.cast(a[0], &Ty::Bool, &Ty::Float),
                 Ty::String => self.cast(a[0], &Ty::String, &Ty::Float),
-                _ => a[0],
+                _ => {
+                    let boxed = self.cast(a[0], &arg_tys[0], &Ty::Mixed);
+                    self.cast(boxed, &Ty::Mixed, &Ty::Float)
+                }
             },
             Strval => match arg_tys[0] {
                 Ty::Mixed => self.cast(a[0], &Ty::Mixed, &Ty::String),
@@ -2011,7 +2170,10 @@ impl Lowerer {
                 Ty::Int => self.cast(a[0], &Ty::Int, &Ty::String),
                 Ty::Float => self.cast(a[0], &Ty::Float, &Ty::String),
                 Ty::Bool => self.cast(a[0], &Ty::Bool, &Ty::String),
-                _ => a[0],
+                _ => {
+                    let boxed = self.cast(a[0], &arg_tys[0], &Ty::Mixed);
+                    self.cast(boxed, &Ty::Mixed, &Ty::String)
+                }
             },
             Abs => match arg_tys[0] {
                 Ty::Int => self.rt_call("pxr_abs_i64", vec![a[0]], Ty::Int),
@@ -2129,9 +2291,15 @@ impl Lowerer {
             ArrayMerge => {
                 // Fold a variadic call into a chain of binary merges, starting
                 // from an empty array so that even one argument is reindexed.
+                if argc == 2 {
+                    let left = self.cast(a[0], &arg_tys[0], ret);
+                    let right = self.cast(a[1], &arg_tys[1], ret);
+                    return self.rt_call("pxr_array_merge_pair", vec![left, right], ret.clone());
+                }
                 let mut acc = self.array_new();
                 for i in 0..argc {
-                    acc = self.rt_call("pxr_array_merge", vec![acc, a[i]], ret.clone());
+                    let array = self.cast(a[i], &arg_tys[i], ret);
+                    acc = self.rt_call("pxr_array_merge", vec![acc, array], ret.clone());
                 }
                 acc
             }

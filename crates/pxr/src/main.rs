@@ -30,7 +30,7 @@ USAGE:
 COMMANDS:
     build <file.php> [-o <out>]   Compile to a native executable
     run   <file.php>              Compile to a temporary executable and run it
-    check <file.php>              Type-check without generating code
+    migration-report <file.php> [--json]  Report native and PHP migration boundaries\n    check <file.php>              Type-check without generating code
     emit-ir <file.php>            Print the optimized PXR IR
     emit-llvm <file.php>          Print the generated LLVM IR
     tokens <file.php>             Print the lexer token stream
@@ -73,6 +73,7 @@ fn run() -> i32 {
             0
         }
         "check" => cmd_check(rest),
+        "migration-report" => cmd_migration_report(rest),
         "build" => cmd_build(rest),
         "run" => cmd_run(rest),
         "emit-ir" => cmd_emit_ir(rest),
@@ -146,6 +147,37 @@ fn parse_options(args: &[String], allow_program_args: bool) -> Result<Options, S
         i += 1;
     }
     Ok(o)
+}
+
+fn cmd_migration_report(args: &[String]) -> i32 {
+    let json = args.iter().any(|arg| arg == "--json");
+    let args: Vec<_> = args
+        .iter()
+        .filter(|arg| *arg != "--json")
+        .cloned()
+        .collect();
+    let options = match parse_options(&args, false) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("pxr migration-report: {error}");
+            return 2;
+        }
+    };
+    let Some(file) = options.file else {
+        eprintln!("pxr migration-report: missing input file");
+        return 2;
+    };
+    let source = match read(&file) {
+        Ok(source) => source,
+        Err(code) => return code,
+    };
+    let (migration, diagnostics) = pxr_driver::migration_report(&file);
+    if json {
+        println!("{}", migration.to_json());
+    } else {
+        print!("{}", migration.to_text());
+    }
+    report(&diagnostics, &source, &file)
 }
 
 fn cmd_check(args: &[String]) -> i32 {

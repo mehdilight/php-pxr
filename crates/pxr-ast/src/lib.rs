@@ -41,9 +41,16 @@ pub enum Stmt {
     },
     FnDecl(Box<FnDecl>),
     ClassDecl(Box<ClassDecl>),
+    /// File-loader-resolved interpreter boundary, not parsed from source directly.
+    PhpInclude {
+        path: String,
+        mode: u8,
+        span: Span,
+    },
     Require {
         path: String,
         once: bool,
+        required: bool,
         dir_relative: bool,
         span: Span,
     },
@@ -100,6 +107,79 @@ pub enum Stmt {
 }
 
 impl Stmt {
+    /// Statement lists owned by this node, including declaration bodies.
+    pub fn bodies(&self) -> Vec<&[Stmt]> {
+        match self {
+            Stmt::FnDecl(f) => vec![&f.body],
+            Stmt::ClassDecl(c) => c
+                .members
+                .iter()
+                .filter_map(|m| match m {
+                    ClassMember::Method(m) => Some(m.body.as_slice()),
+                    _ => None,
+                })
+                .collect(),
+            Stmt::Block(body, _)
+            | Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::Foreach { body, .. } => vec![body],
+            Stmt::If {
+                then_branch,
+                elifs,
+                else_branch,
+                ..
+            } => {
+                let mut bodies = vec![then_branch.as_slice()];
+                bodies.extend(elifs.iter().map(|(_, body)| body.as_slice()));
+                if let Some(body) = else_branch {
+                    bodies.push(body);
+                }
+                bodies
+            }
+            Stmt::For {
+                init, update, body, ..
+            } => vec![init, update, body],
+            Stmt::Switch { cases, .. } => cases.iter().map(|case| case.body.as_slice()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn bodies_mut(&mut self) -> Vec<&mut Vec<Stmt>> {
+        match self {
+            Stmt::FnDecl(f) => vec![&mut f.body],
+            Stmt::ClassDecl(c) => c
+                .members
+                .iter_mut()
+                .filter_map(|m| match m {
+                    ClassMember::Method(m) => Some(&mut m.body),
+                    _ => None,
+                })
+                .collect(),
+            Stmt::Block(body, _)
+            | Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::Foreach { body, .. } => vec![body],
+            Stmt::If {
+                then_branch,
+                elifs,
+                else_branch,
+                ..
+            } => {
+                let mut bodies = vec![then_branch];
+                bodies.extend(elifs.iter_mut().map(|(_, body)| body));
+                if let Some(body) = else_branch {
+                    bodies.push(body);
+                }
+                bodies
+            }
+            Stmt::For {
+                init, update, body, ..
+            } => vec![init, update, body],
+            Stmt::Switch { cases, .. } => cases.iter_mut().map(|case| &mut case.body).collect(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn span(&self) -> Span {
         match self {
             Stmt::Echo(_, sp)
@@ -108,7 +188,8 @@ impl Stmt {
             | Stmt::Return(_, sp)
             | Stmt::Break(_, sp)
             | Stmt::Continue(_, sp) => *sp,
-            Stmt::Require { span, .. }
+            Stmt::PhpInclude { span, .. }
+            | Stmt::Require { span, .. }
             | Stmt::Assign { span, .. }
             | Stmt::AssignOp { span, .. }
             | Stmt::IncDec { span, .. }

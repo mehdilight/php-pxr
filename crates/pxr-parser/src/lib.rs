@@ -406,8 +406,13 @@ impl Parser {
             TokenKind::Class | TokenKind::Abstract | TokenKind::Interface => self
                 .parse_class()
                 .map(|c| Some(Stmt::ClassDecl(Box::new(c)))),
-            TokenKind::Require | TokenKind::RequireOnce => {
-                let once = self.advance().kind == TokenKind::RequireOnce;
+            TokenKind::Require
+            | TokenKind::RequireOnce
+            | TokenKind::Include
+            | TokenKind::IncludeOnce => {
+                let kind = self.advance().kind;
+                let once = matches!(kind, TokenKind::RequireOnce | TokenKind::IncludeOnce);
+                let required = matches!(kind, TokenKind::Require | TokenKind::RequireOnce);
                 let paren = self.eat(&TokenKind::LParen);
                 let dir_relative = matches!(&self.peek().kind, TokenKind::Ident(name) if name.eq_ignore_ascii_case("__DIR__"));
                 if dir_relative {
@@ -431,6 +436,7 @@ impl Parser {
                 Ok(Some(Stmt::Require {
                     path,
                     once,
+                    required,
                     dir_relative,
                     span: start.merge(end.span),
                 }))
@@ -1657,7 +1663,8 @@ fn set_stmt_span(s: &mut Stmt, span: Span) {
         | Stmt::Return(_, sp)
         | Stmt::Break(_, sp)
         | Stmt::Continue(_, sp) => *sp = span,
-        Stmt::Require { span: sp, .. }
+        Stmt::PhpInclude { span: sp, .. }
+        | Stmt::Require { span: sp, .. }
         | Stmt::Assign { span: sp, .. }
         | Stmt::AssignOp { span: sp, .. }
         | Stmt::IncDec { span: sp, .. }

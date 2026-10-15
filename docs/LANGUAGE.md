@@ -4,7 +4,7 @@ This is the precise description of the language the current compiler accepts.
 It is written to match the implementation and the test suite — if this document
 and the compiler disagree, that is a bug.
 
-PXR is **statically typed**, with opt-in scalar/null `mixed` values for gradual
+PXR is **statically typed**, with opt-in `mixed` values for gradual
 migration. Concrete types retain their existing checks; `mixed` values carry a
 runtime value tag and require explicit conversion for typed-only operations.
 
@@ -25,13 +25,13 @@ runtime value tag and require explicit conversion for typed-only operations.
 | `int` | 64‑bit signed integer | `i64` |
 | `float` | IEEE‑754 double | `double` |
 | `string` | immutable byte string | `pxr_str *` |
-| `mixed` | opt-in tagged scalar or null (`int`, `float`, `bool`, `string`, `null`) | opaque `ptr` |
+| `mixed` | opt-in tagged null, scalar, array, or object | opaque `ptr` |
 | `bool` | boolean | `i1` |
 | `void` | no value (return types only) | — |
 | `array<T>` | ordered map with values of type `T` (`int`/`string` keys) | opaque `ptr` |
 | `ClassName` | reference to class instance (`Ty::Named`) | opaque `ptr` |
 
-Concrete scalar coercion widens **`int` → `float`**. Scalars can also be boxed
+Concrete scalar coercion widens **`int` → `float`**. Scalars, arrays, and objects can also be boxed
 implicitly when the destination is `mixed`; mixed values are not implicitly
 converted back to concrete types. Other mismatches are compile errors.
 
@@ -48,7 +48,7 @@ visibility:= 'public' | 'protected' | 'private'
 fn        := 'function' NAME '(' params? ')' (':' type)? block
 params    := param (',' param)*
 param     := type VARIABLE
-type      := 'int' | 'float' | 'string' | 'bool' | 'void' | 'array' '<' type '>' | NAME
+type      := 'int' | 'float' | 'string' | 'bool' | 'void' | 'mixed' | 'array' '<' type '>' | NAME
 block     := '{' stmt* '}'
 
 stmt      := 'echo' expr (',' expr)* ';'
@@ -62,6 +62,7 @@ stmt      := 'echo' expr (',' expr)* ';'
            | 'switch' '(' expr ')' '{' switch_case* '}'
            | 'break' INT? ';'
            | 'continue' INT? ';'
+           | ('include' | 'include_once' | 'require' | 'require_once') module_path ';'
            | block
            | lvalue (':' type)? '=' expr ';'          // assignment (optionally typed)
            | lvalue ('+=' | '-=' | '*=' | '/=' | '%=' | '.=' | '&=' | '|=' | '^=' | '<<=' | '>>=' | '??=') expr ';'
@@ -148,7 +149,8 @@ declaration) become the program entry point.
 
 ## Expressions and operators
 
-Arithmetic `+ - * /` require numeric operands; `%` requires two `int`s.
+The following operator rules apply to concrete operands; runtime mixed rules
+are described below. Arithmetic `+ - * /` require numeric operands; `%` requires two `int`s.
 `/` always produces `float` (PHP semantics), even for two `int`s.
 
 Concatenation `.` accepts `string`, and also `int`/`float`/`bool`, which are
@@ -378,7 +380,8 @@ are `W020x`.
 | `E0270` | Invalid class/interface inheritance edge, duplicate supertype, or non-public interface method |
 | `E0271` | Static-member misuse, static/instance modifier mismatch, or unsupported static form |
 | `E0273` | Invalid/unresolved compile-time module dependency or missing file context |
-| `E0274` | Unsupported mixed operation or mixed property default |
+| `E0274` | Invalid mixed property default |
+| `E0275` | Invalid `__toString` signature |
 | `W0202` | `return` with a value at top level is ignored |
 
 ## Classes, Inheritance & Polymorphism
@@ -453,47 +456,68 @@ are `W020x`.
   function or builtin. Explicitly qualified calls have no global fallback.
 * Namespaces and imports must be top-level. Namespace declarations precede code.
 
-## Compile-time modules
+## Modules and PHP boundaries
 
-`require_once __DIR__ . "/Library.php";` loads declarations at compile time.
-Literal `require "Library.php";` is also supported. Relative paths resolve from
-that file's directory. Dependencies must precede executable top-level statements;
-loaded files may contain only declarations and dependencies. Once dependencies
-are deduplicated by canonical path. Non-once cycles and dynamic paths are errors.
-See [`MODULES.md`](MODULES.md) for examples and the distinction from runtime PHP
-inclusion. `tokens` and `ast` inspect only the requested file; semantic/build
-commands resolve its full dependency graph.
+Literal include/include_once/require/require_once statements resolve paths from
+the containing source file; `__DIR__ . "/Library.php"` is supported. Unmarked
+files are declaration-only modules, loaded before native executable statements;
+once dependencies deduplicate by canonical path. Native module cycles without
+once edges and variable path expressions are errors. `tokens`/`ast` inspect only
+the requested file; semantic/build commands resolve the graph.
 
-## Scalar and null mixed values (M4.1–M4.3)
+A leading `// @pxr-dynamic` comment selects a runtime PHP boundary. These
+includes can appear in branches and function/method bodies. PHP maintains their
+runtime include registry and state. Unbound calls in a program with such a
+boundary dispatch to PHP and return mixed; known compiled calls and global
+native builtins retain static binding. Namespaced calls that may resolve in PHP
+cannot establish native predicate facts; explicitly qualify guard builtins.
+See [`MODULES.md`](MODULES.md) and [`INTEROP.md`](INTEROP.md).
 
-`function identity(mixed $value): mixed { return $value; }` accepts boxed scalar
-and null values. Local variables can opt in with `$value: mixed = 1;`; a value inferred
-as `mixed` also remains mixed when subsequently assigned another supported value.
+## Mixed values (M4)
 
-Predicates: `is_int`, `is_float`, `is_bool`, `is_string`, `is_scalar`, `is_array`,
-`is_object`, and `is_null`. Conversion: `intval`, `floatval`, `strval`, `boolval`.
-Mixed values support echo/print, concatenation, interpolation, boolean contexts,
-strict comparisons, `match` against scalar conditions, and scalar/mixed branch
-results. Direct arithmetic, ordering, loose comparisons, and implicit unboxing
-are rejected unless scalar guard facts prove a concrete operand type. Guards
-narrow local mixed variables/parameters; rebinding invalidates previous facts.
+`function identity(mixed $value): mixed { return $value; }` accepts null,
+scalars, arrays, and objects. Local annotations such as `$value: mixed = 1;`
+provide another opt-in. Null literals have type mixed. Concrete declarations
+remain non-nullable and never implicitly unbox mixed values.
 
-Null literals have type `mixed` and support predicates, scalar conversions,
-strict comparisons, matching, and lazy coalescing. Nullable annotations remain
-planned; concrete types cannot store null. Arrays and objects cannot yet become
-mixed values. Arrays can store boxed scalars/null as `array<mixed>`; use explicitly
-boxed elements rather than converting an entire concrete array. See
-[`MIXED.md`](MIXED.md) for examples and remaining limits.
+`is_int`, `is_float`, `is_bool`, `is_string`, `is_scalar`, `is_array`, `is_object`,
+and `is_null` inspect runtime tags. `intval`, `floatval`, `strval`, and `boolval`
+explicitly convert to concrete scalars. Echo/print, concatenation/interpolation,
+truthiness, boolean operators, strict and loose comparisons, ordering,
+spaceship, mixed switch subjects, and match against mixed-compatible conditions
+are supported.
 
-## Guard-based scalar narrowing (M4.2)
+Mixed arithmetic `+ - * / %`, bitwise `& | ^ ~ << >>`, numeric negation, and
+compound operations check operand tags at runtime. Numeric strings work;
+integer overflow promotes to float. Dynamic integer division returns an integer
+when exact and a float otherwise. Array addition preserves left-hand keys.
+Invalid operands, zero division, and negative shifts fail at runtime. Arithmetic
+results remain mixed; typed destinations need guards or explicit conversion.
+Concrete arithmetic retains its static return/overflow rules. `**` is still
+outside the compiled subset. Numeric increment/decrement requires a concrete
+numeric guard.
 
-`if (is_int($value)) { echo $value + 1; }` narrows a local mixed slot to `int`
-inside the true branch. The other scalar predicates work similarly. Negation,
-`elseif`/`else`, early returns, `&&`/`||`, ternaries, and successful strict scalar
-comparisons propagate facts. Branch joins merge reachable possibilities; guarded
-reads never change the slot's boxed storage representation.
+Arrays copy by value through mixed boundaries and array transforms. Objects
+retain identity and dispatch public `__toString` methods when stringified.
+`array<T>` can become `array<mixed>`; heterogeneous array literals work at mixed
+parameter/return/local/property boundaries and in PHP-call arguments. Other
+inferred arrays retain homogeneous element checks. Recursive arbitrary array
+conversions are not implicit. See [`MIXED.md`](MIXED.md).
 
-Assignments invalidate earlier facts. Repeated loop code is checked without
-assuming values retain a type that can be changed by a body/update path. Loop
-guards can establish fresh facts. Property and array-element reads do not yet
-receive persistent refinements; guarding a local copy is supported.
+## Guard-based narrowing
+
+Scalar guards narrow local mixed variables and parameters. `is_array` narrows
+to `array<mixed>` for typed indexing, mutation, iteration, and array builtins.
+`instanceof` against a compiled class or interface supplies its nominal type;
+`is_object` alone does not identify a class. Null guards constrain surviving
+possibilities. PHP object handles stay opaque to native member access.
+
+Negation, elseif/else, early returns, short-circuit booleans, ternaries, and
+successful strict scalar comparisons propagate facts. Reachable branch joins
+merge possibilities, retaining a nominal type only when every surviving path
+proves it. Guarded reads never alter boxed storage.
+
+Assignments invalidate previous facts. Repeated loop code does not assume a
+value keeps a type that can be changed by a body/update path; loop guards can
+establish fresh facts. Property and array-element guards do not persist: use a
+local copy. More precise loop analysis remains future work.
