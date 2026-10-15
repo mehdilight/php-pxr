@@ -1749,3 +1749,113 @@ fn invalid_interface_programs_are_rejected() {
         assert!(r.stderr.contains(code), "{name}: {}", r.stderr);
     }
 }
+
+#[test]
+fn static_members_and_inheritance_match_php() {
+    if !have_cc() {
+        return;
+    }
+    let src = include_str!("../../../examples/static.php");
+    let f = temp_php("static_members", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "1\n12\ncounter:2\n102\ncounter:2\nPXR runtime:3:1\n1:9\n99\n3\n"
+    );
+    assert_matches_php("static_members_php", src);
+}
+
+#[test]
+fn static_methods_have_no_this_and_bind_self_lexically() {
+    assert_matches_php(
+        "static_binding",
+        r#"<?php
+class ParentCounter {
+    public static int $value = 1;
+    public static function read(): int { return self::$value; }
+    public function instanceValue(): int { return 7; }
+    public function invoke(): int { return self::instanceValue(); }
+}
+class ChildCounter extends ParentCounter {
+    public static int $value = 2;
+    public static function read(): int { return parent::read() + self::$value; }
+    public function invoke(): int { return parent::invoke(); }
+}
+echo ChildCounter::read() . "\n";
+ParentCounter::$value = 5;
+echo ChildCounter::read() . "\n";
+echo ChildCounter::$value . "\n";
+$p = new ChildCounter();
+echo $p->invoke() . "\n";
+abstract class Creator { abstract public static function make(): int; }
+class ConcreteCreator extends Creator { public static function make(): int { return 8; } }
+echo ConcreteCreator::make() . "\n";
+class StaticFactory {
+    public static function sum(float $a, int $b): float { return $a + $b; }
+    public static function make(): ParentCounter { return new ParentCounter(); }
+}
+echo StaticFactory::sum(2, 3) . "\n";
+echo StaticFactory::make()->invoke() . "\n";
+"#,
+    );
+}
+
+#[test]
+fn static_properties_initialize_once_and_copy_arrays() {
+    assert_matches_php(
+        "static_initialization",
+        r#"<?php
+class ChildSettings extends BaseSettings {}
+class BaseSettings {
+    public static int $count = 1 + 2;
+    public static $words = ["hello", "world"];
+    static public function first(): string { return self::$words[0]; }
+}
+ChildSettings::$count++;
+echo BaseSettings::$count . ":" . ChildSettings::$count . "\n";
+$a = ["new", "value"];
+ChildSettings::$words = $a;
+$a[0] = "changed";
+echo ChildSettings::first() . ":" . $a[0] . "\n";
+$x = new BaseSettings();
+$y = new ChildSettings();
+echo BaseSettings::$count . "\n";
+"#,
+    );
+}
+
+#[test]
+fn static_member_diagnostics_are_rejected() {
+    let cases = [
+        ("this", "class A { public static function f(): int { return $this->x; } }", "E0268"),
+        ("instance_call", "class A { public function f(): int { return 1; } } A::f();", "E0271"),
+        ("static_to_instance", "class A { public function f(): int { return 1; } public static function g(): int { return self::f(); } }", "E0271"),
+        ("private_property", "class A { private static int $x = 1; } echo A::$x;", "E0265"),
+        ("private_method", "class A { private static function f(): int { return 1; } } A::f();", "E0265"),
+        ("protected_property", "class A { protected static int $x = 1; } A::$x = 2;", "E0265"),
+        ("instance_property", "class A { public int $x = 1; } echo A::$x;", "E0271"),
+        ("object_property", "class A { public static int $x = 1; } $a = new A(); echo $a->x;", "E0271"),
+        ("object_method", "class A { public static function f(): int { return 1; } } $a = new A(); $a->f();", "E0271"),
+        ("property_override", "class A { public static int $x = 1; } class B extends A { public int $x = 1; }", "E0271"),
+        ("method_override", "class A { public static function f(): int { return 1; } } class B extends A { public function f(): int { return 2; } }", "E0271"),
+        ("interface", "interface I { static function f(): int; } class A implements I { public function f(): int { return 1; } }", "E0271"),
+        ("constructor", "class A { public static function __construct() {} }", "E0271"),
+        ("no_default", "class A { public static int $x; }", "E0271"),
+        ("dynamic_default", "class A { public static int $x = intval(1); }", "E0271"),
+        ("wrong_default", "class A { public static int $x = \"bad\"; }", "E0212"),
+        ("wrong_assignment", "class A { public static int $x = 1; } A::$x = \"bad\";", "E0212"),
+        ("arity", "class A { public static function f(int $x): int { return $x; } } A::f();", "E0207"),
+        ("argument", "class A { public static function f(int $x): int { return $x; } } A::f(\"bad\");", "E0208"),
+        ("self_context", "self::f();", "E0268"),
+        ("parent_context", "class A { public static function f(): void { parent::f(); } }", "E0268"),
+        ("late_binding", "class A { public static function f(): void { static::f(); } }", "E0271"),
+        ("abstract_call", "interface I { static function f(): int; } I::f();", "E0269"),
+    ];
+    for (name, source, code) in cases {
+        let f = temp_php(&format!("static_invalid_{name}"), source);
+        let r = run_ok(&["check", f.to_str().unwrap()]);
+        assert_ne!(r.code, 0, "accepted {name}");
+        assert!(r.stderr.contains(code), "{name}: {}", r.stderr);
+    }
+}

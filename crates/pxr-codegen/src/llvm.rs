@@ -112,6 +112,7 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     ("pxr_printf", "i64", &["ptr", "ptr"]),
     // Object runtime (M3.1, M3.2).
     ("pxr_object_new", "ptr", &["i64", "ptr", "i64"]),
+    ("pxr_static_storage", "ptr", &["i64", "i64"]),
     ("pxr_object_get_bits", "i64", &["ptr", "i64"]),
     ("pxr_object_set_bits", "void", &["ptr", "i64", "i64", "i64"]),
     ("pxr_class_register", "void", &["i64", "i64"]),

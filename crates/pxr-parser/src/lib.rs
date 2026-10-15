@@ -447,36 +447,37 @@ impl Parser {
 
     fn parse_class_member(&mut self, is_interface: bool) -> Result<ClassMember, ()> {
         let start = self.peek().span;
-        let mut is_abstract = self.eat(&TokenKind::Abstract);
-        let (vis, has_vis) = match self.peek().kind {
-            TokenKind::Public => {
-                self.advance();
-                (Visibility::Public, true)
+        let mut is_abstract = false;
+        let mut is_static = false;
+        let mut vis = Visibility::Public;
+        let mut has_vis = false;
+        loop {
+            match self.peek().kind {
+                TokenKind::Abstract if !is_abstract => {
+                    is_abstract = true;
+                    self.advance();
+                }
+                TokenKind::Static if !is_static => {
+                    is_static = true;
+                    self.advance();
+                }
+                TokenKind::Public | TokenKind::Protected | TokenKind::Private if !has_vis => {
+                    vis = match self.advance().kind {
+                        TokenKind::Protected => Visibility::Protected,
+                        TokenKind::Private => Visibility::Private,
+                        _ => Visibility::Public,
+                    };
+                    has_vis = true;
+                }
+                _ => break,
             }
-            TokenKind::Protected => {
-                self.advance();
-                (Visibility::Protected, true)
-            }
-            TokenKind::Private => {
-                self.advance();
-                (Visibility::Private, true)
-            }
-            _ => (Visibility::Public, false),
-        };
-
-        if self.eat(&TokenKind::Abstract) {
-            if is_abstract {
-                self.error(start, "duplicate `abstract` modifier");
-                return Err(());
-            }
-            is_abstract = true;
         }
         if is_interface && is_abstract {
             self.error(start, "interface methods are implicitly abstract");
             return Err(());
         }
         if self.at(&TokenKind::Function) {
-            let m = self.parse_method(start, vis, is_abstract || is_interface)?;
+            let m = self.parse_method(start, vis, is_abstract || is_interface, is_static)?;
             return Ok(ClassMember::Method(m));
         }
 
@@ -487,7 +488,7 @@ impl Parser {
             );
             return Err(());
         }
-        if !has_vis {
+        if !has_vis && !is_static {
             let span = self.peek().span;
             self.error(
                 span,
@@ -519,6 +520,7 @@ impl Parser {
 
         let semi = self.expect(&TokenKind::Semicolon, "`;` after property declaration")?;
         Ok(ClassMember::Property(PropertyDecl {
+            is_static,
             visibility: vis,
             ty,
             name,
@@ -533,6 +535,7 @@ impl Parser {
         start: Span,
         visibility: Visibility,
         is_abstract: bool,
+        is_static: bool,
     ) -> Result<MethodDecl, ()> {
         self.expect(&TokenKind::Function, "`function`")?;
         let name_tok = self.expect_ident("method name")?;
@@ -584,6 +587,7 @@ impl Parser {
         };
         let end = self.peek().span;
         Ok(MethodDecl {
+            is_static,
             is_abstract,
             visibility,
             name,
@@ -744,6 +748,15 @@ impl Parser {
     /// for non-lvalues (e.g. `1 = 2`).
     fn expr_to_lvalue(&mut self, e: Expr) -> Result<LValue, ()> {
         match e {
+            Expr::StaticProperty {
+                class_name,
+                name,
+                span,
+            } => Ok(LValue::StaticProperty {
+                class_name,
+                name,
+                span,
+            }),
             Expr::Var(name, span) => Ok(LValue::Var { name, span }),
             Expr::Index { base, index, span } => {
                 let base = self.expr_to_lvalue(*base)?;
@@ -1105,6 +1118,52 @@ impl Parser {
         Ok(base)
     }
 
+    fn parse_qualified_member(&mut self, class_name: String, start: Span) -> Result<Expr, ()> {
+        self.expect(&TokenKind::DoubleColon, "`::` after class name")?;
+        if matches!(self.peek().kind, TokenKind::Variable(_)) {
+            let token = self.advance();
+            let TokenKind::Variable(name) = token.kind else {
+                unreachable!()
+            };
+            return Ok(Expr::StaticProperty {
+                class_name,
+                name,
+                span: start.merge(token.span),
+            });
+        }
+        let token = self.expect_ident("method name after `::`")?;
+        let TokenKind::Ident(method) = token.kind else {
+            unreachable!()
+        };
+        self.expect(&TokenKind::LParen, "`(` after method name")?;
+        let mut args = Vec::new();
+        if !self.at(&TokenKind::RParen) {
+            loop {
+                args.push(self.parse_expr()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        let close = self.expect(&TokenKind::RParen, "`)` after arguments")?;
+        // Keep the existing AST shape for parent calls for downstream consumers.
+        if class_name == "parent" {
+            Ok(Expr::ParentMethodCall {
+                method,
+                method_span: token.span,
+                args,
+                span: start.merge(close.span),
+            })
+        } else {
+            Ok(Expr::StaticCall {
+                class_name,
+                method,
+                args,
+                span: start.merge(close.span),
+            })
+        }
+    }
+
     fn parse_primary(&mut self) -> Result<Expr, ()> {
         let tok = self.peek().clone();
         let span = tok.span;
@@ -1179,35 +1238,21 @@ impl Parser {
                 self.parse_array_literal(TokenKind::LParen, TokenKind::RParen)
             }
             TokenKind::Match => self.parse_match(),
-            TokenKind::Parent => {
-                self.advance();
-                self.expect(&TokenKind::DoubleColon, "`::` after `parent`")?;
-                let method_tok = self.expect_ident("method name after `parent::`")?;
-                let method = match method_tok.kind {
-                    TokenKind::Ident(n) => n,
-                    _ => unreachable!(),
-                };
-                let method_span = method_tok.span;
-                self.expect(&TokenKind::LParen, "`(` after `parent::method`")?;
-                let mut args = Vec::new();
-                if !self.at(&TokenKind::RParen) {
-                    loop {
-                        args.push(self.parse_expr()?);
-                        if !self.eat(&TokenKind::Comma) {
-                            break;
-                        }
-                    }
+            TokenKind::Parent | TokenKind::Static => {
+                let class_name = if self.at(&TokenKind::Parent) {
+                    "parent"
+                } else {
+                    "static"
                 }
-                let close = self.expect(&TokenKind::RParen, "`)` after arguments")?;
-                Ok(Expr::ParentMethodCall {
-                    method,
-                    method_span,
-                    args,
-                    span: span.merge(close.span),
-                })
+                .to_string();
+                self.advance();
+                self.parse_qualified_member(class_name, span)
             }
             TokenKind::Ident(name) => {
                 self.advance();
+                if self.at(&TokenKind::DoubleColon) {
+                    return self.parse_qualified_member(name, span);
+                }
                 if self.at(&TokenKind::LParen) {
                     self.advance();
                     let mut args = Vec::new();

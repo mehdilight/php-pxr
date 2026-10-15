@@ -21,8 +21,8 @@ PXR runtime.
 > Milestones 1 and 2 are complete (control flow, arrays, byte strings, and
 > standard-library builtins). M3 now supports classes, typed properties,
 > constructors, visibility, inheritance, polymorphic method dispatch, `parent::`,
-> `instanceof`, abstract classes and methods, and interfaces. Static members,
-> namespaces, and modules remain planned. See [`docs/MILESTONES.md`](docs/MILESTONES.md).
+> `instanceof`, abstract classes and methods, interfaces, and static properties
+> and methods. Namespaces and modules remain planned. See [`docs/MILESTONES.md`](docs/MILESTONES.md).
 
 ---
 
@@ -110,7 +110,8 @@ migration path possible.
   `return`, `echo`/`print`, short‑circuit `&&`/`||`.
 * **Objects** — classes, typed properties, methods, constructors, visibility,
   single inheritance, dynamic dispatch, `parent::`, `instanceof`, and abstract
-  classes and methods, interface contracts, and calls through interface types.
+  classes and methods, interface contracts, calls through interface types, and
+  static properties/methods via `Class::`, `self::`, and `parent::`.
 * **Data** — homogeneous `array<T>` values (PHP ordered‑map semantics) with
   `[...]`/`array(...)` literals, indexing, append, `count`, and `foreach`.
 * **Operators** — ternary `? :`, null coalescing `??`, spaceship `<=>`,
@@ -184,7 +185,7 @@ automatically when no C compiler is available.
 
 Tracked honestly in [`docs/ROADMAP.md`](docs/ROADMAP.md). The larger items:
 keyed `foreach`, `echo` of arrays, nested array assignment, `null`/nullable
-types, integer‑overflow → `float` promotion, static members,
+types, integer‑overflow → `float` promotion, late static binding (`static::`),
 namespaces, generics,
 ownership & borrowing, the complex string‑interpolation forms (`"$a[0]"`,
 `"{$expr}"`, `"${name}"`, `"$obj->p"`; the simple `"$name"` / `"{$name}"` work),

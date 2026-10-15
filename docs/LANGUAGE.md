@@ -372,6 +372,7 @@ are `W020x`.
 | `E0268` | Cannot use `$this` outside object context / property type mismatch |
 | `E0269` | Invalid abstract declaration, missing implementation, abstract/interface instantiation, or abstract parent call |
 | `E0270` | Invalid class/interface inheritance edge, duplicate supertype, or non-public interface method |
+| `E0271` | Static-member misuse, static/instance modifier mismatch, or unsupported static form |
 | `W0202` | `return` with a value at top level is ignored |
 
 ## Classes, Inheritance & Polymorphism
@@ -401,8 +402,8 @@ are `W020x`.
 
 * **Interfaces**: `interface Name [extends A, B] { public function f(Type $x): Ret; }`.
   Methods are implicitly abstract and must be public; visibility may be omitted.
-  Bodies, explicit `abstract` modifiers, properties, constants, and static members
-  are not supported in this slice.
+  Bodies, explicit `abstract` modifiers, properties, and constants
+  are not supported in this slice. Static method signatures are supported.
 * **Implementation**: `class Name [extends Parent] implements A, B { ... }`.
   Concrete classes must implement all interface methods, including constructors;
   inherited public methods can satisfy a contract. Abstract classes can defer
@@ -411,3 +412,22 @@ are `W020x`.
 * Interface types can be used wherever named object types are accepted. Calls
   through interface types dispatch to the concrete object's method. `instanceof`
   includes interfaces inherited through classes and other interfaces.
+
+## Static members
+
+* Properties: `public static int $count = 0;`. Types can be inferred from defaults;
+  static defaults must be scalar or array constant expressions in this slice.
+* Methods: `public static function next(): int { ... }`. Static methods have no
+  `$this`. Visibility, `static`, and `abstract` modifiers may appear in any order;
+  duplicate modifiers are rejected. Constructors cannot be static.
+* Access: `Counter::$count`, `Counter::$count++`, `Counter::next()`, `self::$count`,
+  `self::next()`, `parent::$count`, and `parent::next()`.
+* `self` resolves lexically to the class declaring the method. Inherited static
+  properties share storage until a subclass redeclares that property.
+* Static interface and abstract class method signatures require compatible
+  implementations with the same static modifier. Qualified calls to abstract
+  declarations are rejected.
+* `static::` late binding, dynamic class names, function-local statics, object-style
+  static calls, uninitialized static properties, and direct array element writes
+  through properties are not supported yet. Use a local array copy and assign the
+  whole property when updating an array-valued static property.

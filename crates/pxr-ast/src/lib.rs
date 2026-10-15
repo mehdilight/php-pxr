@@ -115,6 +115,11 @@ pub enum LValue {
         index: Option<Box<Expr>>,
         span: Span,
     },
+    StaticProperty {
+        class_name: String,
+        name: String,
+        span: Span,
+    },
     /// `$base->prop`.
     Property {
         base: Box<Expr>,
@@ -129,7 +134,7 @@ impl LValue {
         match self {
             LValue::Var { span, .. } => *span,
             LValue::Index { span, .. } => *span,
-            LValue::Property { span, .. } => *span,
+            LValue::Property { span, .. } | LValue::StaticProperty { span, .. } => *span,
         }
     }
 
@@ -138,7 +143,7 @@ impl LValue {
         match self {
             LValue::Var { name, .. } => name,
             LValue::Index { base, .. } => base.root_name(),
-            LValue::Property { name, .. } => name,
+            LValue::Property { name, .. } | LValue::StaticProperty { name, .. } => name,
         }
     }
 }
@@ -190,6 +195,7 @@ pub enum ClassMember {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PropertyDecl {
+    pub is_static: bool,
     pub visibility: Visibility,
     pub ty: Option<TypeRef>,
     pub name: String,
@@ -200,6 +206,7 @@ pub struct PropertyDecl {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MethodDecl {
+    pub is_static: bool,
     pub is_abstract: bool,
     pub visibility: Visibility,
     pub name: String,
@@ -375,6 +382,17 @@ pub enum Expr {
         class_span: Span,
         span: Span,
     },
+    StaticProperty {
+        class_name: String,
+        name: String,
+        span: Span,
+    },
+    StaticCall {
+        class_name: String,
+        method: String,
+        args: Vec<Expr>,
+        span: Span,
+    },
     ParentMethodCall {
         method: String,
         method_span: Span,
@@ -424,7 +442,9 @@ impl Expr {
             | Expr::MethodCall { span, .. }
             | Expr::New { span, .. }
             | Expr::Instanceof { span, .. }
-            | Expr::ParentMethodCall { span, .. } => *span,
+            | Expr::ParentMethodCall { span, .. }
+            | Expr::StaticProperty { span, .. }
+            | Expr::StaticCall { span, .. } => *span,
         }
     }
 }

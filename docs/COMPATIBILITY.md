@@ -83,7 +83,7 @@ behavioural divergence.
 | Functions that return `string|false` / `int|false` (`strpos`, `strstr`, `base64_decode`, `hex2bin`, `substr_compare`, …) | Not yet — needs a union / `false` value type; only the never-failing encoders above are provided |
 | `number_format` | Not yet |
 | Traits, enums, namespaces, closures | Not yet |
-| `include`/`require`, `global`, `static`, references `&` | Not yet |
+| `include`/`require`, `global`, function-local `static`, references `&` | Not yet |
 | Exceptions, generators, attributes | Not yet |
 
 ### Notes
@@ -233,8 +233,19 @@ parent classes and parent interfaces. Abstract classes may defer implementations
 concrete classes must provide compatible public methods, including constructors.
 Parameters must have identical types in this initial subset (PHP permits broader
 contravariant overrides); named return types may narrow covariantly. Numeric
-`int` to `float` widening is not valid signature covariance. Constants, static
-interface methods, and interface property declarations are not implemented.
+`int` to `float` widening is not valid signature covariance. Constants and interface property declarations are not implemented. Static
+interface methods are supported with matching static implementations.
+
+**Static properties and methods.** Static members support visibility, inheritance,
+class-qualified access, lexical `self::`, and `parent::`. Inherited static
+properties share their declaring class's storage; redeclaring one in a subclass
+creates separate storage. Static methods have no `$this`. Static properties must
+have constant scalar/array defaults in this slice; missing defaults are rejected
+instead of silently treating an uninitialized typed property as zero. Array
+properties can be read, copied, and replaced; direct element assignment remains
+unsupported as it is for other property arrays. Object-style calls to static
+methods and late static binding (`static::`) are rejected with `E0271`.
+Function-local static variables and dynamic class/member names remain unsupported.
 
 **Fail loud, never silent.** Features not yet implemented (such as
 `null`, keyed `foreach`, nested array assignment, complex interpolation forms)

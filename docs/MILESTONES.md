@@ -386,7 +386,32 @@ the word‑count block at the end of `examples/compat.php` does exactly this. �
   inheritance, constructors, covariance, unused interfaces, and rejection cases —
   66 CLI tests total. Example: `examples/interfaces.php`.
 
-**Next:** static members, namespaces, and module resolution.
+**Delivered (M3.5: static properties & methods slice).**
+
+* `static` properties and methods with public/protected/private visibility and
+  modifier order independence; static interface and abstract method contracts.
+* `Class::$property`, `Class::method(...)`, `self::`, and `parent::` access with
+  member resolution, visibility, argument counts/types, and assignment checks.
+  Instance methods retain `$this` for compatible class-qualified calls; static
+  methods have no implicit receiver and reject `$this`.
+* Arena-backed per-declaring-class storage initializes static defaults once at
+  program startup. Inherited declarations share storage; subclass redeclarations
+  have separate storage. Scalars and homogeneous arrays preserve existing value
+  semantics. Compound assignments and increment/decrement use the property path.
+* Static/instance modifier changes in overrides and interface implementations,
+  static constructors, abstract qualified calls, and instance calls without a
+  receiver are rejected at compile time. `E0271` covers static-member misuse and
+  unsupported static forms.
+* Initial limits: static properties require constant scalar/array defaults;
+  uninitialized typed static properties, `static::` late binding, dynamic class
+  names, object-style static calls, and static array element assignment remain
+  unsupported and produce diagnostics.
+* Four new CLI tests cover PHP output comparisons, inherited/redeclared storage,
+  lexical `self`, `parent::`, interfaces, abstract methods, array copying,
+  initialization, and invalid programs — 70 CLI tests total.
+  Example: `examples/static.php`.
+
+**Next:** namespaces and module resolution.
 
 ## ⛔ M4 — Gradual migration
 

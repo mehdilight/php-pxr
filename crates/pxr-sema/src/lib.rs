@@ -472,6 +472,7 @@ pub struct ClassInfo {
 
 #[derive(Clone, Debug)]
 pub struct PropertyInfo {
+    pub is_static: bool,
     pub declaring_class: String,
     pub name: String,
     pub name_span: Span,
@@ -884,7 +885,8 @@ impl Analyzer {
         for class_key in self.classes.keys().cloned().collect::<Vec<_>>() {
             let class = self.classes.get(&class_key).unwrap().clone();
             for method in class.methods.values() {
-                if (method.name != "__construct" || method.ast_method.is_abstract)
+                if !method.ast_method.is_static
+                    && (method.name != "__construct" || method.ast_method.is_abstract)
                     && self.method_has_overrides(&class.name, &method.name)
                 {
                     let disp_tf = self.synthesize_dispatcher(&class, method);
@@ -1084,6 +1086,11 @@ impl Analyzer {
             for member in &c.members {
                 match member {
                     ast::ClassMember::Property(p) => {
+                        if p.is_static && p.default.as_ref().is_none_or(|e| !static_initializer(e))
+                        {
+                            self.diags.emit(Diagnostic::error("static properties require a constant default value in this slice")
+                                .with_code("E0271").with_span(p.name_span));
+                        }
                         let ty = match &p.ty {
                             Some(t) => self.resolve_type(t),
                             None => {
@@ -1129,6 +1136,15 @@ impl Analyzer {
                                 );
                                 continue;
                             }
+                            if p.is_static != existing.is_static {
+                                self.diags.emit(
+                                    Diagnostic::error(
+                                        "cannot change whether an inherited property is static",
+                                    )
+                                    .with_code("E0271")
+                                    .with_span(p.name_span),
+                                );
+                            }
                             // Overriding inherited property
                             if existing.visibility == ast::Visibility::Public
                                 && p.visibility != ast::Visibility::Public
@@ -1164,6 +1180,7 @@ impl Analyzer {
                                 );
                             }
                             properties[existing_idx] = PropertyInfo {
+                                is_static: p.is_static,
                                 declaring_class: c.name.clone(),
                                 name: p.name.clone(),
                                 name_span: p.name_span,
@@ -1175,6 +1192,7 @@ impl Analyzer {
                             let idx = properties.len();
                             prop_indices.insert(p.name.clone(), idx);
                             properties.push(PropertyInfo {
+                                is_static: p.is_static,
                                 declaring_class: c.name.clone(),
                                 name: p.name.clone(),
                                 name_span: p.name_span,
@@ -1196,6 +1214,13 @@ impl Analyzer {
                             self.diags.emit(
                                 Diagnostic::error("abstract methods cannot be private")
                                     .with_code("E0269")
+                                    .with_span(m.name_span),
+                            );
+                        }
+                        if m.is_static && m.name.eq_ignore_ascii_case("__construct") {
+                            self.diags.emit(
+                                Diagnostic::error("constructors cannot be static")
+                                    .with_code("E0271")
                                     .with_span(m.name_span),
                             );
                         }
@@ -1271,6 +1296,15 @@ impl Analyzer {
                                     .with_span(m.name_span),
                                 );
                                 continue;
+                            }
+                            if m.is_static != existing.ast_method.is_static {
+                                self.diags.emit(
+                                    Diagnostic::error(
+                                        "cannot change whether an inherited method is static",
+                                    )
+                                    .with_code("E0271")
+                                    .with_span(m.name_span),
+                                );
                             }
                             if m.is_abstract && !existing.ast_method.is_abstract {
                                 self.diags.emit(
@@ -1387,6 +1421,15 @@ impl Analyzer {
                 .collect();
             for (key, requirement) in contracts {
                 if let Some(implementation) = methods.get(&key) {
+                    if implementation.ast_method.is_static != requirement.ast_method.is_static {
+                        self.diags.emit(
+                            Diagnostic::error(
+                                "interface method static modifier must match its implementation",
+                            )
+                            .with_code("E0271")
+                            .with_span(implementation.name_span),
+                        );
+                    }
                     if implementation.visibility != ast::Visibility::Public {
                         self.diags.emit(
                             Diagnostic::error(format!(
@@ -1572,7 +1615,9 @@ impl Analyzer {
     fn analyze_method(&mut self, class_name: &str, method: &MethodInfo) -> Option<TFunc> {
         let mut ctx = FnCtx::new(method.ret.clone(), false);
         ctx.current_class = Some(class_name.to_string());
-        ctx.declare("this", Ty::Named(class_name.to_string()));
+        if !method.ast_method.is_static {
+            ctx.declare("this", Ty::Named(class_name.to_string()));
+        }
         for (name, ty) in method.param_names.iter().zip(method.params.iter()) {
             ctx.declare(name, ty.clone());
         }
@@ -1606,7 +1651,11 @@ impl Analyzer {
             self.check_termination(&method.ast_method.body, &sig, method.name_span);
         }
 
-        let mut all_params = vec![("this".to_string(), Ty::Named(class_name.to_string()))];
+        let mut all_params = if method.ast_method.is_static {
+            Vec::new()
+        } else {
+            vec![("this".to_string(), Ty::Named(class_name.to_string()))]
+        };
         all_params.extend(
             method
                 .param_names
@@ -1627,7 +1676,41 @@ impl Analyzer {
 
     fn analyze_main(&mut self, stmts: &[ast::Stmt]) -> Option<TFunc> {
         let mut ctx = FnCtx::new(Ty::Void, true);
-        let body = self.analyze_stmts(stmts, &mut ctx);
+        let mut body = Vec::new();
+        let mut classes: Vec<_> = self.classes.values().cloned().collect();
+        classes.sort_by_key(|c| c.class_id);
+        for class in classes {
+            for (index, property) in class.properties.iter().enumerate() {
+                if !property.is_static
+                    || !property.declaring_class.eq_ignore_ascii_case(&class.name)
+                {
+                    continue;
+                }
+                if let Some(default) = &property.default {
+                    let value = self.infer(default, &mut ctx)?;
+                    if !self.is_assignable(&value.ty(), &property.ty) {
+                        self.diags.emit(
+                            Diagnostic::error("static property default has the wrong type")
+                                .with_code("E0212")
+                                .with_span(property.name_span),
+                        );
+                        continue;
+                    }
+                    body.push(TStmt::Assign {
+                        target: TTarget::Property {
+                            base: Box::new(self.static_storage(&class, property.name_span)),
+                            class_name: class.name.clone(),
+                            prop_name: property.name.clone(),
+                            prop_idx: index as u32,
+                            ty: property.ty.clone(),
+                        },
+                        ty: property.ty.clone(),
+                        value,
+                    });
+                }
+            }
+        }
+        body.extend(self.analyze_stmts(stmts, &mut ctx));
         Some(TFunc {
             name: "main".to_string(),
             display: "main".to_string(),
@@ -2130,6 +2213,24 @@ impl Analyzer {
                     value: val,
                 })
             }
+            ast::LValue::StaticProperty {
+                class_name, name, ..
+            } => {
+                let (target, ty) = self.static_property(class_name, name, span, ctx)?;
+                if annotation.is_some() || !self.is_assignable(&val_ty, &ty) {
+                    self.diags.emit(
+                        Diagnostic::error("invalid type in static property assignment")
+                            .with_code("E0212")
+                            .with_span(span),
+                    );
+                    return None;
+                }
+                Some(TStmt::Assign {
+                    target,
+                    ty,
+                    value: val,
+                })
+            }
             ast::LValue::Property {
                 base,
                 name,
@@ -2189,6 +2290,14 @@ impl Analyzer {
                 };
 
                 let prop = &class.properties[prop_idx];
+                if prop.is_static {
+                    self.diags.emit(
+                        Diagnostic::error("static properties require `Class::$property` access")
+                            .with_code("E0271")
+                            .with_span(*name_span),
+                    );
+                    return None;
+                }
                 if !self.check_member_visibility(
                     &prop.declaring_class,
                     prop.visibility,
@@ -2357,6 +2466,9 @@ impl Analyzer {
                 }
                 Some((t, ty))
             }
+            ast::LValue::StaticProperty {
+                class_name, name, ..
+            } => self.static_property(class_name, name, span, ctx),
             ast::LValue::Property {
                 base,
                 name,
@@ -2407,6 +2519,14 @@ impl Analyzer {
                 };
 
                 let prop = &class.properties[prop_idx];
+                if prop.is_static {
+                    self.diags.emit(
+                        Diagnostic::error("static properties require `Class::$property` access")
+                            .with_code("E0271")
+                            .with_span(*name_span),
+                    );
+                    return None;
+                }
                 if prop.visibility == ast::Visibility::Private
                     && ctx.current_class.as_deref().map(|s| s.to_ascii_lowercase())
                         != Some(class.name.to_ascii_lowercase())
@@ -2583,7 +2703,7 @@ impl Analyzer {
             }
             ast::Expr::Paren(inner, _) => self.infer(inner, ctx),
             ast::Expr::Var(name, span) => {
-                if name == "this" && ctx.current_class.is_none() {
+                if name == "this" && ctx.slot_of("this").is_none() {
                     self.diags.emit(
                         Diagnostic::error("using `$this` when not in object context")
                             .with_code("E0268")
@@ -2745,6 +2865,14 @@ impl Analyzer {
                 };
 
                 let prop = &class.properties[prop_idx];
+                if prop.is_static {
+                    self.diags.emit(
+                        Diagnostic::error("static properties require `Class::$property` access")
+                            .with_code("E0271")
+                            .with_span(*name_span),
+                    );
+                    return None;
+                }
                 if !self.check_member_visibility(
                     &prop.declaring_class,
                     prop.visibility,
@@ -2836,6 +2964,16 @@ impl Analyzer {
                     return None;
                 }
 
+                if method.ast_method.is_static {
+                    self.diags.emit(
+                        Diagnostic::error(
+                            "static methods require `Class::method()` access in this slice",
+                        )
+                        .with_code("E0271")
+                        .with_span(*span),
+                    );
+                    return None;
+                }
                 let target_mangled = if self.method_has_overrides(&class.name, &name) {
                     mangle_dispatcher(&class.name, &name)
                 } else {
@@ -2971,6 +3109,9 @@ impl Analyzer {
                 // Infer default expressions for properties
                 let mut prop_defaults = Vec::new();
                 for (idx, p) in class.properties.iter().enumerate() {
+                    if p.is_static {
+                        continue;
+                    }
                     if let Some(def_expr) = &p.default {
                         let mut dummy_ctx = FnCtx::new(Ty::Void, false);
                         if let Some(t_def) = self.infer(def_expr, &mut dummy_ctx) {
@@ -3035,141 +3176,246 @@ impl Analyzer {
                 })
             }
             ast::Expr::ParentMethodCall {
+                method, args, span, ..
+            } => self.qualified_call("parent", method, args, *span, ctx),
+            ast::Expr::StaticCall {
+                class_name,
                 method,
-                method_span,
                 args,
                 span,
+            } => self.qualified_call(class_name, method, args, *span, ctx),
+            ast::Expr::StaticProperty {
+                class_name,
+                name,
+                span,
             } => {
-                let current_class_name = match &ctx.current_class {
-                    Some(c) => c.clone(),
-                    None => {
-                        self.diags.emit(
-                            Diagnostic::error("cannot use `parent::` outside a class context")
-                                .with_code("E0268")
-                                .with_span(*span),
-                        );
-                        return None;
-                    }
+                let (target, _) = self.static_property(class_name, name, *span, ctx)?;
+                let TTarget::Property {
+                    base,
+                    class_name,
+                    prop_name,
+                    prop_idx,
+                    ty,
+                } = target
+                else {
+                    unreachable!()
                 };
-                let current_class = self
-                    .classes
-                    .get(&current_class_name.to_ascii_lowercase())
-                    .unwrap()
-                    .clone();
-                let parent_name = match &current_class.parent {
-                    Some(p) => p.clone(),
-                    None => {
-                        self.diags.emit(
-                            Diagnostic::error(format!(
-                                "cannot use `parent::` in class `{}` which does not extend any class",
-                                current_class.name
-                            ))
-                            .with_code("E0268")
-                            .with_span(*span),
-                        );
-                        return None;
-                    }
-                };
-                let parent_class = match self.classes.get(&parent_name) {
-                    Some(c) => c.clone(),
-                    None => {
-                        self.diags.emit(
-                            Diagnostic::error(format!("unknown parent class `{parent_name}`"))
-                                .with_code("E0205")
-                                .with_span(*span),
-                        );
-                        return None;
-                    }
-                };
-                let parent_method = match parent_class.methods.get(&method.to_ascii_lowercase()) {
-                    Some(m) => m.clone(),
-                    None => {
-                        self.diags.emit(
-                            Diagnostic::error(format!(
-                                "parent class `{}` has no method `{method}`",
-                                parent_class.name
-                            ))
-                            .with_code("E0262")
-                            .with_span(*method_span),
-                        );
-                        return None;
-                    }
-                };
-                if parent_method.ast_method.is_abstract {
-                    self.diags.emit(
-                        Diagnostic::error("cannot call abstract method using `parent::`")
-                            .with_code("E0269")
-                            .with_span(*method_span),
-                    );
-                    return None;
-                }
-                if parent_method.visibility == ast::Visibility::Private {
-                    self.diags.emit(
-                        Diagnostic::error(format!(
-                            "cannot call private method {}::{method} using `parent::`",
-                            parent_class.name
-                        ))
-                        .with_code("E0265")
-                        .with_span(*method_span),
-                    );
-                    return None;
-                }
-                if args.len() != parent_method.params.len() {
-                    self.diags.emit(
-                        Diagnostic::error(format!(
-                            "method `{}::{method}` expects {} argument{}, found {}",
-                            parent_class.name,
-                            parent_method.params.len(),
-                            if parent_method.params.len() == 1 {
-                                ""
-                            } else {
-                                "s"
-                            },
-                            args.len()
-                        ))
-                        .with_code("E0207")
-                        .with_span(*span),
-                    );
-                    return None;
-                }
-                let this_expr = TExpr::Var {
-                    name: "$this".to_string(),
-                    slot: 0,
-                    ty: Ty::Named(current_class.name.clone()),
-                };
-                let mut typed_args = vec![this_expr];
-                let mut actual_tys = vec![Ty::Named(current_class.name.clone())];
-                let mut formal_params = vec![Ty::Named(parent_class.name.clone())];
-                formal_params.extend(parent_method.params.iter().cloned());
-                for (arg, formal_ty) in args.iter().zip(parent_method.params.iter()) {
-                    let t_arg = self.infer(arg, ctx)?;
-                    let aty = t_arg.ty();
-                    if !self.is_assignable(&aty, formal_ty) {
-                        self.diags.emit(
-                            Diagnostic::error(format!(
-                                "argument type mismatch in call to `parent::{method}`: expected `{formal_ty}`, found `{aty}`"
-                            ))
-                            .with_code("E0208")
-                            .with_span(arg.span()),
-                        );
-                        return None;
-                    }
-                    actual_tys.push(aty);
-                    typed_args.push(t_arg);
-                }
-                Some(TExpr::Call {
-                    callee: Callee::User {
-                        mangled: parent_method.mangled,
-                        name: format!("parent::{method}"),
-                        params: formal_params,
-                    },
-                    ret: parent_method.ret,
-                    args: typed_args,
-                    arg_tys: actual_tys,
-                    span: *span,
+                Some(TExpr::Property {
+                    base,
+                    class_name,
+                    prop_name,
+                    prop_idx,
+                    ty,
                 })
             }
         }
+    }
+
+    fn qualified_class(&mut self, name: &str, span: Span, ctx: &FnCtx) -> Option<ClassInfo> {
+        let key = match name.to_ascii_lowercase().as_str() {
+            "static" => {
+                self.diags.emit(
+                    Diagnostic::error("late static binding (`static::`) is not implemented yet")
+                        .with_code("E0271")
+                        .with_span(span),
+                );
+                return None;
+            }
+            "self" | "parent" => {
+                let Some(current) = ctx
+                    .current_class
+                    .as_ref()
+                    .and_then(|n| self.classes.get(&n.to_ascii_lowercase()))
+                else {
+                    self.diags.emit(
+                        Diagnostic::error("`self::` and `parent::` require a class context")
+                            .with_code("E0268")
+                            .with_span(span),
+                    );
+                    return None;
+                };
+                if name.eq_ignore_ascii_case("parent") {
+                    let Some(parent) = &current.parent else {
+                        self.diags.emit(
+                            Diagnostic::error("`parent::` requires a parent class")
+                                .with_code("E0268")
+                                .with_span(span),
+                        );
+                        return None;
+                    };
+                    parent.clone()
+                } else {
+                    current.name.to_ascii_lowercase()
+                }
+            }
+            _ => name.to_ascii_lowercase(),
+        };
+        let result = self.classes.get(&key).cloned();
+        if result.is_none() {
+            self.diags.emit(
+                Diagnostic::error(format!("unknown class `{name}`"))
+                    .with_code("E0205")
+                    .with_span(span),
+            );
+        }
+        result
+    }
+
+    fn static_storage(&self, class: &ClassInfo, span: Span) -> TExpr {
+        TExpr::Call {
+            callee: Callee::User {
+                mangled: "pxr_static_storage".into(),
+                name: "pxr_static_storage".into(),
+                params: vec![Ty::Int, Ty::Int],
+            },
+            ret: Ty::Named(class.name.clone()),
+            args: vec![
+                TExpr::Int(class.class_id as i64),
+                TExpr::Int(class.properties.len() as i64),
+            ],
+            arg_tys: vec![Ty::Int, Ty::Int],
+            span,
+        }
+    }
+
+    fn static_property(
+        &mut self,
+        class_name: &str,
+        name: &str,
+        span: Span,
+        ctx: &FnCtx,
+    ) -> Option<(TTarget, Ty)> {
+        let class = self.qualified_class(class_name, span, ctx)?;
+        let Some(&index) = class.prop_indices.get(name) else {
+            self.diags.emit(
+                Diagnostic::error(format!("unknown static property `{}::${name}`", class.name))
+                    .with_code("E0261")
+                    .with_span(span),
+            );
+            return None;
+        };
+        let property = &class.properties[index];
+        if !property.is_static {
+            self.diags.emit(
+                Diagnostic::error("instance properties require an object")
+                    .with_code("E0271")
+                    .with_span(span),
+            );
+            return None;
+        }
+        if !self.check_member_visibility(&property.declaring_class, property.visibility, span, ctx)
+        {
+            return None;
+        }
+        let owner = &self.classes[&property.declaring_class.to_ascii_lowercase()];
+        let owner_index = owner.prop_indices[name];
+        Some((
+            TTarget::Property {
+                base: Box::new(self.static_storage(owner, span)),
+                class_name: owner.name.clone(),
+                prop_name: name.to_string(),
+                prop_idx: owner_index as u32,
+                ty: property.ty.clone(),
+            },
+            property.ty.clone(),
+        ))
+    }
+
+    fn qualified_call(
+        &mut self,
+        class_name: &str,
+        name: &str,
+        args: &[ast::Expr],
+        span: Span,
+        ctx: &mut FnCtx,
+    ) -> Option<TExpr> {
+        let class = self.qualified_class(class_name, span, ctx)?;
+        let Some(method) = class.methods.get(&name.to_ascii_lowercase()).cloned() else {
+            self.diags.emit(
+                Diagnostic::error(format!("unknown method `{}::{name}`", class.name))
+                    .with_code("E0262")
+                    .with_span(span),
+            );
+            return None;
+        };
+        if method.ast_method.is_abstract {
+            self.diags.emit(
+                Diagnostic::error("cannot call an abstract method using class-qualified access")
+                    .with_code("E0269")
+                    .with_span(span),
+            );
+            return None;
+        }
+        if !self.check_member_visibility(&method.declaring_class, method.visibility, span, ctx) {
+            return None;
+        }
+        if args.len() != method.params.len() {
+            self.diags.emit(
+                Diagnostic::error("incorrect argument count in class-qualified call")
+                    .with_code("E0207")
+                    .with_span(span),
+            );
+            return None;
+        }
+        let mut typed = Vec::new();
+        let mut actual = Vec::new();
+        let mut formal = Vec::new();
+        if !method.ast_method.is_static {
+            let Some(slot) = ctx.slot_of("this") else {
+                self.diags.emit(
+                    Diagnostic::error("cannot call an instance method without `$this`")
+                        .with_code("E0271")
+                        .with_span(span),
+                );
+                return None;
+            };
+            let this_ty = ctx.slot_ty(slot);
+            if !self.is_assignable(&this_ty, &Ty::Named(class.name.clone())) {
+                self.diags.emit(
+                    Diagnostic::error(
+                        "class-qualified instance call requires a compatible `$this`",
+                    )
+                    .with_code("E0271")
+                    .with_span(span),
+                );
+                return None;
+            }
+            typed.push(TExpr::Var {
+                name: "this".into(),
+                slot,
+                ty: this_ty.clone(),
+            });
+            actual.push(this_ty);
+            formal.push(Ty::Named(class.name.clone()));
+        }
+        formal.extend(method.params.clone());
+        for (arg, want) in args.iter().zip(&method.params) {
+            let value = self.infer(arg, ctx)?;
+            let ty = value.ty();
+            if !self.is_assignable(&ty, want) {
+                self.diags.emit(
+                    Diagnostic::error(format!(
+                        "expected `{want}`, found `{ty}` in class-qualified call"
+                    ))
+                    .with_code("E0208")
+                    .with_span(arg.span()),
+                );
+                return None;
+            }
+            typed.push(value);
+            actual.push(ty);
+        }
+        Some(TExpr::Call {
+            callee: Callee::User {
+                mangled: method.mangled,
+                name: format!("{}::{name}", class.name),
+                params: formal,
+            },
+            ret: method.ret,
+            args: typed,
+            arg_tys: actual,
+            span,
+        })
     }
 
     fn infer_binary(
@@ -4383,5 +4629,22 @@ mod tests {
         ");
         assert!(d2.has_errors());
         assert!(d2.items().iter().any(|x| x.code == Some("E0262")));
+    }
+}
+
+// Static defaults are restricted to scalar/array constant expressions. Reject
+// calls, variable reads, and member access rather than running them at startup.
+fn static_initializer(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::IntLit(..)
+        | ast::Expr::FloatLit(..)
+        | ast::Expr::StrLit(..)
+        | ast::Expr::BoolLit(..) => true,
+        ast::Expr::Paren(e, _) | ast::Expr::Unary { expr: e, .. } => static_initializer(e),
+        ast::Expr::Binary { lhs, rhs, .. } => static_initializer(lhs) && static_initializer(rhs),
+        ast::Expr::ArrayLit { items, .. } => items.iter().all(|item| {
+            item.key.as_ref().is_none_or(static_initializer) && static_initializer(&item.value)
+        }),
+        _ => false,
     }
 }

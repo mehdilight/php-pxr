@@ -162,6 +162,7 @@ void  *pxr_array_copy(void *a);                /* deep copy (value semantics) */
 
 /* objects — allocated in arena, properties indexed by slot, inheritance */
 void      *pxr_object_new(long long class_id, const pxr_str *class_name, long long num_props);
+void      *pxr_static_storage(long long class_id, long long num_props);
 long long  pxr_object_get_bits(void *obj, long long prop_idx);
 void       pxr_object_set_bits(void *obj, long long prop_idx, long long tag, long long bits);
 void       pxr_class_register(long long class_id, long long super_id);
@@ -202,6 +203,15 @@ The `instanceof` operator calls `pxr_instanceof(obj, target_class_id)`, checking
 identity first and then the registered supertype pairs. The same lookup handles
 class inheritance, multiple interface inheritance, and inherited implementation
 contracts. Calls through interface types use the same dispatcher mechanism.
+
+Static properties reuse the object property-slot ABI through
+`pxr_static_storage(class_id, num_props)`, which returns one arena-allocated slot
+container per declaring class. The compiler initializes declared defaults once,
+before top-level execution. Inherited accesses use the original declaring class;
+redeclared properties use the subclass container. Instance construction skips
+static defaults. Slot indices currently include static declarations, so instances
+can have reserved unused slots. Static methods lower to ordinary mangled
+functions without a receiver; qualified calls resolve directly to those symbols.
 
 Array values cross the ABI as a **type tag plus a 64‑bit payload**: `int` is the
 value itself, `bool` is zero‑extended, `float` is its IEEE‑754 bits

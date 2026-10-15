@@ -2031,6 +2031,26 @@ void *pxr_object_new(long long class_id, const pxr_str *name, long long num_prop
     return obj;
 }
 
+typedef struct pxr_static_class {
+    int64_t class_id;
+    void *storage;
+    struct pxr_static_class *next;
+} pxr_static_class;
+static pxr_static_class *pxr_static_classes[256];
+
+void *pxr_static_storage(long long class_id, long long num_props) {
+    size_t bucket = (uint64_t)class_id % 256;
+    for (pxr_static_class *entry = pxr_static_classes[bucket]; entry; entry = entry->next) {
+        if (entry->class_id == class_id) return entry->storage;
+    }
+    pxr_static_class *entry = pxr_arena_alloc(sizeof(pxr_static_class));
+    entry->class_id = class_id;
+    entry->storage = pxr_object_new(class_id, NULL, num_props);
+    entry->next = pxr_static_classes[bucket];
+    pxr_static_classes[bucket] = entry;
+    return entry->storage;
+}
+
 long long pxr_object_get_class_id(void *p) {
     if (!p) {
         return 0;
