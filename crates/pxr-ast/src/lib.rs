@@ -264,6 +264,7 @@ impl LValue {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FnDecl {
+    pub type_params: Vec<(String, Span)>,
     pub name: String,
     pub name_span: Span,
     pub params: Vec<Param>,
@@ -334,6 +335,8 @@ pub struct MethodDecl {
 /// A syntactic type reference, before resolution.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeRef {
+    /// A lexically scoped generic function parameter.
+    Param(String, Span),
     Mixed,
     Int,
     Float,
@@ -350,7 +353,7 @@ pub enum TypeRef {
 impl TypeRef {
     pub fn span(&self) -> Span {
         match self {
-            TypeRef::Span(s) => *s,
+            TypeRef::Span(s) | TypeRef::Param(_, s) => *s,
             _ => Span::synthetic(),
         }
     }
@@ -471,6 +474,7 @@ pub enum Expr {
         fallback: Option<String>,
         callee: String,
         callee_span: Span,
+        type_args: Vec<TypeRef>,
         args: Vec<Expr>,
         span: Span,
     },

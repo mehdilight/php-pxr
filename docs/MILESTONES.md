@@ -559,14 +559,31 @@ using `mixed`.
 **Acceptance achieved.** All M4 deliverables above run end to end. M4 covers an
 explicit migration boundary, not every PHP feature. Compiled union/nullable
 annotations, property/element guard caching, and more precise loop analysis
-remain outside this milestone. **Next:** M5 — generics and inference; async
+remain outside this milestone. **In progress:** M5 — generics and inference; async
 implementation remains sequenced after M5/M6 in M7.
 
-## ⛔ M5 — Generics & inference
+## 🚧 M5 — Generics & inference
 
-* Generic functions and types (`function max<T>(T $a, T $b): T`).
-* Monomorphization in the backend; constraints/traits.
-* Whole‑function return‑type inference.
+**Delivered (M5.1: generic functions).**
+
+* `function identity<T>(T $value): T` with explicit `identity<int>(42)` and
+  inferred `identity(42)` calls. Several parameters, nested array patterns,
+  concrete/mixed/object arguments, namespace imports, and declaration modules.
+* Concrete specialization before IR generation, with one native function per
+  function/type tuple. Direct/mutual recursion reuse cached signatures; growing
+  polymorphic recursion fails with a bounded specialization diagnostic.
+* Per-instantiation body checking, contextual mixed arguments, and existing
+  array-copy/object-identity semantics. Unsafe numeric array widening and deep
+  element reboxing are rejected. Return annotations remain required.
+* Eight CLI tests cover execution, native signatures/reuse, modules, recursion,
+  evaluation order, rejected programs, and diagnostics. The full suite has
+  107 CLI tests plus 43 unit tests (150 total).
+
+See [`GENERICS.md`](GENERICS.md) and `examples/generics.php`. Generic syntax is a
+PXR extension in `.php` files and does not parse in PHP.
+
+**Remaining.** Generic classes/types and methods; constraints/traits;
+whole-function return-type inference. M5 is not complete.
 
 ## ⛔ M6 — Ownership & memory safety
 

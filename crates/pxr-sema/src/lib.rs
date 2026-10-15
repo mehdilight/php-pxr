@@ -17,7 +17,9 @@
 use pxr_ast::{self as ast, BinOp as ABinOp, UnOp as AUnOp};
 use pxr_diag::{Diagnostic, Diagnostics, Span};
 use pxr_types::Ty;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
+mod generics;
 
 /// Aliases re-exported so downstream stages can refer to the operator enums
 /// through the semantic layer.
@@ -763,6 +765,9 @@ pub struct Analyzer {
     diags: Diagnostics,
     /// lowercased name -> signature
     funcs: HashMap<String, Signature>,
+    generics: HashMap<String, ast::FnDecl>,
+    specializations: HashMap<(String, Vec<Ty>), Signature>,
+    pending_specializations: VecDeque<(ast::FnDecl, Signature, HashMap<String, Ty>)>,
     /// lowercased name -> class info
     classes: HashMap<String, ClassInfo>,
 }
@@ -780,6 +785,7 @@ struct Signature {
 /// Result of analysing one function body.
 struct FnCtx {
     flow: FlowState,
+    type_bindings: HashMap<String, Ty>,
     slots: Vec<Ty>,
     vars: HashMap<String, u32>,
     ret: Ty,
@@ -796,6 +802,7 @@ impl FnCtx {
     fn new(ret: Ty, is_main: bool) -> Self {
         FnCtx {
             flow: FlowState::default(),
+            type_bindings: HashMap::new(),
             slots: Vec::new(),
             vars: HashMap::new(),
             ret,
@@ -847,6 +854,9 @@ pub fn analyze(program: &ast::Program) -> (Option<TProgram>, Diagnostics) {
         php_interop: program.items.iter().any(uses_php),
         diags: Diagnostics::new(),
         funcs: HashMap::new(),
+        generics: HashMap::new(),
+        specializations: HashMap::new(),
+        pending_specializations: VecDeque::new(),
         classes: HashMap::new(),
     };
     let result = a.run(program);
@@ -885,9 +895,20 @@ impl Analyzer {
                 matches!(**e, Ty::Null)
                     || e == t
                     || **t == Ty::Mixed
-                    || (!contains_mixed(e) && !contains_mixed(t) && self.is_assignable(e, t))
+                    || self.array_layout_assignable(e, t)
             }
             (Ty::Named(child), Ty::Named(parent)) => self.is_subclass_of(child, parent),
+            _ => false,
+        }
+    }
+
+    fn array_layout_assignable(&self, from: &Ty, to: &Ty) -> bool {
+        if from == to || *from == Ty::Null {
+            return true;
+        }
+        match (from, to) {
+            (Ty::Named(child), Ty::Named(parent)) => self.is_subclass_of(child, parent),
+            (Ty::Array(from), Ty::Array(to)) => self.array_layout_assignable(from, to),
             _ => false,
         }
     }
@@ -1195,6 +1216,9 @@ impl Analyzer {
         // Analyze user functions
         for item in &program.items {
             if let ast::Stmt::FnDecl(f) = item {
+                if !f.type_params.is_empty() {
+                    continue;
+                }
                 if let Some(tf) = self.analyze_function(f) {
                     funcs.push(tf);
                 }
@@ -1209,6 +1233,22 @@ impl Analyzer {
             .cloned()
             .collect();
         let main = self.analyze_main(&main_stmts);
+        while let Some((declaration, signature, bindings)) =
+            self.pending_specializations.pop_front()
+        {
+            let previous = std::mem::take(&mut self.diags);
+            let function = self.analyze_function_with_signature(&declaration, &signature, bindings);
+            let specialized_diags = std::mem::take(&mut self.diags);
+            self.diags = previous;
+            for diagnostic in specialized_diags.items() {
+                self.diags.emit(
+                    diagnostic
+                        .clone()
+                        .with_note(format!("while specializing `{}`", signature.display)),
+                );
+            }
+            funcs.push(function);
+        }
 
         if self.diags.has_errors() {
             return None;
@@ -1810,24 +1850,43 @@ impl Analyzer {
         for item in &program.items {
             let ast::Stmt::FnDecl(f) = item else { continue };
             let key = f.name.to_ascii_lowercase();
-            if let Some(prev) = self.funcs.get(&key) {
+            if self.generics.contains_key(&key) || self.funcs.contains_key(&key) {
+                let previous_span = self
+                    .generics
+                    .get(&key)
+                    .map(|f| f.span)
+                    .or_else(|| self.funcs.get(&key).map(|sig| sig.span))
+                    .unwrap();
                 self.diags.emit(
                     Diagnostic::error(format!("function `{}` is already defined", f.name))
                         .with_code("E0201")
                         .with_span(f.name_span)
                         .with_note(format!(
                             "previous definition is at byte offset {}",
-                            prev.span.start
+                            previous_span.start
                         )),
                 );
                 continue;
             }
 
+            let bindings: HashMap<_, _> = f
+                .type_params
+                .iter()
+                .map(|(name, _)| (name.clone(), Ty::Mixed))
+                .collect();
             let mut params = Vec::new();
             let mut param_names = Vec::new();
             for p in &f.params {
+                if param_names.contains(&p.name) {
+                    self.diags.emit(
+                        Diagnostic::error(format!("duplicate parameter `${}`", p.name))
+                            .with_code("E0201")
+                            .with_span(p.name_span),
+                    );
+                }
+
                 let ty = match &p.ty {
-                    Some(t) => self.resolve_type(t),
+                    Some(t) => self.resolve_type_with(t, &bindings),
                     None => {
                         self.diags.emit(
                             Diagnostic::error(format!(
@@ -1853,7 +1912,7 @@ impl Analyzer {
             }
 
             let ret = match &f.ret {
-                Some(t) => self.resolve_type(t),
+                Some(t) => self.resolve_type_with(t, &bindings),
                 None => {
                     self.diags.emit(
                         Diagnostic::error(format!(
@@ -1868,6 +1927,10 @@ impl Analyzer {
                 }
             };
 
+            if !f.type_params.is_empty() {
+                self.generics.insert(key, (**f).clone());
+                continue;
+            }
             self.funcs.insert(
                 key,
                 Signature {
@@ -1883,7 +1946,19 @@ impl Analyzer {
     }
 
     fn resolve_type(&mut self, t: &ast::TypeRef) -> Ty {
+        self.resolve_type_with(t, &HashMap::new())
+    }
+
+    fn resolve_type_with(&mut self, t: &ast::TypeRef, bindings: &HashMap<String, Ty>) -> Ty {
         match t {
+            ast::TypeRef::Param(name, span) => bindings.get(name).cloned().unwrap_or_else(|| {
+                self.diags.emit(
+                    Diagnostic::error(format!("unbound generic type parameter `{name}`"))
+                        .with_code("E0280")
+                        .with_span(*span),
+                );
+                Ty::Mixed
+            }),
             ast::TypeRef::Mixed => Ty::Mixed,
             ast::TypeRef::Int => Ty::Int,
             ast::TypeRef::Float => Ty::Float,
@@ -1891,7 +1966,7 @@ impl Analyzer {
             ast::TypeRef::Bool => Ty::Bool,
             ast::TypeRef::Void => Ty::Void,
             ast::TypeRef::Array(inner) => {
-                let elem = self.resolve_type(inner);
+                let elem = self.resolve_type_with(inner, bindings);
                 if elem == Ty::Void {
                     self.diags.emit(
                         Diagnostic::error("an array cannot have element type `void`")
@@ -1920,7 +1995,17 @@ impl Analyzer {
 
     fn analyze_function(&mut self, f: &ast::FnDecl) -> Option<TFunc> {
         let sig = self.funcs.get(&f.name.to_ascii_lowercase()).cloned()?;
+        Some(self.analyze_function_with_signature(f, &sig, HashMap::new()))
+    }
+
+    fn analyze_function_with_signature(
+        &mut self,
+        f: &ast::FnDecl,
+        sig: &Signature,
+        bindings: HashMap<String, Ty>,
+    ) -> TFunc {
         let mut ctx = FnCtx::new(sig.ret.clone(), false);
+        ctx.type_bindings = bindings;
         for (name, ty) in sig.param_names.iter().zip(sig.params.iter()) {
             ctx.declare(name, ty.clone());
         }
@@ -1929,14 +2014,19 @@ impl Analyzer {
             self.check_termination(&f.body, &sig, f.name_span);
         }
 
-        Some(TFunc {
-            name: sig.mangled,
-            display: sig.display,
-            params: sig.param_names.iter().cloned().zip(sig.params).collect(),
-            ret: sig.ret,
+        TFunc {
+            name: sig.mangled.clone(),
+            display: sig.display.clone(),
+            params: sig
+                .param_names
+                .iter()
+                .cloned()
+                .zip(sig.params.iter().cloned())
+                .collect(),
+            ret: sig.ret.clone(),
             slots: ctx.slots,
             body,
-        })
+        }
     }
 
     fn analyze_method(&mut self, class_name: &str, method: &MethodInfo) -> Option<TFunc> {
@@ -2513,7 +2603,7 @@ impl Analyzer {
         ctx: &mut FnCtx,
     ) -> Option<TStmt> {
         let expected = if let Some(annotation) = annotation {
-            Some(self.resolve_type(annotation))
+            Some(self.resolve_type_with(annotation, &ctx.type_bindings))
         } else if let ast::LValue::Var { name, .. } = target {
             ctx.slot_of(name).map(|slot| ctx.slot_ty(slot))
         } else {
@@ -2541,7 +2631,7 @@ impl Analyzer {
                     );
                     return None;
                 }
-                let annotated = annotation.map(|t| self.resolve_type(t));
+                let annotated = annotation.map(|t| self.resolve_type_with(t, &ctx.type_bindings));
                 let (slot, decl_ty) = match ctx.slot_of(name) {
                     Some(slot) => {
                         let existing = ctx.slot_ty(slot);
@@ -3223,22 +3313,24 @@ impl Analyzer {
             ast::Expr::Call {
                 callee,
                 callee_span,
+                type_args,
                 args,
                 span,
                 fallback,
             } => {
-                let name = if self.funcs.contains_key(&callee.to_ascii_lowercase()) {
+                let name = if self.is_compiled_function(&callee.to_ascii_lowercase()) {
                     callee.as_str()
                 } else {
                     fallback.as_deref().unwrap_or(callee)
                 };
                 if self.php_interop
-                    && !self.funcs.contains_key(&callee.to_ascii_lowercase())
+                    && !self.is_compiled_function(&callee.to_ascii_lowercase())
                     && fallback
                         .as_ref()
-                        .is_some_and(|f| !self.funcs.contains_key(&f.to_ascii_lowercase()))
+                        .is_some_and(|f| !self.is_compiled_function(&f.to_ascii_lowercase()))
                 {
-                    let mut expression = self.infer_call(callee, *callee_span, args, *span, ctx)?;
+                    let mut expression =
+                        self.infer_call(callee, *callee_span, type_args, args, *span, ctx)?;
                     if let TExpr::Call {
                         callee:
                             Callee::Php {
@@ -3251,7 +3343,7 @@ impl Analyzer {
                     }
                     return Some(expression);
                 }
-                self.infer_call(name, *callee_span, args, *span, ctx)
+                self.infer_call(name, *callee_span, type_args, args, *span, ctx)
             }
             ast::Expr::Ternary {
                 cond,
@@ -4366,11 +4458,26 @@ impl Analyzer {
         &mut self,
         callee: &str,
         callee_span: Span,
+        type_args: &[ast::TypeRef],
         args: &[ast::Expr],
         span: Span,
         ctx: &mut FnCtx,
     ) -> Option<TExpr> {
         let key = callee.to_ascii_lowercase();
+
+        if let Some(declaration) = self.generics.get(&key).cloned() {
+            return self.infer_generic_call(&declaration, type_args, args, span, ctx);
+        }
+        if !type_args.is_empty() {
+            self.diags.emit(
+                Diagnostic::error(format!(
+                    "`{callee}` does not declare generic type parameters"
+                ))
+                .with_code("E0280")
+                .with_span(callee_span),
+            );
+            return None;
+        }
 
         // User-defined function?
         if let Some(sig) = self.funcs.get(&key).cloned() {
@@ -5228,14 +5335,6 @@ fn static_initializer(expr: &ast::Expr) -> bool {
         ast::Expr::ArrayLit { items, .. } => items.iter().all(|item| {
             item.key.as_ref().is_none_or(static_initializer) && static_initializer(&item.value)
         }),
-        _ => false,
-    }
-}
-
-fn contains_mixed(ty: &Ty) -> bool {
-    match ty {
-        Ty::Mixed => true,
-        Ty::Array(element) => contains_mixed(element),
         _ => false,
     }
 }

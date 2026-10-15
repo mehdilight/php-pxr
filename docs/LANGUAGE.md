@@ -34,6 +34,8 @@ runtime value tag and require explicit conversion for typed-only operations.
 Concrete scalar coercion widens **`int` → `float`**. Scalars, arrays, and objects can also be boxed
 implicitly when the destination is `mixed`; mixed values are not implicitly
 converted back to concrete types. Other mismatches are compile errors.
+Scalar widening does not widen array elements: `array<int>` cannot be used as
+`array<float>`. Nested element reboxing is not implicit either.
 
 ## A quick tour of the supported subset (verbatim from the grammar)
 
@@ -45,7 +47,9 @@ member    := prop_decl | method_decl
 prop_decl := visibility type VARIABLE ('=' expr)? ';'
 method_decl := visibility 'function' NAME '(' params? ')' (':' type)? block
 visibility:= 'public' | 'protected' | 'private'
-fn        := 'function' NAME '(' params? ')' (':' type)? block
+fn        := 'function' NAME type_params? '(' params? ')' (':' type)? block
+type_params := '<' NAME (',' NAME)* '>'
+type_args := '<' type (',' type)* '>'
 params    := param (',' param)*
 param     := type VARIABLE
 type      := 'int' | 'float' | 'string' | 'bool' | 'void' | 'mixed' | 'array' '<' type '>' | NAME
@@ -102,7 +106,7 @@ primary   := INT | FLOAT | STRING | INTERP_STRING | 'true' | 'false' | 'null'
            | 'new' NAME ('(' (expr (',' expr)*)? ')')?
            | '[' (array_item (',' array_item)*)? ','? ']'
            | 'array' '(' ... ')'
-           | VARIABLE '(' (expr (',' expr)*)? ')' | NAME '(' (expr (',' expr)*)? ')'
+           | VARIABLE '(' (expr (',' expr)*)? ')' | NAME type_args? '(' (expr (',' expr)*)? ')'
            | 'match' '(' expr ')' '{' match_arm* '}'
            | '(' expr ')'
 array_item := (expr '=>')? expr
@@ -134,6 +138,14 @@ deliberately does **not** allow assignment expressions (so `$a = $b = 1` and
   later in the file, and recursion is supported.
 * A non‑`void` function must `return` on every path; the analyzer rejects
   fall‑through.
+* Generic functions declare parameters as `function identity<T>(T $value): T`.
+  Calls supply all type arguments (`identity<int>(42)`) or infer them from values
+  (`identity(42)`). Type parameters are case-sensitive, lexically scoped, and
+  usable in local and nested array annotations. Each concrete instantiation is
+  checked and specialized before IR generation; unused bodies are not checked.
+  Inference requires exact agreement for repeated parameters and does not use
+  the expected return type. Generic classes/methods, constraints, and return-type
+  inference remain unsupported. See [`GENERICS.md`](GENERICS.md).
 
 The remaining top‑level statements (everything that is not a function
 declaration) become the program entry point.
@@ -324,7 +336,7 @@ are `W020x`.
 | `W0001` | Leading‑zero octal treated as decimal |
 | `E0008` | Unsupported double‑quoted interpolation form (`$a[...]`, `{$expr}`, `$obj->p`, `${...}`) |
 | `E0100` | Syntax error (with the unexpected token described) |
-| `E0201` | Duplicate function definition |
+| `E0201` | Duplicate function definition or parameter |
 | `E0202` | Parameter needs an explicit type |
 | `E0203` | Parameter cannot be `void` |
 | `E0204` | Function needs an explicit return type |
@@ -382,6 +394,9 @@ are `W020x`.
 | `E0273` | Invalid/unresolved compile-time module dependency or missing file context |
 | `E0274` | Invalid mixed property default |
 | `E0275` | Invalid `__toString` signature |
+| `E0280` | Invalid generic type arguments or unbound type parameter |
+| `E0281` | Missing or conflicting generic inference |
+| `E0283` | Generic specialization limit exceeded |
 | `W0202` | `return` with a value at top level is ignored |
 
 ## Classes, Inheritance & Polymorphism

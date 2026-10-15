@@ -16,7 +16,8 @@ Two commitments make this practical rather than a rewrite‑everything exercise:
 
 1. **The `.php` extension stays.** Migrating a project does not mean renaming
    files or moving to a new ecosystem. Compilation is a *tool* choice
-   (`pxr build main.php`), so the same file can be run by PHP or compiled by PXR.
+   (`pxr build main.php`). Files using the shared subset run in either tool;
+   PXR extensions such as generic syntax require PXR.
 2. **The migration is gradual.** Modern PHP is already mostly typed
    (`function f(int $x): string`). PXR accepts that syntax directly and adds
    strictness; M4 supplies mixed values, guard narrowing, explicit legacy PHP
@@ -49,7 +50,7 @@ today     typed scalars, arrays, control flow, LLVM backend, tests, benchmarks
   ├─ M2  owned strings + a real standard library          ✅ done
   ├─ M3  classes, namespaces, compile-time modules        ✅ done
   ├─ M4  mixed values, narrowing, PHP interop, report          ✅ done
-  ├─ M5  generics + inference                             (zero-cost abstraction)
+  ├─ M5  generics + inference                             🚧 functions delivered
   ├─ M6  ownership & borrowing, no leaks                  (memory safety)
   ├─ M7  async/await + structured tasks, then threads     (I/O + parallelism)
   ├─ M8  C interoperability (extern "C", FFI)             (systems access)

@@ -187,6 +187,290 @@ fn emit_ir_contains_functions() {
 }
 
 #[test]
+fn generic_functions_run_with_concrete_types_and_recursion() {
+    if !have_cc() {
+        return;
+    }
+    let source = include_str!("../../../examples/generics.php");
+    let f = temp_php("generic_functions", source);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "42:hello\n7:empty\nforwarded:9\n1:99\n8:4\nok\n");
+}
+
+#[test]
+fn generic_specializations_reuse_concrete_native_signatures() {
+    let f = temp_php(
+        "generic_ir",
+        r#"<?php
+        function identity<T>(T $value): T { return $value; }
+        function unused<U>(U $value): U { return $value; }
+        echo identity(1), identity<int>(2), identity('s');
+    "#,
+    );
+    let r = run_ok(&["emit-ir", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let definitions: Vec<_> = r
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("func pxr$g$"))
+        .collect();
+    assert_eq!(definitions.len(), 2, "{}", r.stdout);
+    assert!(definitions
+        .iter()
+        .any(|line| line.contains("(%v0: int) -> int")));
+    assert!(definitions
+        .iter()
+        .any(|line| line.contains("(%v0: string) -> string")));
+    assert!(!r.stdout.contains("mixed"), "{}", r.stdout);
+}
+
+#[test]
+fn generic_arrays_objects_and_explicit_widening() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "generic_values",
+        r#"<?php
+        class ParentItem { public int $value = 1; }
+        class ChildItem extends ParentItem {}
+        function identity<T>(T $value): T { return $value; }
+        function replace<T>(array<T> $values, T $value): array<T> {
+            $values[0] = $value;
+            return $values;
+        }
+        function choose<T>(T $a, T $b): T { return $b; }
+        function first<T>(array<T> $values): T { return $values[0]; }
+        $original = [[1]];
+        $changed = replace($original, [2]);
+        echo $original[0][0], ':', $changed[0][0], "\n";
+        $object = new ChildItem();
+        $alias = identity<ParentItem>($object);
+        $alias->value = 7;
+        $items = identity<array<ParentItem>>([$object]);
+        echo first($items)->value, ':', $object->value, "\n";
+        echo choose<float>(1, 2.5), ':', identity(true), "\n";
+        $mixed = replace<mixed>([1, 'two'], null);
+        echo is_null($mixed[0]), ':', $mixed[1], "\n";
+        $empty = identity([]);
+        echo count($empty), "\n";
+    "#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "1:2\n7:7\n2.5:1\n1:two\n0\n");
+}
+
+#[test]
+fn generic_namespaces_imports_and_mutual_recursion() {
+    if !have_cc() {
+        return;
+    }
+    let module = temp_php(
+        "generic_module",
+        r#"<?php
+        namespace Templates;
+        function left<T>(T $value, int $n): T {
+            if ($n == 0) { return $value; }
+            return right<T>($value, $n - 1);
+        }
+        function right<U>(U $value, int $n): U {
+            if ($n == 0) { return $value; }
+            return left($value, $n - 1);
+        }
+    "#,
+    );
+    let source = format!(
+        r#"<?php
+        namespace Client;
+        require '{}';
+        use function Templates\left as run;
+        echo run<string>('ok', 5), ':', \Templates\right(42, 4), "\n";
+    "#,
+        module.display()
+    );
+    let f = temp_php("generic_modules", &source);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "ok:42\n");
+}
+
+#[test]
+fn generic_multiple_parameters_preserve_evaluation_order() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "generic_multiple",
+        r#"<?php
+        class State { public int $calls = 0; }
+        function next(State $state): int { $state->calls += 1; return $state->calls; }
+        function second<A,B>(A $a, B $b): B { echo $a, ':'; return $b; }
+        function show<T>(T $value): void { echo $value, "\n"; }
+        $state = new State();
+        show(second(next($state), next($state)));
+        show(second<int,string>(next($state), 'ok'));
+        echo $state->calls, "\n";
+    "#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "1:2\n3:ok\n3\n");
+}
+
+#[test]
+fn generic_invalid_programs_fail_with_diagnostics() {
+    let cases = [
+        (
+            "arity",
+            "function f<T>(T $x): T {return $x;} f<int,string>(1);",
+            "E0280",
+        ),
+        (
+            "values_arity",
+            "function f<T>(T $x): T {return $x;} f();",
+            "E0230",
+        ),
+        (
+            "void",
+            "function f<T>(T $x): T {return $x;} f<void>(1);",
+            "E0280",
+        ),
+        (
+            "void_array",
+            "function f<T>(T $x): T {return $x;} f<array<void>>([]);",
+            "E0205",
+        ),
+        (
+            "unknown",
+            "function f<T>(T $x): T {return $x;} f<Missing>(1);",
+            "E0205",
+        ),
+        (
+            "conflict",
+            "function f<T>(T $x,T $y): T {return $x;} f(1,2.0);",
+            "E0281",
+        ),
+        (
+            "empty",
+            "function f<T>(array<T> $x): T {return $x[0];} f([]);",
+            "E0281",
+        ),
+        (
+            "return_only",
+            "function f<T>(): T {return 1;} f();",
+            "E0281",
+        ),
+        (
+            "wrong_value",
+            "function f<T>(T $x): T {return $x;} f<int>('s');",
+            "E0231",
+        ),
+        (
+            "array_widen",
+            "function f<T>(array<T> $x): T {return $x[0];} f<float>([1]);",
+            "E0231",
+        ),
+        (
+            "ordinary_array_widen",
+            "function f(array<float> $x): float {return $x[0];} f([1]);",
+            "E0231",
+        ),
+        (
+            "deep_rebox",
+            "function f<T>(T $x): T {return $x;} f<array<array<mixed>>>([[1]]);",
+            "E0231",
+        ),
+        (
+            "nongeneric",
+            "function f(int $x): int {return $x;} f<int>(1);",
+            "E0280",
+        ),
+        ("builtin", "strlen<int>('s');", "E0280"),
+        (
+            "duplicate_type",
+            "function f<T,T>(T $x): T {return $x;}",
+            "E0100",
+        ),
+        (
+            "duplicate_value",
+            "function f<T>(T $x,T $x): T {return $x;}",
+            "E0201",
+        ),
+        (
+            "duplicate_function",
+            "function f<T>(T $x): T {return $x;} function F(int $x): int {return $x;}",
+            "E0201",
+        ),
+        (
+            "return_required",
+            "function f<T>(T $x) {return $x;}",
+            "E0204",
+        ),
+        (
+            "out_of_scope",
+            "function f<T>(T $x): T {return $x;} function g(T $x): int {return 1;}",
+            "E0205",
+        ),
+        ("classes_pending", "class Box<T> {}", "E0100"),
+        (
+            "methods_pending",
+            "class Box {public function get<T>(T $x): T {return $x;}}",
+            "E0100",
+        ),
+        (
+            "constraints_pending",
+            "function f<T: Countable>(T $x): T {return $x;}",
+            "E0100",
+        ),
+    ];
+    for (name, source, code) in cases {
+        let f = temp_php(&format!("generic_error_{name}"), &format!("<?php {source}"));
+        let r = run_ok(&["check", f.to_str().unwrap()]);
+        assert_eq!(r.code, 1, "{name}: {}", r.stderr);
+        assert!(
+            r.stderr.contains(code),
+            "{name}: expected {code}: {}",
+            r.stderr
+        );
+    }
+}
+
+#[test]
+fn generic_body_errors_identify_the_specialization() {
+    let f = temp_php(
+        "generic_body_error",
+        r#"<?php
+        function invert<T>(T $value): T { return ~$value; }
+        echo invert('s');
+    "#,
+    );
+    let r = run_ok(&["check", f.to_str().unwrap()]);
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("E0221"), "{}", r.stderr);
+    assert!(
+        r.stderr.contains("while specializing `invert<string>`"),
+        "{}",
+        r.stderr
+    );
+}
+
+#[test]
+fn generic_polymorphic_recursion_is_bounded() {
+    let f = temp_php(
+        "generic_limit",
+        r#"<?php
+        function grow<T>(T $value): void { grow([$value]); }
+        grow(1);
+    "#,
+    );
+    let r = run_ok(&["check", f.to_str().unwrap()]);
+    assert_eq!(r.code, 1, "{}", r.stderr);
+    assert!(r.stderr.contains("E0283"), "{}", r.stderr);
+}
+
+#[test]
 fn emit_llvm_is_llvm_assembly() {
     let f = temp_php("ll", "<?php echo 1;");
     let r = run_ok(&["emit-llvm", f.to_str().unwrap()]);

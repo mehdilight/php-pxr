@@ -25,6 +25,7 @@ pub struct Parser {
     global_imports: bool,
     declared_types: Vec<String>,
     declared_functions: Vec<String>,
+    type_params: Vec<String>,
 }
 
 pub fn parse(src: &str) -> (Option<Program>, Diagnostics) {
@@ -60,6 +61,7 @@ pub fn parse_at(src: &str, offset: usize) -> (Option<Program>, Diagnostics) {
         global_imports: false,
         declared_types: Vec::new(),
         declared_functions: Vec::new(),
+        type_params: Vec::new(),
     };
     let program = p.parse_program();
     let mut diags = shifted;
@@ -563,6 +565,13 @@ impl Parser {
     }
 
     fn parse_fn(&mut self) -> Result<FnDecl, ()> {
+        let previous = std::mem::take(&mut self.type_params);
+        let result = self.parse_fn_inner();
+        self.type_params = previous;
+        result
+    }
+
+    fn parse_fn_inner(&mut self) -> Result<FnDecl, ()> {
         let start = self.advance().span; // `function`
         let name_tok = self.expect_ident("function name")?;
         let name = match name_tok.kind {
@@ -578,6 +587,24 @@ impl Parser {
         }
         self.declared_functions.push(name.to_ascii_lowercase());
         let name = self.declared_name(&name);
+        let mut type_params = Vec::new();
+        if self.eat(&TokenKind::Lt) {
+            loop {
+                let parameter = self.expect_ident("generic type parameter")?;
+                let TokenKind::Ident(name) = parameter.kind else {
+                    unreachable!()
+                };
+                if self.type_params.contains(&name) {
+                    self.error(parameter.span, format!("duplicate type parameter `{name}`"));
+                }
+                self.type_params.push(name.clone());
+                type_params.push((name, parameter.span));
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect_type_close()?;
+        }
 
         self.expect(&TokenKind::LParen, "`(` after function name")?;
         let mut params = Vec::new();
@@ -616,6 +643,7 @@ impl Parser {
         let body = self.parse_block()?;
         let end = self.peek().span;
         Ok(FnDecl {
+            type_params,
             name,
             name_span,
             params,
@@ -871,12 +899,37 @@ impl Parser {
         )
     }
 
+    /// Split adjacent closers in type contexts without changing expression shifts.
+    fn expect_type_close(&mut self) -> Result<Token, ()> {
+        let token = self.peek().clone();
+        let remainder = match token.kind {
+            TokenKind::Shr => Some(TokenKind::Gt),
+            TokenKind::GtEq => Some(TokenKind::Assign),
+            TokenKind::ShrEq => Some(TokenKind::GtEq),
+            _ => None,
+        };
+        if let Some(kind) = remainder {
+            self.toks[self.pos] = Token {
+                kind,
+                span: Span::new(token.span.start + 1, token.span.end),
+            };
+            return Ok(Token {
+                kind: TokenKind::Gt,
+                span: Span::new(token.span.start, token.span.start + 1),
+            });
+        }
+        self.expect(&TokenKind::Gt, "`>` closing type arguments")
+    }
+
     fn parse_type(&mut self) -> Result<TypeRef, ()> {
         if matches!(
             self.peek().kind,
             TokenKind::Ident(_) | TokenKind::Backslash | TokenKind::Namespace
         ) {
-            let (name, _) = self.parse_name()?;
+            let (name, span) = self.parse_name()?;
+            if self.type_params.contains(&name) {
+                return Ok(TypeRef::Param(name, span));
+            }
             return Ok(TypeRef::Named(self.resolve_name(&name, false).0));
         }
 
@@ -884,7 +937,7 @@ impl Parser {
             let start = self.advance().span;
             self.expect(&TokenKind::Lt, "`<` after `array` (write `array<T>`)")?;
             let inner = self.parse_type()?;
-            let close = self.expect(&TokenKind::Gt, "`>` closing the array element type")?;
+            let close = self.expect_type_close()?;
             let _ = start.merge(close.span);
             return Ok(TypeRef::Array(Box::new(inner)));
         }
@@ -1515,6 +1568,16 @@ impl Parser {
                     let name = self.resolve_name(&name, false).0;
                     return self.parse_qualified_member(name, span);
                 }
+                let mut type_args = Vec::new();
+                if self.eat(&TokenKind::Lt) {
+                    loop {
+                        type_args.push(self.parse_type()?);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect_type_close()?;
+                }
                 if self.at(&TokenKind::LParen) {
                     self.advance();
                     let mut args = Vec::new();
@@ -1532,6 +1595,7 @@ impl Parser {
                         fallback,
                         callee,
                         callee_span: span,
+                        type_args,
                         args,
                         span: span.merge(close.span),
                     })
