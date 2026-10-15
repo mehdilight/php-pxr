@@ -23,7 +23,8 @@ worker when they execute.
 > `examples/migration/main.php` runs a typed native entry point with untyped PHP.
 > M5 adds native specialization for generic functions, classes, interfaces, and
 > independent methods; nominal bounds, trait composition, and return inference.
-> Next is M6: ownership and memory safety. Async remains sequenced for M7.
+> M6 is in progress: tracked heap allocation and exit cleanup are implemented;
+> compile-time ownership and borrowing remain next. Async stays sequenced for M7.
 > See [`docs/GENERICS.md`](docs/GENERICS.md), [`docs/MILESTONES.md`](docs/MILESTONES.md),
 > [`docs/MIXED.md`](docs/MIXED.md), and [`docs/INTEROP.md`](docs/INTEROP.md).
 

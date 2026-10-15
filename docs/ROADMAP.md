@@ -51,7 +51,7 @@ today     typed scalars, arrays, control flow, LLVM backend, tests, benchmarks
   ├─ M3  classes, namespaces, compile-time modules        ✅ done
   ├─ M4  mixed values, narrowing, PHP interop, report          ✅ done
   ├─ M5  generics, bounds, traits, return inference        ✅ done
-  ├─ M6  ownership & borrowing, no leaks                  (memory safety)
+  ├─ M6  ownership & borrowing, no leaks                  🚧 in progress
   ├─ M7  async/await + structured tasks, then threads     (I/O + parallelism)
   ├─ M8  C interoperability (extern "C", FFI)             (systems access)
   └─ M9  package manager, LSP, cross-compile, JIT         (ecosystem)

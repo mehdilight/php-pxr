@@ -653,13 +653,33 @@ run end to end. See [`GENERICS.md`](GENERICS.md), [`TRAITS.md`](TRAITS.md), and
 [`INFERENCE.md`](INFERENCE.md). Explicit annotations remain necessary where
 inference cannot establish one valid result. Default/partial type arguments and
 constructor type-argument inference are further extensions, not M5 deliverables.
-**Next:** M6 — ownership and memory safety. Async remains M7 after M6.
+**Next:** M6 — ownership and memory safety (in progress). Async remains M7 after M6.
 
-## ⛔ M6 — Ownership & memory safety
+## 🚧 M6 — Ownership & memory safety
 
 * Owned values and borrows; no leaks, no use‑after‑free, provable at compile
   time; replace the bump arena.
 * Affine/linear types, `&`/`&mut`‑style borrowing, lifetimes where needed.
+
+**Delivered (M6.1: runtime allocation lifecycle).**
+
+* Replaced the bump arena with aligned, tracked heap blocks. Strings, arrays,
+  objects, mixed boxes, class metadata, PHP handles, and temporary formatting
+  buffers share an explicit internal allocation/release path.
+* Array/formatting buffer growth releases obsolete buffers immediately; normal
+  process return and `exit`-based fatal errors reclaim every remaining block.
+  Stable value addresses, array value semantics, object identity, and the LLVM
+  value ABI are preserved. Cycles are safe during terminal cleanup.
+* Checked allocation arithmetic covers headers, terminators, buffer capacities,
+  property slots, repetition, concatenation, replacement, and encoding growth.
+* A C runtime harness tests alignment, resizing, copy preservation, cycles,
+  overflow rejection, and normal/fatal exit cleanup; it can also run under
+  AddressSanitizer and UndefinedBehaviorSanitizer.
+
+**Remaining.** Compiler-inserted per-value drops and reclamation during execution,
+affine moves, shared/exclusive borrows, lifetime/escape checks, shared-object
+cycle rules, and end-to-end ownership diagnostics/acceptance. Values still live
+until process exit; M6 is not complete. See [`OWNERSHIP.md`](OWNERSHIP.md).
 
 ## ⛔ M7 — Async I/O & concurrency
 

@@ -1,5 +1,5 @@
 /*
- * PXR runtime library — milestone 0.
+ * PXR standalone runtime library.
  *
  * This is the PXR "standalone runtime": every executable produced by `pxr build`
  * links against it, so PXR programs do not need the traditional PHP
@@ -8,9 +8,8 @@
  * Design notes (see docs/RUNTIME.md):
  *   - Values are unboxed: int -> int64_t, float -> double, bool -> i1/_Bool,
  *     string -> `pxr_str *` (length-prefixed byte string; NUL- and binary-safe).
- *   - String-producing operations allocate from a process-wide bump arena.
- *     There is no per-value free yet; owned strings / reference counting are a
- *     roadmap item. The arena is released by the operating system at exit.
+ *   - Runtime allocations use a tracked heap with deterministic exit cleanup.
+ *     Compiler-inserted value drops and borrow checking remain M6 work.
  *   - This file is embedded into the `pxr` binary at build time and compiled
  *     with the system C compiler on demand, then cached.
  */
@@ -27,44 +26,105 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
-/* ------------------------------------------------------------------ arena */
+/* ----------------------------------------------------------- managed heap */
 
-/*
- * A page-list "bump" arena. Unlike a single realloc'd block, growing the
- * arena never invalidates previously handed-out pointers, which matters once
- * arrays (whose values may reference earlier strings) are in play. Memory is
- * handed to the operating system at exit; there is no per-value free yet.
- */
-typedef struct pxr_page {
-    struct pxr_page *next;
-    size_t cap;
-    size_t used;
-    char data[]; /* 16-byte aligned on 64-bit targets */
-} pxr_page;
+/* Private allocation headers never cross the generated-code ABI. A union
+ * preserves malloc's alignment, including for zero-sized allocations. The heap
+ * owns every block until explicit internal release or process shutdown. This
+ * is the M6 foundation; it does not yet shorten language-value lifetimes. */
+typedef union pxr_allocation pxr_allocation;
+union pxr_allocation {
+    struct {
+        pxr_allocation *prev, *next;
+        size_t size;
+    } h;
+    max_align_t alignment;
+};
 
-static pxr_page *g_page = NULL;
+static pxr_allocation *pxr_heap_head = NULL;
+static size_t pxr_heap_blocks = 0;
+static size_t pxr_heap_bytes = 0;
+static int pxr_heap_initialized = 0;
 
 static void pxr_oom(void) {
     fputs("pxr: out of memory\n", stderr);
     abort();
 }
 
-void *pxr_arena_alloc(size_t n) {
-    n = (n + 7u) & ~(size_t)7u; /* 8-byte align */
-    if (!g_page || g_page->used + n > g_page->cap) {
-        size_t cap = n > ((size_t)1 << 16) ? n : ((size_t)1 << 16);
-        pxr_page *p = (pxr_page *)malloc(sizeof(pxr_page) + cap);
-        if (!p) {
-            pxr_oom();
-        }
-        p->next = g_page;
-        p->cap = cap;
-        p->used = 0;
-        g_page = p;
+static size_t pxr_size_add(size_t a, size_t b) {
+    if (b > SIZE_MAX - a) pxr_oom();
+    return a + b;
+}
+
+static size_t pxr_size_mul(size_t a, size_t b) {
+    if (a && b > SIZE_MAX / a) pxr_oom();
+    return a * b;
+}
+
+/* Terminal cleanup only: runtime roots must never be used after this call.
+ * No graph traversal is needed, so cycles and shared object identity are safe. */
+static void pxr_heap_shutdown(void) {
+    while (pxr_heap_head) {
+        pxr_allocation *next = pxr_heap_head->h.next;
+        free(pxr_heap_head);
+        pxr_heap_head = next;
     }
-    char *p = g_page->data + g_page->used;
-    g_page->used += n;
-    return p;
+    pxr_heap_blocks = 0;
+    pxr_heap_bytes = 0;
+}
+
+static void *pxr_heap_alloc(size_t n) {
+    size_t total = pxr_size_add(sizeof(pxr_allocation), n ? n : 1);
+    size_t bytes = pxr_size_add(pxr_heap_bytes, n);
+    if (!pxr_heap_initialized) {
+        if (atexit(pxr_heap_shutdown) != 0) pxr_oom();
+        pxr_heap_initialized = 1;
+    }
+    pxr_allocation *block = malloc(total);
+    if (!block) pxr_oom();
+    block->h.prev = NULL;
+    block->h.next = pxr_heap_head;
+    block->h.size = n;
+    if (pxr_heap_head) pxr_heap_head->h.prev = block;
+    pxr_heap_head = block;
+    pxr_heap_blocks++;
+    pxr_heap_bytes = bytes;
+    return block + 1;
+}
+
+/* Only accepts NULL or pointers returned by pxr_heap_alloc/resize. Literal
+ * strings and borrowed interior pointers must never reach this function. */
+static void pxr_heap_free(void *ptr) {
+    if (!ptr) return;
+    pxr_allocation *block = (pxr_allocation *)ptr - 1;
+    if (block->h.prev) block->h.prev->h.next = block->h.next;
+    else pxr_heap_head = block->h.next;
+    if (block->h.next) block->h.next->h.prev = block->h.prev;
+    pxr_heap_blocks--;
+    pxr_heap_bytes -= block->h.size;
+    free(block);
+}
+
+/* Resize private buffers only; language values keep stable addresses. Allocate
+ * before release so allocation failure never loses the original buffer. */
+static void *pxr_heap_resize(void *ptr, size_t n) {
+    void *result = pxr_heap_alloc(n);
+    if (ptr) {
+        pxr_allocation *old = (pxr_allocation *)ptr - 1;
+        size_t copy = old->h.size < n ? old->h.size : n;
+        memcpy(result, ptr, copy);
+        pxr_heap_free(ptr);
+    }
+    return result;
+}
+
+static size_t pxr_grow_capacity(size_t current, size_t needed) {
+    size_t cap = current ? current : 8;
+    while (cap < needed) {
+        if (cap > SIZE_MAX / 2) return needed;
+        cap *= 2;
+    }
+    return cap;
 }
 
 /*
@@ -83,7 +143,7 @@ typedef struct {
 } pxr_str;
 
 pxr_str *pxr_str_alloc(size_t len) {
-    pxr_str *p = (pxr_str *)pxr_arena_alloc(sizeof(pxr_str) + len + 1);
+    pxr_str *p = (pxr_str *)pxr_heap_alloc(pxr_size_add(sizeof(pxr_str), pxr_size_add(len, 1)));
     p->len = len;
     p->data[len] = '\0';
     return p;
@@ -219,7 +279,7 @@ void pxr_print_bool(int v) {
 pxr_str *pxr_str_concat(const pxr_str *a, const pxr_str *b) {
     size_t la = a ? a->len : 0;
     size_t lb = b ? b->len : 0;
-    pxr_str *out = pxr_str_alloc(la + lb);
+    pxr_str *out = pxr_str_alloc(pxr_size_add(la, lb));
     if (a) {
         memcpy(out->data, a->data, la);
     }
@@ -620,20 +680,14 @@ static long pxr_array_find(pxr_array *a, long long ktag, long long ki,
 }
 
 static void pxr_array_grow(pxr_array *a, size_t at_least) {
-    size_t ncap = a->cap ? a->cap * 2 : 8;
-    while (ncap < at_least) {
-        ncap *= 2;
-    }
-    pxr_ent *ne = (pxr_ent *)realloc(a->ents, ncap * sizeof(pxr_ent));
-    if (!ne) {
-        pxr_oom();
-    }
+    size_t ncap = pxr_grow_capacity(a->cap, at_least);
+    pxr_ent *ne = pxr_heap_resize(a->ents, pxr_size_mul(ncap, sizeof(pxr_ent)));
     a->ents = ne;
     a->cap = ncap;
 }
 
 void *pxr_array_new(void) {
-    pxr_array *a = (pxr_array *)pxr_arena_alloc(sizeof(pxr_array));
+    pxr_array *a = (pxr_array *)pxr_heap_alloc(sizeof(pxr_array));
     a->ents = NULL;
     a->len = 0;
     a->cap = 0;
@@ -653,7 +707,7 @@ void pxr_array_set(void *p, long long ktag, long long ki, const pxr_str *ks,
         return;
     }
     if (a->len == a->cap) {
-        pxr_array_grow(a, a->len + 1);
+        pxr_array_grow(a, pxr_size_add(a->len, 1));
     }
     pxr_ent *e = &a->ents[a->len++];
     e->vt = vt;
@@ -851,7 +905,7 @@ pxr_str *pxr_str_repeat(const pxr_str *s, long long n) {
         return pxr_str_alloc(0);
     }
     size_t sl = s->len;
-    pxr_str *out = pxr_str_alloc(sl * (size_t)n);
+    pxr_str *out = pxr_str_alloc(pxr_size_mul(sl, (size_t)n));
     for (long long i = 0; i < n; i++) {
         memcpy(out->data + (size_t)i * sl, s->data, sl);
     }
@@ -882,7 +936,9 @@ pxr_str *pxr_str_replace(const pxr_str *hay, const pxr_str *rep, const pxr_str *
     if (count == 0) {
         return (pxr_str *)subj;
     }
-    pxr_str *out = pxr_str_alloc(sl + count * (rl - hl));
+    pxr_str *out = pxr_str_alloc(rl >= hl
+        ? pxr_size_add(sl, pxr_size_mul(count, rl - hl))
+        : sl - count * (hl - rl));
     char *o = out->data;
     p = subj->data;
     while ((size_t)(end - p) >= hl) {
@@ -924,10 +980,10 @@ static pxr_str *pxr_val_to_str(long long tag, long long bits) {
 pxr_str *pxr_implode(const pxr_str *glue, void *p) {
     pxr_array *a = (pxr_array *)p;
     size_t gl = glue ? glue->len : 0;
-    size_t total = a->len ? (a->len - 1) * gl : 0;
+    size_t total = a->len ? pxr_size_mul(a->len - 1, gl) : 0;
     for (size_t i = 0; i < a->len; i++) {
         pxr_str *v = pxr_val_to_str(a->ents[i].vt, a->ents[i].bits);
-        total += v->len;
+        total = pxr_size_add(total, v->len);
     }
     pxr_str *out = pxr_str_alloc(total);
     size_t o = 0;
@@ -1459,7 +1515,7 @@ pxr_str *pxr_addslashes(const pxr_str *s) {
             extra++;
         }
     }
-    pxr_str *out = pxr_str_alloc(s->len + extra);
+    pxr_str *out = pxr_str_alloc(pxr_size_add(s->len, extra));
     size_t j = 0;
     for (size_t i = 0; i < s->len; i++) {
         char c = s->data[i];
@@ -1506,7 +1562,7 @@ pxr_str *pxr_stripslashes(const pxr_str *s) {
 /* Lowercase hexadecimal, two digits per input byte. */
 pxr_str *pxr_bin2hex(const pxr_str *s) {
     static const char hexd[] = "0123456789abcdef";
-    pxr_str *out = pxr_str_alloc(s->len * 2);
+    pxr_str *out = pxr_str_alloc(pxr_size_mul(s->len, 2));
     for (size_t i = 0; i < s->len; i++) {
         unsigned char b = (unsigned char)s->data[i];
         out->data[i * 2] = hexd[b >> 4];
@@ -1520,7 +1576,7 @@ pxr_str *pxr_base64_encode(const pxr_str *s) {
     static const char b64[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     size_t n = s->len;
-    pxr_str *out = pxr_str_alloc(((n + 2) / 3) * 4);
+    pxr_str *out = pxr_str_alloc(pxr_size_mul(pxr_size_add(n, 2) / 3, 4));
     size_t i = 0;
     size_t j = 0;
     while (i + 3 <= n) {
@@ -1577,7 +1633,7 @@ static pxr_str *pxr_url_encode(const pxr_str *s, int keep_tilde,
         } else if (space_as_plus && c == ' ') {
             outlen++;
         } else {
-            outlen += 3;
+            outlen = pxr_size_add(outlen, 3);
         }
     }
     pxr_str *out = pxr_str_alloc(outlen);
@@ -1666,17 +1722,17 @@ typedef struct {
 
 static void pxr_buf_init(pxr_buf *b, size_t cap) {
     if (cap < 64) cap = 64;
-    b->data = (char *)malloc(cap);
+    b->data = pxr_heap_alloc(cap);
     b->len = 0;
     b->cap = cap;
 }
 
 static void pxr_buf_append(pxr_buf *b, const char *s, size_t n) {
     if (!n) return;
-    if (b->len + n > b->cap) {
-        size_t ncap = b->cap * 2;
-        while (b->len + n > ncap) ncap *= 2;
-        b->data = (char *)realloc(b->data, ncap);
+    size_t needed = pxr_size_add(b->len, n);
+    if (needed > b->cap) {
+        size_t ncap = pxr_grow_capacity(b->cap, needed);
+        b->data = pxr_heap_resize(b->data, ncap);
         b->cap = ncap;
     }
     memcpy(b->data + b->len, s, n);
@@ -1735,10 +1791,10 @@ static double pxr_arg_to_f64(const pxr_array *args, size_t idx) {
 pxr_str *pxr_sprintf(const pxr_str *fmt, void *vargs) {
     const pxr_array *args = (const pxr_array *)vargs;
     pxr_buf out;
-    pxr_buf_init(&out, fmt ? fmt->len + 64 : 64);
+    pxr_buf_init(&out, fmt ? pxr_size_add(fmt->len, 64) : 64);
     if (!fmt || fmt->len == 0) {
         pxr_str *empty = pxr_str_alloc(0);
-        free(out.data);
+        pxr_heap_free(out.data);
         return empty;
     }
 
@@ -2024,7 +2080,7 @@ pxr_str *pxr_sprintf(const pxr_str *fmt, void *vargs) {
 
     pxr_str *res = pxr_str_alloc(out.len);
     memcpy(res->data, out.data, out.len);
-    free(out.data);
+    pxr_heap_free(out.data);
     return res;
 }
 
@@ -2061,7 +2117,7 @@ static pxr_supertype *pxr_supertypes[256];
 
 void pxr_class_register(long long class_id, long long super_id) {
     size_t bucket = (uint64_t)class_id % 256;
-    pxr_supertype *entry = pxr_arena_alloc(sizeof(pxr_supertype));
+    pxr_supertype *entry = pxr_heap_alloc(sizeof(pxr_supertype));
     entry->class_id = class_id;
     entry->super_id = super_id;
     entry->next = pxr_supertypes[bucket];
@@ -2069,16 +2125,18 @@ void pxr_class_register(long long class_id, long long super_id) {
 }
 
 void *pxr_object_new(long long class_id, const pxr_str *name, long long num_props) {
-    pxr_object *obj = (pxr_object *)pxr_arena_alloc(sizeof(pxr_object));
+    if (num_props < 0) pxr_oom();
+    size_t prop_bytes = pxr_size_mul(sizeof(int64_t), (size_t)num_props);
+    pxr_object *obj = (pxr_object *)pxr_heap_alloc(sizeof(pxr_object));
     obj->class_id = (int64_t)class_id;
     obj->remote_id = 0;
     obj->class_name = name;
     obj->num_props = (size_t)num_props;
     if (num_props > 0) {
-        obj->tags = (int64_t *)pxr_arena_alloc(sizeof(int64_t) * (size_t)num_props);
-        obj->bits = (int64_t *)pxr_arena_alloc(sizeof(int64_t) * (size_t)num_props);
-        memset(obj->tags, 0, sizeof(int64_t) * (size_t)num_props);
-        memset(obj->bits, 0, sizeof(int64_t) * (size_t)num_props);
+        obj->tags = (int64_t *)pxr_heap_alloc(prop_bytes);
+        obj->bits = (int64_t *)pxr_heap_alloc(prop_bytes);
+        memset(obj->tags, 0, prop_bytes);
+        memset(obj->bits, 0, prop_bytes);
     } else {
         obj->tags = NULL;
         obj->bits = NULL;
@@ -2098,7 +2156,7 @@ void *pxr_static_storage(long long class_id, long long num_props) {
     for (pxr_static_class *entry = pxr_static_classes[bucket]; entry; entry = entry->next) {
         if (entry->class_id == class_id) return entry->storage;
     }
-    pxr_static_class *entry = pxr_arena_alloc(sizeof(pxr_static_class));
+    pxr_static_class *entry = pxr_heap_alloc(sizeof(pxr_static_class));
     entry->class_id = class_id;
     entry->storage = pxr_object_new(class_id, NULL, num_props);
     entry->next = pxr_static_classes[bucket];
@@ -2175,7 +2233,7 @@ void *pxr_array_to_mixed(void *p);
 
 void *pxr_mixed_box(long long tag, long long bits) {
     if (tag == PXR_TAG_ARR) bits = (int64_t)(intptr_t)pxr_array_to_mixed((void *)(intptr_t)bits);
-    pxr_mixed *value = pxr_arena_alloc(sizeof(pxr_mixed));
+    pxr_mixed *value = pxr_heap_alloc(sizeof(pxr_mixed));
     value->tag = tag; value->bits = bits;
     return value;
 }
@@ -2708,7 +2766,7 @@ static void *pxr_php_receive_value(unsigned depth) {
             pxr_php_handle *handle;
             for (handle = pxr_php_handles; handle && handle->id != id; handle = handle->next) {}
             if (!handle) {
-                handle = pxr_arena_alloc(sizeof(*handle));
+                handle = pxr_heap_alloc(sizeof(*handle));
                 handle->id = id; handle->object = pxr_object_new(-1, name, 0);
                 handle->object->remote_id = id;
                 handle->next = pxr_php_handles; pxr_php_handles = handle;
@@ -2719,7 +2777,7 @@ static void *pxr_php_receive_value(unsigned depth) {
         default: pxr_php_fail("invalid incoming value tag");
     }
     // The array decoder already produced normalized boxes; avoid copying it.
-    pxr_mixed *value = pxr_arena_alloc(sizeof(*value));
+    pxr_mixed *value = pxr_heap_alloc(sizeof(*value));
     value->tag = tag; value->bits = bits;
     return value;
 }

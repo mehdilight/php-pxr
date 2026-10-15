@@ -27,25 +27,32 @@ worker when executed.
 ## Memory model
 
 Strings are immutable; array mutations operate on private value copies.
-Operations that produce a string
-(`pxr_str_concat`, `pxr_i64_to_str`, …) or a new array (`pxr_array_new`) allocate
-from a **bump arena**:
+All runtime-owned memory now uses a **tracked heap**, replacing the page-list
+bump arena in M6.1. Private headers link allocations and record their sizes;
+returned pointers retain `max_align_t` alignment. Headers stay outside the public
+value layout, so generated LLVM and literal string layouts are unchanged.
 
-* `pxr_arena_alloc(n)` — 8‑byte aligned allocation from the current page.
-* `pxr_str_alloc(len)` — allocates a `pxr_str` header (`{ size_t len;
-  char data[]; }`) plus `len + 1` bytes; `data` is zero‑terminated.
+* `pxr_heap_alloc(n)` allocates a stable block and registers terminal cleanup on
+  first use. It checks header-size arithmetic and allocation failure.
+* `pxr_heap_resize(p, n)` allocates/copies/releases a private buffer. Only array
+  entry buffers and formatting buffers resize; language values keep stable
+  addresses. Replaced buffers are released immediately.
+* `pxr_heap_free(p)` releases an internally owned block. It must never receive
+  literal strings, borrowed interior pointers, or an already released block.
+* `pxr_str_alloc(len)` checks header/terminator arithmetic and initializes the
+  byte length and trailing zero. Size helpers guard growing buffers and common
+  expanding string operations against arithmetic overflow.
 
-The arena is a linked list of pages (64 KiB each, doubling only for oversized
-requests), so growing it never invalidates pointers handed out earlier. This was
-upgraded from a single realloc'd block in milestone 1, once arrays could hold
-references to strings allocated before them.
+The heap releases every remaining block on normal return and runtime errors
+that use `exit`, including cyclic objects and PHP handle records. Cleanup is
+terminal: roots cannot be used afterward. Aborts, signals, and `_exit` do not run
+exit callbacks. Allocation failure continues to abort with `pxr: out of memory`.
 
-There is **no per‑value free** yet. The arena grows for the life of the process
-and is reclaimed by the OS at exit. This is a deliberate trade‑off: it is simple,
-fast, and cannot dangle. Owned values, reference counting, and (eventually)
-ownership/borrow checking are roadmap items. Until then, long‑running programs
-that build strings or arrays in a loop can grow memory; this is documented rather
-than hidden.
+**Language-value lifetimes are still process-wide.** This foundation supplies
+internal buffer release and exit cleanup, not compile-time ownership or borrow
+checking. Repeated string/array construction can still grow memory during a
+long-running program. Compiler-inserted drops, moves, borrows, and safe handling
+of shared object graphs remain M6 work; see [`OWNERSHIP.md`](OWNERSHIP.md).
 
 A string is a `pxr_str *`: `len` bytes of `data`, followed by a NUL terminator
 that is not part of the value. Embedded `\0` bytes are first‑class, matching PHP
@@ -56,8 +63,7 @@ mirrored by the `{ i64, [N x i8] }` LLVM constant pool entries the backend emits
 ## ABI
 
 ```c
-/* arena */
-void    *pxr_arena_alloc(size_t n);
+/* strings (heap allocation helpers are private) */
 pxr_str *pxr_str_alloc(size_t len);  /* { len, data[..len] } + NUL terminator */
 
 /* printing (no separator, matching PHP `echo`) */
@@ -163,7 +169,7 @@ long long pxr_array_count(void *a);
 long long pxr_array_val_bits_at(void *a, long long i);   /* foreach */
 void  *pxr_array_copy(void *a);                /* deep copy (value semantics) */
 
-/* objects — allocated in arena, properties indexed by slot, inheritance */
+/* objects — allocated on the tracked heap, properties indexed by slot, inheritance */
 void      *pxr_object_new(long long class_id, const pxr_str *class_name, long long num_props);
 void      *pxr_static_storage(long long class_id, long long num_props);
 long long  pxr_object_get_bits(void *obj, long long prop_idx);
@@ -175,8 +181,7 @@ long long  pxr_instanceof(void *obj, long long target_class_id);
 
 ### Objects and Inheritance
 
-Objects are heap‑allocated structures allocated directly from the runtime bump
-arena:
+Objects are stable structures allocated on the tracked heap:
 
 ```c
 typedef struct {
@@ -197,7 +202,7 @@ with a PHP-faithful fatal error.
 
 The compiler computes the transitive supertype relation, including all parent
 classes and interfaces. Each pair is registered at startup via
-`pxr_class_register(class_id, super_id)` into arena-allocated hash buckets keyed
+`pxr_class_register(class_id, super_id)` into heap-allocated hash buckets keyed
 by the concrete class ID. Empty roots require no registration.
 Method dispatch lowered directly to concrete symbols `pxr$m$<class>$<method>` when
 no overrides exist, and to jump-table dispatchers `pxr$disp$<root>$<method>` checking
@@ -208,7 +213,7 @@ class inheritance, multiple interface inheritance, and inherited implementation
 contracts. Calls through interface types use the same dispatcher mechanism.
 
 Static properties reuse the object property-slot ABI through
-`pxr_static_storage(class_id, num_props)`, which returns one arena-allocated slot
+`pxr_static_storage(class_id, num_props)`, which returns one heap-allocated slot
 container per declaring class. The compiler initializes declared defaults once,
 before top-level execution. Inherited accesses use the original declaring class;
 redeclared properties use the subclass container. Instance construction skips
@@ -292,3 +297,17 @@ Resources, references, callbacks, and native object transfers fail explicitly.
 Uncaught PHP exceptions become native fatal errors; PHP exit codes propagate.
 Shutdown closes the request stream and reaps the child process. See
 [`INTEROP.md`](INTEROP.md) for the user-facing contract.
+
+## Memory lifecycle verification
+
+`cargo test -p pxr --test runtime_heap` compiles the embedded C runtime with a
+small harness. It exercises allocation alignment, buffer growth/shrink/release,
+array copies, binary strings, object cycles, static storage, arithmetic overflow,
+and exit cleanup after both normal execution and fatal runtime errors. Private
+allocation counters verify that cleanup returns the heap to zero blocks/bytes.
+
+For AddressSanitizer and UndefinedBehaviorSanitizer on a supported C toolchain:
+
+```sh
+PXR_RUNTIME_SANITIZERS=1 cargo test -p pxr --test runtime_heap
+```
