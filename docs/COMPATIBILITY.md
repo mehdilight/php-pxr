@@ -262,15 +262,17 @@ PHP `include_path`. Use `__DIR__ . "/file.php"` for an unambiguous shared PHP/PX
 path. Missing files and unsupported dependency forms fail compilation (`E0273`).
 This is a static module resolver; runtime inclusion of untyped PHP remains M4.
 
-**Scalar mixed values.** `mixed` annotations accept scalar values (`int`, `float`,
-`bool`, `string`) using runtime tags. Printing, truthiness, conversions,
+**Scalar and null mixed values.** `mixed` annotations accept scalar values (`int`, `float`,
+`bool`, `string`) and null using runtime tags. Printing, truthiness, conversions,
 concatenation, strict comparisons, and scalar `match` cases are supported. Type
 predicates work on boxed scalars and concrete values. Guards narrow local mixed
 variables and parameters; assignments and control-flow joins invalidate stale
 facts. Concrete variables still cannot change type unless opted into
 `mixed`. Typed-only operations require explicit scalar conversion.
 
-This is an initial subset of PHP's broader `mixed`: null, arrays, and objects
+Null supports strict comparisons, predicates, conversions, and lazy `??`/`??=`
+on variables, mixed properties, and array elements. Concrete types remain
+non-nullable. This is a subset of PHP's broader `mixed`: arrays and objects
 cannot yet be boxed. Unguarded mixed arithmetic, ordering, and loose comparisons fail at
 compile time (`E0274`); guarded concrete scalars use the typed operators. Mixed parameters and returns still require explicit
 annotations. Existing scalar numeric conversion semantics are reused; broader
@@ -279,7 +281,7 @@ future work. See
 [`MIXED.md`](MIXED.md).
 
 **Fail loud, never silent.** Features not yet implemented (such as
-`null`, keyed `foreach`, nested array assignment, complex interpolation forms)
+keyed `foreach`, nested array assignment, complex interpolation forms)
 produce a compile error with a specific code — never a silently different program.
 
 ## Runtime independence

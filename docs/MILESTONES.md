@@ -472,7 +472,8 @@ using `mixed`.
   array copying, append/index assignment, and existing array transforms. Whole
   arrays are not implicitly reboxed from `array<T>` to `array<mixed>`.
 * Unsupported arithmetic, ordering, and loose comparisons on mixed values are
-  loud `E0274` errors; boxing arrays, objects, and null remains unsupported.
+  loud `E0274` errors. M4.1 initially excluded array, object, and null boxing;
+  M4.3 below adds null.
   Typed builtins continue to require concrete arguments except the conversions
   and predicates listed above.
 * Five new CLI tests cover PHP output comparisons, scalar tags and conversions,
@@ -502,6 +503,20 @@ using `mixed`.
 * Four CLI tests cover PHP output comparisons, guard forms, mutation, loop
   iterations, branch joins, and rejection of unsound stale facts — 84 CLI tests
   total. Example: `examples/narrowing.php`.
+
+**Delivered (M4.3: boxed null values and lazy coalescing).**
+
+* Null literals use mixed storage, distinct from the empty-array type sentinel.
+  Parameters, returns, arrays, and constant instance/static property defaults
+  preserve null tags. Scalar conversions follow PHP's null behavior.
+* `is_null`, `is_scalar`, strict comparisons, and `match` distinguish null from
+  false, zero, and empty strings. Flow joins and negative scalar guards account
+  for the null path instead of incorrectly treating scalar guards as exhaustive.
+* `??` and `??=` handle null values, missing keys, and uninitialized mixed
+  properties. Receivers and keys evaluate once; fallback expressions are lazy.
+* Two CLI tests compare these paths and evaluation order against PHP and reject
+  false exhaustiveness — 86 CLI tests total. Example: `examples/nulls.php`.
+  Concrete types remain non-nullable; nullable annotations are still planned.
 
 **Next:** broader boxed values and dynamic operations, migration reporting, and
 runtime PHP interop. Property/array-element guards and more precise loop

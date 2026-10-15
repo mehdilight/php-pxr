@@ -113,9 +113,9 @@ migration path possible.
   single inheritance, dynamic dispatch, `parent::`, `instanceof`, and abstract
   classes and methods, interface contracts, calls through interface types, and
   static properties/methods via `Class::`, `self::`, and `parent::`.
-* **Gradual typing (M4.1)** — opt-in scalar `mixed` parameters, returns, variables,
+* **Gradual typing (M4.1–M4.3)** — opt-in scalar/null `mixed` parameters, returns, variables,
   and properties; `is_*` checks, guarded scalar narrowing, conversions, strict
-  comparisons, and arrays of explicitly boxed scalars.
+  comparisons, lazy null coalescing, and arrays of boxed scalar/null values.
 * **Modules** — braced and unbraced namespaces, qualified names, class/namespace
   aliases, `use function`, and compile-time `require`/`require_once` dependencies
   with diagnostics pointing to the originating file.

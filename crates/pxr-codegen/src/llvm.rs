@@ -24,6 +24,7 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     ("abort", "void", &[]),
     ("pxr_mixed_box", "ptr", &["i64", "i64"]),
     ("pxr_mixed_is", "i64", &["ptr", "i64"]),
+    ("pxr_mixed_is_nullish", "i64", &["ptr"]),
     ("pxr_mixed_i64", "i64", &["ptr"]),
     ("pxr_mixed_f64", "double", &["ptr"]),
     ("pxr_mixed_bool", "i64", &["ptr"]),

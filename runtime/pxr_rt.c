@@ -2101,12 +2101,12 @@ void pxr_object_set_bits(void *p, long long prop_idx, long long tag, long long b
 
 
 
-/* M4.1: immutable tagged scalar boxes. Container/object boxing follows later. */
+/* Immutable tagged scalar and null boxes. Container/object boxing follows later. */
 typedef struct { int64_t tag; int64_t bits; } pxr_mixed;
 
 static const pxr_mixed *pxr_mixed_checked(const void *p) {
     const pxr_mixed *value = p;
-    if (!value || value->tag < 1 || value->tag > 4) {
+    if (!value || value->tag < 0 || value->tag > 4) {
         fprintf(stderr, "Fatal error: Uncaught Error: invalid or uninitialized mixed value\n");
         exit(255);
     }
@@ -2119,9 +2119,14 @@ void *pxr_mixed_box(long long tag, long long bits) {
     return value;
 }
 
+/* Coalescing may inspect an unset typed property without reading its value. */
+long long pxr_mixed_is_nullish(const void *p) {
+    return !p || pxr_mixed_checked(p)->tag == 0;
+}
+
 long long pxr_mixed_is(const void *p, long long tag) {
     const pxr_mixed *value = pxr_mixed_checked(p);
-    return tag == -1 ? 1 : value->tag == tag;
+    return tag == -1 ? (value->tag >= 1 && value->tag <= 4) : value->tag == tag;
 }
 
 static long long pxr_mixed_float_to_int(double value) {
@@ -2162,6 +2167,7 @@ long long pxr_mixed_bool(const void *p) {
 
 pxr_str *pxr_mixed_str(const void *p) {
     const pxr_mixed *value = pxr_mixed_checked(p);
+    if (value->tag == 0) return pxr_str_alloc(0);
     return pxr_val_to_str(value->tag, value->bits);
 }
 

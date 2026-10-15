@@ -4,9 +4,9 @@ This is the precise description of the language the current compiler accepts.
 It is written to match the implementation and the test suite — if this document
 and the compiler disagree, that is a bug.
 
-PXR is **statically typed**, with opt-in scalar `mixed` values for gradual
+PXR is **statically typed**, with opt-in scalar/null `mixed` values for gradual
 migration. Concrete types retain their existing checks; `mixed` values carry a
-runtime scalar tag and require explicit conversion for typed-only operations.
+runtime value tag and require explicit conversion for typed-only operations.
 
 ## Source encoding
 
@@ -25,7 +25,7 @@ runtime scalar tag and require explicit conversion for typed-only operations.
 | `int` | 64‑bit signed integer | `i64` |
 | `float` | IEEE‑754 double | `double` |
 | `string` | immutable byte string | `pxr_str *` |
-| `mixed` | opt-in tagged scalar (`int`, `float`, `bool`, `string`) | opaque `ptr` |
+| `mixed` | opt-in tagged scalar or null (`int`, `float`, `bool`, `string`, `null`) | opaque `ptr` |
 | `bool` | boolean | `i1` |
 | `void` | no value (return types only) | — |
 | `array<T>` | ordered map with values of type `T` (`int`/`string` keys) | opaque `ptr` |
@@ -182,9 +182,11 @@ Additional operators:
 
 * `<=>` (spaceship) — compares two numerics or two strings and yields `int`
   `-1`/`0`/`1`.
-* `??` (null coalescing) — yields the left operand when it "is set". In PXR only
-  an array element read can be unset; for any other expression `??` degrades to
-  its left operand. The right operand is only evaluated when needed.
+* `??` (null coalescing) — yields the left operand unless it is null or unset.
+  Missing array keys and uninitialized mixed properties select the fallback.
+  `??=` assigns only in those cases. False, zero, and empty strings are retained;
+  the right operand is only evaluated when needed. Undefined local variables
+  remain compile errors.
 * `& | ^ << >> ~` — bitwise operators require `int` operands (PHP would coerce;
   PXR rejects at compile time). Shifts follow PHP's rules exactly: `>>` is an
   arithmetic (sign‑preserving) shift, a count of 64 or more yields `0` (or `-1`
@@ -328,7 +330,6 @@ are `W020x`.
 | `E0206` | Function must return on all paths |
 | `E0207` | Nested function declarations unsupported |
 | `E0208` | Condition is not a scalar |
-| `E0209` | `null` is not supported yet |
 | `E0210` | Variable redeclared with a different type |
 | `E0211` | Variable cannot be `void` |
 | `E0212` | Cannot assign value to variable |
@@ -463,11 +464,11 @@ See [`MODULES.md`](MODULES.md) for examples and the distinction from runtime PHP
 inclusion. `tokens` and `ast` inspect only the requested file; semantic/build
 commands resolve its full dependency graph.
 
-## Scalar mixed values (M4.1)
+## Scalar and null mixed values (M4.1–M4.3)
 
 `function identity(mixed $value): mixed { return $value; }` accepts boxed scalar
-values. Local variables can opt in with `$value: mixed = 1;`; a value inferred
-as `mixed` also remains mixed when subsequently assigned another scalar.
+and null values. Local variables can opt in with `$value: mixed = 1;`; a value inferred
+as `mixed` also remains mixed when subsequently assigned another supported value.
 
 Predicates: `is_int`, `is_float`, `is_bool`, `is_string`, `is_scalar`, `is_array`,
 `is_object`, and `is_null`. Conversion: `intval`, `floatval`, `strval`, `boolval`.
@@ -477,8 +478,10 @@ results. Direct arithmetic, ordering, loose comparisons, and implicit unboxing
 are rejected unless scalar guard facts prove a concrete operand type. Guards
 narrow local mixed variables/parameters; rebinding invalidates previous facts.
 
-Only scalar boxing is implemented. Null, arrays, and objects cannot yet become
-mixed values. Arrays can store boxed scalars as `array<mixed>`; use explicitly
+Null literals have type `mixed` and support predicates, scalar conversions,
+strict comparisons, matching, and lazy coalescing. Nullable annotations remain
+planned; concrete types cannot store null. Arrays and objects cannot yet become
+mixed values. Arrays can store boxed scalars/null as `array<mixed>`; use explicitly
 boxed elements rather than converting an entire concrete array. See
 [`MIXED.md`](MIXED.md) for examples and remaining limits.
 

@@ -410,6 +410,10 @@ impl Lowerer {
             TExpr::Float(v) => self.emit_const(Literal::Float(*v)),
             TExpr::Str(s) => self.emit_const(Literal::Str(s.clone())),
             TExpr::Bool(b) => self.emit_const(Literal::Bool(*b)),
+            TExpr::Null => {
+                let zero = self.emit_const(Literal::Int(0));
+                self.rt_call("pxr_mixed_box", vec![zero, zero], Ty::Mixed)
+            }
             TExpr::Var { slot, ty, .. } => {
                 let dst = self.fresh();
                 self.emit(Inst::SlotGet {
@@ -762,9 +766,7 @@ impl Lowerer {
         }
     }
 
-    /// Lower `a ?? b` with proper laziness. In PXR only an array element read
-    /// can be "unset"; every other expression is always set, so `??` degrades
-    /// to its left operand.
+    /// Lower `a ?? b` lazily, testing both key presence and boxed nulls.
     fn lower_null_coalesce(&mut self, lhs: &TExpr, lhs_ty: &Ty, rhs: &TExpr, rhs_ty: &Ty) -> Value {
         // Keep a reference around so we can borrow it in `match` arms later.
         let ty = self.common_of(lhs_ty, rhs_ty);
@@ -817,6 +819,16 @@ impl Lowerer {
                 };
                 let bits = self.array_get(a3, ktag, kint, kstr);
                 let v1 = self.decode_bits(bits, ety);
+                if *ety == Ty::Mixed {
+                    let is_null = self.mixed_is_null(v1);
+                    let present_l = self.fresh_label();
+                    self.terminator(Inst::Branch {
+                        cond: is_null,
+                        then_label: rhs_l,
+                        else_label: present_l,
+                    });
+                    self.switch_to(present_l);
+                }
                 let v1 = self.cast(v1, ety, &ty);
                 self.emit(Inst::SlotSet {
                     slot: tmp,
@@ -840,11 +852,49 @@ impl Lowerer {
                 self.emit(Inst::SlotGet { dst, slot: tmp, ty });
                 dst
             }
+            _ if *lhs_ty == Ty::Mixed => {
+                let v = self.lower_expr(lhs);
+                let is_null = self.mixed_is_null(v);
+                let tmp = self.alloc_temp_slot(ty.clone());
+                let rhs_l = self.fresh_label();
+                let take_l = self.fresh_label();
+                let end = self.fresh_label();
+                self.terminator(Inst::Branch {
+                    cond: is_null,
+                    then_label: rhs_l,
+                    else_label: take_l,
+                });
+                self.switch_to(take_l);
+                self.emit(Inst::SlotSet {
+                    slot: tmp,
+                    src: v,
+                    ty: ty.clone(),
+                });
+                self.terminator(Inst::Jump(end));
+                self.switch_to(rhs_l);
+                let fallback = self.lower_expr(rhs);
+                let fallback = self.cast(fallback, rhs_ty, &ty);
+                self.emit(Inst::SlotSet {
+                    slot: tmp,
+                    src: fallback,
+                    ty: ty.clone(),
+                });
+                self.terminator(Inst::Jump(end));
+                self.switch_to(end);
+                let dst = self.fresh();
+                self.emit(Inst::SlotGet { dst, slot: tmp, ty });
+                dst
+            }
             _ => {
                 let v = self.lower_expr(lhs);
                 self.cast(v, lhs_ty, &ty)
             }
         }
+    }
+
+    fn mixed_is_null(&mut self, value: Value) -> Value {
+        let result = self.rt_call("pxr_mixed_is_nullish", vec![value], Ty::Int);
+        self.to_bool(result, &Ty::Int)
     }
 
     /// The common type of a binary/coalesce/ternary result, mirroring the
@@ -1527,7 +1577,44 @@ impl Lowerer {
     fn lower_coalesce_assign(&mut self, target: &TTarget, ty: &Ty, value: &TExpr) {
         match target {
             TTarget::MixedVar { .. } | TTarget::Var { .. } | TTarget::Property { .. } => {
-                // PXR variables and properties are always set; `??=` is a no-op.
+                // A proven concrete value cannot be null. Evaluate property bases
+                // even when the assignment is skipped, as PHP does.
+                let property = if let TTarget::Property { base, prop_idx, .. } = target {
+                    let obj = self.lower_expr(base);
+                    let idx = self.emit_const(Literal::Int(*prop_idx as i64));
+                    Some((obj, idx))
+                } else {
+                    None
+                };
+                if *ty != Ty::Mixed {
+                    return;
+                }
+                let current = if let Some((obj, idx)) = property {
+                    let bits = self.rt_call("pxr_object_get_bits", vec![obj, idx], Ty::Int);
+                    self.decode_bits(bits, ty)
+                } else {
+                    self.lower_load(target, ty.clone()).0
+                };
+                let is_null = self.mixed_is_null(current);
+                let set_l = self.fresh_label();
+                let skip_l = self.fresh_label();
+                self.terminator(Inst::Branch {
+                    cond: is_null,
+                    then_label: set_l,
+                    else_label: skip_l,
+                });
+                self.switch_to(set_l);
+                let v = self.lower_expr(value);
+                let v = self.cast(v, &value.ty(), ty);
+                if let Some((obj, idx)) = property {
+                    let tag = self.emit_const(Literal::Int(Self::tag_of(ty)));
+                    let bits = self.encode_bits(v, ty);
+                    self.rt_call("pxr_object_set_bits", vec![obj, idx, tag, bits], Ty::Void);
+                } else {
+                    self.lower_store(target, ty.clone(), v);
+                }
+                self.terminator(Inst::Jump(skip_l));
+                self.switch_to(skip_l);
             }
             TTarget::Index {
                 base,
@@ -1540,11 +1627,27 @@ impl Lowerer {
                 let has = self.array_has(arr, ktag, kint, kstr);
                 let set_l = self.fresh_label();
                 let skip_l = self.fresh_label();
+                let check_l = if *ty == Ty::Mixed {
+                    self.fresh_label()
+                } else {
+                    skip_l
+                };
                 self.terminator(Inst::Branch {
                     cond: has,
-                    then_label: skip_l,
+                    then_label: check_l,
                     else_label: set_l,
                 });
+                if *ty == Ty::Mixed {
+                    self.switch_to(check_l);
+                    let bits = self.array_get(arr, ktag, kint, kstr);
+                    let current = self.decode_bits(bits, ty);
+                    let is_null = self.mixed_is_null(current);
+                    self.terminator(Inst::Branch {
+                        cond: is_null,
+                        then_label: set_l,
+                        else_label: skip_l,
+                    });
+                }
                 self.switch_to(set_l);
                 let mut v = self.lower_expr(value);
                 let vt = value.ty();

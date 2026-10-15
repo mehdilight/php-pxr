@@ -4,7 +4,7 @@
 //! generator so that every stage agrees on the same representation.
 //!
 //! PXR starts from a small, *statically typed* core that mirrors the
-//! scalar types of PHP. Opt-in `mixed` values use tagged scalar boxes.
+//! scalar types of PHP. Opt-in `mixed` values use tagged scalar/null boxes.
 
 use std::fmt;
 
@@ -17,9 +17,10 @@ pub enum Ty {
     Int,
     Float,
     String,
-    /// Opt-in tagged scalar value (M4.1).
+    /// Opt-in tagged scalar/null value.
     Mixed,
-    /// The type of the `null` literal. Currently not fully implemented.
+    /// Internal element-type sentinel for empty array literals.
+    /// User-facing null literals have type `Mixed`.
     Null,
     /// An array with a statically-known value type and dynamically-typed
     /// (`int` or `string`) keys, mirroring PHP's ordered maps. `Array(Null)` is

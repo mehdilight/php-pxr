@@ -253,6 +253,8 @@ pub enum TExpr {
     /// Raw byte-string literal (PHP strings are byte strings).
     Str(Vec<u8>),
     Bool(bool),
+    /// Null is a boxed mixed value, distinct from the empty-array sentinel.
+    Null,
     Var {
         name: String,
         slot: u32,
@@ -346,6 +348,7 @@ impl TExpr {
             TExpr::Float(_) => Ty::Float,
             TExpr::Str(_) => Ty::String,
             TExpr::Bool(_) => Ty::Bool,
+            TExpr::Null => Ty::Mixed,
             TExpr::Var { ty, .. } => ty.clone(),
             TExpr::Un { ty, .. } => ty.clone(),
             TExpr::Bin { ty, .. } => ty.clone(),
@@ -406,9 +409,10 @@ impl TTarget {
     }
 }
 
-// Scalar possibility sets for local mixed slots. Facts describe values, never
+// Value possibility sets for local mixed slots. Facts describe values, never
 // alter slot storage types, and are joined only across reachable paths.
 const SCALAR_MASK: u8 = 15;
+const VALUE_MASK: u8 = SCALAR_MASK | 16; // Scalars and null.
 #[derive(Clone, Debug)]
 struct FlowState {
     types: HashMap<u32, u8>,
@@ -424,7 +428,7 @@ impl Default for FlowState {
 }
 impl FlowState {
     fn mask(&self, slot: u32) -> u8 {
-        self.types.get(&slot).copied().unwrap_or(SCALAR_MASK)
+        self.types.get(&slot).copied().unwrap_or(VALUE_MASK)
     }
     fn restrict(&mut self, slot: u32, mask: u8) {
         let mask = self.mask(slot) & mask;
@@ -510,6 +514,13 @@ impl FlowState {
                     }
                 }
                 let mut result = self.clone();
+                for (candidate, other) in [(lhs, rhs), (rhs, lhs)] {
+                    if matches!(&**other, TExpr::Null) {
+                        if let Some(slot) = mixed_slot(candidate) {
+                            result.restrict(slot, if equal { 16 } else { VALUE_MASK & !16 });
+                        }
+                    }
+                }
                 if equal {
                     if let Some(slot) = mixed_slot(lhs) {
                         if rhs.ty().is_scalar() {
@@ -535,12 +546,13 @@ impl FlowState {
                     Builtin::IsBool => 4,
                     Builtin::IsString => 8,
                     Builtin::IsScalar => SCALAR_MASK,
-                    Builtin::IsArray | Builtin::IsObject | Builtin::IsNull => 0,
+                    Builtin::IsNull => 16,
+                    Builtin::IsArray | Builtin::IsObject => 0,
                     _ => return self.clone(),
                 };
                 let mut result = self.clone();
                 if let Some(slot) = args.first().and_then(mixed_slot) {
-                    result.restrict(slot, if truth { mask } else { SCALAR_MASK & !mask });
+                    result.restrict(slot, if truth { mask } else { VALUE_MASK & !mask });
                 }
                 result
             }
@@ -565,7 +577,7 @@ fn scalar_mask(ty: &Ty) -> u8 {
         Ty::Float => 2,
         Ty::Bool => 4,
         Ty::String => 8,
-        _ => SCALAR_MASK,
+        _ => VALUE_MASK,
     }
 }
 
@@ -1338,13 +1350,13 @@ impl Analyzer {
                         if ty == Ty::Mixed {
                             if let Some(default) = &p.default {
                                 if !static_initializer(default) {
-                                    self.diags.emit(Diagnostic::error("mixed property defaults require constant scalar expressions")
+                                    self.diags.emit(Diagnostic::error("mixed property defaults require constant scalar or null expressions")
                                         .with_code("E0274").with_span(p.name_span));
                                 } else {
                                     let mut context = FnCtx::new(Ty::Void, false);
                                     if let Some(value) = self.infer(default, &mut context) {
-                                        if !value.ty().is_scalar() {
-                                            self.diags.emit(Diagnostic::error("only scalar values can be boxed as mixed in this slice")
+                                        if !value.ty().is_scalar() && value.ty() != Ty::Mixed {
+                                            self.diags.emit(Diagnostic::error("only scalar and null values can be boxed as mixed in this slice")
                                                 .with_code("E0274").with_span(p.name_span));
                                         }
                                     }
@@ -2425,15 +2437,6 @@ impl Analyzer {
         let val = self.infer(value, ctx)?;
         let val_ty = val.ty();
 
-        if val_ty == Ty::Null {
-            self.diags.emit(
-                Diagnostic::error("`null` is not supported yet; use a concrete value")
-                    .with_code("E0209")
-                    .with_span(value.span()),
-            );
-            return None;
-        }
-
         match target {
             ast::LValue::Var { name, .. } => {
                 if name == "this" {
@@ -3032,14 +3035,7 @@ impl Analyzer {
             ast::Expr::FloatLit(v, _) => Some(TExpr::Float(*v)),
             ast::Expr::StrLit(s, _) => Some(TExpr::Str(s.clone())),
             ast::Expr::BoolLit(b, _) => Some(TExpr::Bool(*b)),
-            ast::Expr::NullLit(span) => {
-                self.diags.emit(
-                    Diagnostic::error("`null` is not supported yet")
-                        .with_code("E0209")
-                        .with_span(*span),
-                );
-                None
-            }
+            ast::Expr::NullLit(_) => Some(TExpr::Null),
             ast::Expr::Paren(inner, _) => self.infer(inner, ctx),
             ast::Expr::Var(name, span) => {
                 if name == "this" && ctx.slot_of("this").is_none() {
@@ -5058,7 +5054,8 @@ fn static_initializer(expr: &ast::Expr) -> bool {
         ast::Expr::IntLit(..)
         | ast::Expr::FloatLit(..)
         | ast::Expr::StrLit(..)
-        | ast::Expr::BoolLit(..) => true,
+        | ast::Expr::BoolLit(..)
+        | ast::Expr::NullLit(..) => true,
         ast::Expr::Paren(e, _) | ast::Expr::Unary { expr: e, .. } => static_initializer(e),
         ast::Expr::Binary { lhs, rhs, .. } => static_initializer(lhs) && static_initializer(rhs),
         ast::Expr::ArrayLit { items, .. } => items.iter().all(|item| {

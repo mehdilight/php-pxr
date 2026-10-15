@@ -2144,6 +2144,12 @@ fn unsupported_mixed_operations_are_rejected() {
             "E0215",
         ),
         (
+            "null_into_concrete_return",
+            "function f(): int { return null; }",
+            "E0215",
+        ),
+        ("null_into_concrete_variable", "$v = 1; $v = null;", "E0212"),
+        (
             "array_box",
             "function f(mixed $v): void {} f([1]);",
             "E0231",
@@ -2163,7 +2169,6 @@ fn unsupported_mixed_operations_are_rejected() {
             "class C { public mixed $value = [1]; }",
             "E0274",
         ),
-        ("null", "function f(): mixed { return null; }", "E0209"),
         (
             "builtin",
             "function f(mixed $v): int { return strlen($v); }",
@@ -2282,4 +2287,66 @@ fn mixed_narrowing_invalidates_assignments_and_joins() {
         assert_ne!(r.code, 0, "accepted unsound refinement: {name}");
         assert!(r.stderr.contains("E0274"), "{name}: {}", r.stderr);
     }
+}
+
+#[test]
+fn boxed_nulls_and_coalescing_match_php() {
+    assert_matches_php("boxed_nulls", include_str!("../../../examples/nulls.php"));
+    assert_matches_php(
+        "null_coalesce_evaluation",
+        r#"<?php
+class Holder { public mixed $value = null; public int $number = 1; }
+function receiver(Holder $h): Holder { echo "receiver|"; return $h; }
+function nextKey(): string { echo "key|"; return "x"; }
+function fallback(): mixed { echo "rhs|"; return 9; }
+$h = new Holder();
+receiver($h)->value ??= fallback();
+receiver($h)->value ??= fallback();
+receiver($h)->number ??= 5;
+echo "\n";
+$a = ["x" => null];
+$a[nextKey()] ??= fallback();
+$a[nextKey()] ??= fallback();
+echo "\n" . ($a[nextKey()] ?? fallback()) . "\n";
+$a["x"] = null;
+echo ($a[nextKey()] ?? fallback()) . "\n";
+echo (null ?? null ?? "last") . "\n";
+"#,
+    );
+}
+
+#[test]
+fn null_guards_preserve_sound_scalar_narrowing() {
+    assert_matches_php(
+        "null_guard_paths",
+        r#"<?php
+function booleanOnly(mixed $v): bool {
+    if (is_null($v) || is_int($v) || is_float($v) || is_string($v)) { return false; }
+    return $v;
+}
+function surviving(mixed $v): string {
+    if ($v === null) { return "null"; }
+    if (is_int($v)) { return "int:" . ($v + 1); }
+    if (is_float($v) || is_bool($v)) { return "other"; }
+    return strtoupper($v);
+}
+function inverse(mixed $v): string {
+    if (null !== $v && is_string($v)) { return strtoupper($v); }
+    return "other";
+}
+echo booleanOnly(null) . ":" . booleanOnly(true) . "\n";
+echo surviving(null) . ":" . surviving("hello") . ":" . surviving(3) . "\n";
+echo inverse(null) . ":" . inverse("yes") . "\n";
+"#,
+    );
+    let f = temp_php(
+        "null_prevents_false_exhaustiveness",
+        r#"function invalid(mixed $v): bool {
+            if (is_int($v) || is_float($v) || is_string($v)) { return false; }
+            return $v;
+        }"#,
+    );
+    let r = run_ok(&["check", f.to_str().unwrap()]);
+    assert_ne!(r.code, 0);
+    assert!(r.stderr.contains("E0215"), "{}", r.stderr);
 }
