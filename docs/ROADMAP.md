@@ -51,7 +51,7 @@ today     typed scalars, arrays, control flow, LLVM backend, tests, benchmarks
   ├─ M3  classes, namespaces, compile-time modules        ✅ done
   ├─ M4  mixed values, narrowing, PHP interop, report          ✅ done
   ├─ M5  generics, bounds, traits, return inference        ✅ done
-  ├─ M6  ownership & borrowing, no leaks                  🚧 in progress
+  ├─ M6  affine ownership, borrows, precise reclamation    ✅ done
   ├─ M7  async/await + structured tasks, then threads     (I/O + parallelism)
   ├─ M8  C interoperability (extern "C", FFI)             (systems access)
   └─ M9  package manager, LSP, cross-compile, JIT         (ecosystem)
@@ -67,7 +67,9 @@ trustworthy standard library (M2). The early milestones exist so the compiler is
 Async/await is planned for M7.1, followed by threaded parallelism in M7.2.
 The proposed PXR syntax is `async function`, `await`, and explicit `spawn`;
 [`ASYNC.md`](ASYNC.md) records the design and remaining decisions. M5 supplies
-typed task support, and M6 establishes ownership and task lifetimes. Structured
+generic types, and M6 supplies affine handles, call-borrow lifetimes, and precise
+heap reclamation. Resumable task frames still need their own root/lifetime
+lowering in M7. Structured
 error propagation and cancellation must be settled before implementation.
 The first executor uses one thread with nonblocking timers and socket I/O;
 ordinary blocking calls still block that thread.

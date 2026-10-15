@@ -61,10 +61,13 @@ mechanism and the ordering of simultaneous child failures remain design work.
 
 ## Dependencies and implementation order
 
-1. M1–M5, including generics and inference, are complete. Implement the
-   ownership/lifetime rules in M6 before beginning the async runtime.
-   General generics and ownership are project sequencing choices; basic async
-   execution alone does not inherently require a complete generics system.
+1. M1–M6 are complete, including generics, affine owned handles, call-scoped
+   borrows, and precise memory reclamation. M7 must extend synchronous stack
+   roots to resumable task frames and reject call borrows escaping into lazy or
+   spawned tasks. M6 does not yet supply async syntax, task types, cancellation,
+   or cross-thread transfer guarantees. General generics and ownership are
+   project sequencing choices; basic async execution alone does not inherently
+   require a complete generics system.
 2. Specify structured errors and resource cleanup, cancellation propagation,
    task consumption, and parent/child lifetimes. The existing compiler has no
    exception model; async must not silently invent incompatible failure rules.

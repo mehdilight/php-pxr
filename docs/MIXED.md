@@ -92,7 +92,7 @@ before guarding it. Most builtins retain concrete argument requirements.
 
 ## Boundaries
 
-Compiled code still excludes union/nullable annotations, resources, references,
+Compiled code still excludes union/nullable annotations, resources, PHP reference aliases,
 and arbitrary dynamic member names. Concrete types remain non-nullable. Read
 potentially missing mixed array keys through `??`; using a direct missing-key
 read as a mixed value fails rather than fabricating a box. Exceptions and broad
@@ -102,7 +102,9 @@ PHP object handles can be passed back to legacy functions, compared, or
 stringified; their methods/properties are accessed inside PHP helpers. Native
 objects cannot cross into PHP. See [interop rules](INTEROP.md).
 
-Boxes and copies use the process arena; ownership and reclamation remain M6.
+Boxes and copies use the tracked heap and precise live-root collection, including
+cyclic object graphs. Affine handles and call-scoped borrows are described in
+[`OWNERSHIP.md`](OWNERSHIP.md).
 Mixed programs that do not execute a PHP boundary run without PHP. See
 [`examples/containers.php`](../examples/containers.php),
 [`examples/nulls.php`](../examples/nulls.php), and

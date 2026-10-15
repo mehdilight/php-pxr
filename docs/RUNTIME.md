@@ -48,11 +48,35 @@ that use `exit`, including cyclic objects and PHP handle records. Cleanup is
 terminal: roots cannot be used afterward. Aborts, signals, and `_exit` do not run
 exit callbacks. Allocation failure continues to abort with `pxr: out of memory`.
 
-**Language-value lifetimes are still process-wide.** This foundation supplies
-internal buffer release and exit cleanup, not compile-time ownership or borrow
-checking. Repeated string/array construction can still grow memory during a
-long-running program. Compiler-inserted drops, moves, borrows, and safe handling
-of shared object graphs remain M6 work; see [`OWNERSHIP.md`](OWNERSHIP.md).
+**Language values are reclaimed during execution.** After IR optimization, the
+compiler computes precise CFG liveness and emits stack root frames at safepoints.
+Only live slots, temporary pointers, and pointer-valued integer payloads are
+published. Scalar functions proven to have no allocation-capable callees omit
+root machinery, and control flow before its first possible allocation omits
+polling; allocating paths retain safepoints. A caller protects arguments during its pre-call safepoint, then hands
+parameter retention to the callee. Return values remain protected until the
+caller resumes. Dead roots are removed across assignment and all control-flow
+exits. Explicit `drop` emits a forced collection call.
+
+The collector traces array keys/tagged entries, object names/properties, and
+mixed boxes. Class metadata and static storage are explicit global roots. An
+allocation index recognizes heap pointers without reading headers before static
+literals. An iterative worklist marks reachable graphs; sweep reclaims dead
+cycles and buffers. Ordinary collection starts at 1 MiB of payload allocation,
+then adapts to live data. These are internal thresholds, not memory limits.
+
+Native stringifier re-entry uses a guarded allocation snapshot for C runtime
+locals and a root for its returned string. Callback allocations remain
+collectible, and callback garbage is swept before another callback can retain
+it. The native PHP handle cache is weak. At collections the worker receives live
+object IDs and array lineage IDs, drops dead transfer roots, and runs its cycle
+collector. A received object/array schedules a native collection at the next
+safepoint to bound retention of large remote values behind small proxies.
+
+[`OWNERSHIP.md`](OWNERSHIP.md) describes the affine source contracts. These use
+existing pointer/value layouts; the generated program exposes no unsafe pointer
+operations. Shared object fields remain shared, so this is not a thread-transfer
+or deterministic resource-destruction guarantee.
 
 A string is a `pxr_str *`: `len` bytes of `data`, followed by a NUL terminator
 that is not part of the value. Embedded `\0` bytes are first‑class, matching PHP
@@ -291,8 +315,10 @@ before acknowledging it.
 The wire format is length-prefixed binary data with little-endian 64-bit
 integers/doubles, binary strings, ordered array keys, and object handle IDs.
 Arrays cross by value; retained array origins preserve PHP comparison behavior
-across round trips. Mutations acquire a new origin. PHP objects are retained in
-the worker with stable IDs.
+across round trips. Mutations acquire a new origin. PHP objects use stable IDs while their native handles remain live. The worker
+releases dead transfer-table entries during native collection; its own globals
+retain their normal PHP references. Request temporaries are cleared after each
+response, and new transfer IDs are monotonic rather than reused.
 Resources, references, callbacks, and native object transfers fail explicitly.
 Uncaught PHP exceptions become native fatal errors; PHP exit codes propagate.
 Shutdown closes the request stream and reaps the child process. See
@@ -309,5 +335,19 @@ allocation counters verify that cleanup returns the heap to zero blocks/bytes.
 For AddressSanitizer and UndefinedBehaviorSanitizer on a supported C toolchain:
 
 ```sh
-PXR_RUNTIME_SANITIZERS=1 cargo test -p pxr --test runtime_heap
+PXR_RUNTIME_SANITIZERS=1 cargo test -p pxr --test runtime_heap --test ownership
 ```
+
+`PXR_GC_STRESS=1` collects at every generated safepoint. `PXR_GC_STATS=1` prints
+collection count, peak payload bytes, and bytes remaining before terminal cleanup
+to stderr. These diagnostic environment switches are useful for lifecycle tests:
+
+```sh
+PXR_GC_STATS=1 pxr run examples/memory.php
+```
+
+The ownership acceptance suite runs optimized/unoptimized binaries, checks
+negative ownership programs before lowering, verifies bounded repeated
+allocation/cyclic garbage, tests stringifier re-entry, and checks PHP handle
+release without losing live identity. Sanitizer mode instruments both the real
+runtime and the generated native executable.

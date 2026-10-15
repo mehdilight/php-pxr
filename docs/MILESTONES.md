@@ -653,9 +653,9 @@ run end to end. See [`GENERICS.md`](GENERICS.md), [`TRAITS.md`](TRAITS.md), and
 [`INFERENCE.md`](INFERENCE.md). Explicit annotations remain necessary where
 inference cannot establish one valid result. Default/partial type arguments and
 constructor type-argument inference are further extensions, not M5 deliverables.
-**Next:** M6 — ownership and memory safety (in progress). Async remains M7 after M6.
+**M6 is delivered below.** Async remains the next milestone, M7.
 
-## 🚧 M6 — Ownership & memory safety
+## ✅ M6 — Ownership & memory safety
 
 * Owned values and borrows; no leaks, no use‑after‑free, provable at compile
   time; replace the bump arena.
@@ -676,16 +676,63 @@ constructor type-argument inference are further extensions, not M5 deliverables.
   overflow rejection, and normal/fatal exit cleanup; it can also run under
   AddressSanitizer and UndefinedBehaviorSanitizer.
 
-**Remaining.** Compiler-inserted per-value drops and reclamation during execution,
-affine moves, shared/exclusive borrows, lifetime/escape checks, shared-object
-cycle rules, and end-to-end ownership diagnostics/acceptance. Values still live
-until process exit; M6 is not complete. See [`OWNERSHIP.md`](OWNERSHIP.md).
+**Delivered (M6.2: affine bindings and call-scoped borrows).**
+
+* `owned<T>` local/parameter/result contracts, explicit `move($value)`, inferred
+  owned bindings from transfers, optional `drop($value)`, and reinitialization.
+  Use after move/drop, implicit sharing, and invalid control-flow availability
+  fail with `E0290`, including loop conditions/updates and continue edges.
+* `&T` and aggregate `&mut T` parameters with explicit `&$owner` / `&mut $owner`
+  arguments. Shared/exclusive loans cover nested argument evaluation, receiver
+  calls, reborrowing, mutation, and lifetime escape. Borrows cannot be stored or
+  returned as reference-valued handles. Borrowed aggregate bindings cannot be
+  rebound; mutation affects their object properties/array elements directly.
+* Modules, traits, generics, class ancestors, independent methods, interfaces,
+  and overrides preserve ownership modes. Fresh owned classes audit receiver
+  escapes from constructors/instance methods. Specialization receives a final
+  concrete representation check: borrowing cannot rebox/widen/copy array views.
+
+**Delivered (M6.3: live roots and reclamation during execution).**
+
+* Compiler-inserted stack root frames from backwards CFG liveness after
+  optimization. Live slots, SSA pointers, and packed pointer payloads survive
+  calls and return transfer. Dead roots disappear across assignment, early
+  returns, break/continue, and completion. Explicit drops request collection.
+* Allocation-free scalar functions omit root machinery; scalar loops before
+  their first possible allocation omit polling. Allocating paths retain precise
+  safepoints, with propagation across recursive native calls.
+* Precise iterative tracing of arrays, objects, mixed boxes, metadata, and
+  statics reclaims unreachable values and cycles. This preserves ordinary PHP
+  array-copy/object-identity behavior alongside explicit affine handles.
+* Native stringifier re-entry protects C runtime temporaries while collecting
+  callback garbage. Native and PHP transfer caches release dead roots while
+  preserving live object identity and array lineage. No PHP dependency is added
+  to native-only programs.
+
+**Acceptance achieved.** Eight native acceptance tests plus the runtime harness
+and focused liveness/representation units verify optimized/unoptimized ownership,
+rejected programs, modules/generics/virtual calls, array mutation through borrows,
+explicit release before exit, bounded allocation loops/cyclic garbage, deep graph
+tracing, callback re-entry, and PHP transfer cleanup. AddressSanitizer and
+UndefinedBehaviorSanitizer instrument the runtime and acceptance executables.
+The full suite has **149 native CLI tests, one C-runtime harness test, and 52 unit
+tests (202 total)**. All examples type-check; optimized ownership/memory examples
+run without PHP.
+
+**Scope.** Static owner availability and call-borrow lifetimes are checked before
+lowering; shared heap graphs use compiler roots and tracing rather than plain
+reference counting. Stored/named-lifetime references, owned fields/nested
+qualifiers, scalar variable aliases, native destructors, deterministic resource
+cleanup, and thread transfer are further extensions. Shared child object fields
+remain shared. These rejected forms are documented in [`OWNERSHIP.md`](OWNERSHIP.md);
+M6 does not claim full PHP reference support or `Send`/`Sync` guarantees.
+**Next:** M7.1 — async functions and structured tasks.
 
 ## ⛔ M7 — Async I/O & concurrency
 
-**Sequencing.** Implement after typed task support (M5) and ownership/lifetime
-rules (M6). Define structured error propagation and cancellation before starting
-the runtime implementation. Async is planned, not available in the compiler.
+**Sequencing.** M5 generics and M6 affine ownership/live-root reclamation are
+complete. Define structured error propagation, cancellation, and resumable task
+frame lifetimes before starting the async runtime implementation. Async is planned, not available in the compiler.
 See [`ASYNC.md`](ASYNC.md) for the proposed syntax and execution contract.
 
 ### ⛔ M7.1 — Async functions & structured tasks

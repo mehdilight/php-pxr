@@ -57,7 +57,7 @@ type_param := NAME (':' type ('&' type)*)?
 type_args := '<' type (',' type)* '>'
 params    := param (',' param)*
 param     := type VARIABLE
-type      := 'int' | 'float' | 'string' | 'bool' | 'void' | 'mixed' | 'array' '<' type '>' | NAME type_args?
+type      := 'owned' '<' type '>' | '&' 'mut'? type | 'int' | 'float' | 'string' | 'bool' | 'void' | 'mixed' | 'array' '<' type '>' | NAME type_args?
 block     := '{' stmt* '}'
 
 stmt      := 'echo' expr (',' expr)* ';'
@@ -332,6 +332,23 @@ Functions have a single flat scope (like PHP); there is no block scoping and no
 shadowing in milestone 0. A variable assigned inside an `if`/`while` body is
 visible afterwards.
 
+## Ownership and memory safety
+
+`owned<T>` locals/parameters/results are affine: initialize from a fresh value,
+transfer with `move($owner)`, and optionally discard with `drop($owner)`.
+`&T` and `&mut T` parameters accept explicit `&$owner` / `&mut $owner` call
+arguments. Borrowed bindings cannot be rebound or escape their call. Exclusive
+borrows permit array-element/object-property mutation and require an aggregate
+type. These extensions do not implement PHP variable references.
+
+The source checker rejects use after move/drop, copying into shared storage,
+conflicting call borrows, invalid branch/loop availability, and changed virtual
+ownership contracts with `E0290`. Ordinary arrays still copy and objects share
+identity. Precise compiler roots and tracing reclaim dead values and cycles
+during execution. See [`OWNERSHIP.md`](OWNERSHIP.md) for the full contract,
+examples, and rejected forms. Async, native destructors, and thread transfer
+remain separate features.
+
 ## Diagnostics reference
 
 Diagnostics carry a stable code. Lexical codes are `E000x`/`W000x`, parser
@@ -415,6 +432,7 @@ are `W020x`.
 | `E0284` | Ambiguous, unresolved, or nonconvergent return inference |
 | `E0285` | Invalid/conflicting/unsupported trait composition |
 | `E0286` | Invalid or unsatisfied generic bound |
+| `E0290` | Invalid ownership transfer, borrow/lifetime/representation contract, or unsupported native destructor |
 | `W0202` | `return` with a value at top level is ignored |
 
 ## Classes, Inheritance & Polymorphism

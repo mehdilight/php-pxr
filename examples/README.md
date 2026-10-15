@@ -41,6 +41,19 @@ php examples/quicksort.php
 pxr run examples/quicksort.php
 ```
 
+## Ownership and collection
+
+`ownership.php` demonstrates `owned<T>`, generic transfer, object/array borrows,
+and explicit drops. Its PXR extension syntax does not parse in PHP.
+`memory.php` uses ordinary shared objects to create and discard 10,000 cycles:
+
+```sh
+pxr run examples/ownership.php
+PXR_GC_STATS=1 pxr run examples/memory.php
+```
+
+See [`OWNERSHIP.md`](../docs/OWNERSHIP.md) for the static rules and supported scope.
+
 ## Seeing an error
 
 Compile-time diagnostics are the point. Try:

@@ -22,6 +22,7 @@ use std::collections::{HashMap, VecDeque};
 mod class_generics;
 mod constraints;
 mod generics;
+mod ownership;
 mod return_inference;
 mod traits;
 
@@ -256,6 +257,12 @@ pub enum Callee {
 pub enum TExpr {
     /// Internal inference placeholder; never reaches IR generation.
     Deferred,
+    /// Ownership-checked argument: transfer/borrow without PHP array copying.
+    Pass {
+        expr: Box<TExpr>,
+        borrowed: bool,
+        span: Span,
+    },
     Coerce {
         expr: Box<TExpr>,
         ty: Ty,
@@ -356,6 +363,7 @@ impl TExpr {
     pub fn ty(&self) -> Ty {
         match self {
             TExpr::Deferred => Ty::Infer,
+            TExpr::Pass { expr, .. } => expr.ty(),
             TExpr::Coerce { ty, .. } => ty.clone(),
             TExpr::Int(_) => Ty::Int,
             TExpr::Float(_) => Ty::Float,
@@ -871,7 +879,11 @@ pub fn analyze(program: &ast::Program) -> (Option<TProgram>, Diagnostics) {
     if diagnostics.has_errors() {
         return (None, diagnostics);
     }
-    let program = &expanded_traits;
+    let (owned_program, diagnostics) = ownership::check_and_erase(&expanded_traits);
+    if diagnostics.has_errors() {
+        return (None, diagnostics);
+    }
+    let program = &owned_program;
     let mut class_expander = class_generics::ClassExpander::new(program);
     for _ in 0..2048 {
         let expanded = class_expander.program(program);
@@ -900,7 +912,10 @@ pub fn analyze(program: &ast::Program) -> (Option<TProgram>, Diagnostics) {
             return (None, a.class_expander.diags);
         }
         if !a.class_expander.has_pending() {
-            return (result, a.diags);
+            if let Some(program) = &result {
+                ownership::check_representation(program, &mut a.diags);
+            }
+            return (if a.diags.has_errors() { None } else { result }, a.diags);
         }
         // A generic function can discover a class specialization through its
         // inferred type bindings. Recheck against the expanded declaration graph;
@@ -3590,6 +3605,26 @@ impl Analyzer {
                 span,
                 fallback,
             } => {
+                if callee == "$pxr_collect" {
+                    return Some(TExpr::Call {
+                        callee: Callee::User {
+                            mangled: "pxr_gc_collect".into(),
+                            name: "drop".into(),
+                            params: vec![],
+                        },
+                        ret: Ty::Void,
+                        args: vec![],
+                        arg_tys: vec![],
+                        span: *span,
+                    });
+                }
+                if (callee == "$pxr_pass" || callee == "$pxr_borrow_pass") && args.len() == 1 {
+                    return self.infer(&args[0], ctx).map(|e| TExpr::Pass {
+                        expr: Box::new(e),
+                        borrowed: callee == "$pxr_borrow_pass",
+                        span: *span,
+                    });
+                }
                 let name = if self.is_compiled_function(&callee.to_ascii_lowercase()) {
                     callee.as_str()
                 } else {

@@ -41,7 +41,7 @@ fn managed_heap_lifecycle_and_overflow() {
         "{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
-    for mode in ["normal", "capacity", "fatal", "format-fatal"] {
+    for mode in ["normal", "capacity", "fatal", "format-fatal", "collection"] {
         let out = Command::new(&executable).arg(mode).output().unwrap();
         let fatal = mode.ends_with("fatal");
         assert_eq!(

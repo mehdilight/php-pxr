@@ -78,8 +78,14 @@ and results; keep object mutation inside PHP. Exceptions escaping a call become
 native fatal errors; explicit PHP exit codes terminate the native program with
 that code. Native exception handling is a later language feature.
 
-The worker retains transferred array snapshots and object handles until exit;
-long-running workloads can grow memory, as can the native arena (M6).
+Native collection sends live object and array-lineage IDs to the worker. Dead
+transfer-table roots and request temporaries are released; PHP globals retain
+their own references. IDs are monotonic, preserving the identity of every live
+native handle. Collection also runs the worker's cycle collector. Large values
+behind small proxies schedule collection at the next native safepoint.
+PHP destructors may therefore run at collection safepoints; their timing is not
+claimed to match native PHP variable-scope timing. Native values use precise
+tracing rather than a process arena; see [`OWNERSHIP.md`](OWNERSHIP.md).
 
 The worker is an interpreter boundary with its own globals, locals, stdin,
 output-buffer context, and symbol table. Native variables and compiled functions

@@ -22,6 +22,11 @@ pub struct LlvmOptions {
 /// Runtime entry points and their C signatures.
 const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     ("abort", "void", &[]),
+    ("pxr_gc_enter", "void", &["ptr", "ptr"]),
+    ("pxr_gc_roots", "void", &["ptr", "i64"]),
+    ("pxr_gc_leave", "void", &["ptr"]),
+    ("pxr_gc_safepoint", "void", &[]),
+    ("pxr_gc_collect", "void", &[]),
     ("pxr_php_include", "void", &["ptr", "i64"]),
     ("pxr_php_call", "ptr", &["ptr", "ptr", "ptr"]),
     ("pxr_mixed_negate", "ptr", &["ptr"]),
@@ -220,17 +225,19 @@ pub fn emit_llvm(module: &Module, opts: &LlvmOptions) -> String {
     }
     out.push('\n');
 
+    let traced = crate::roots::traced_functions(module);
     for f in &module.functions {
-        emit_function(&mut out, f, &pool_idx);
+        emit_function(&mut out, f, &pool_idx, traced.contains(&f.name));
         out.push('\n');
     }
     out
 }
 
-fn emit_function(out: &mut String, f: &Function, pool: &HashMap<Vec<u8>, usize>) {
+fn emit_function(out: &mut String, f: &Function, pool: &HashMap<Vec<u8>, usize>, traced: bool) {
     let mut g = FnGen {
         f,
         pool,
+        traced,
         map: HashMap::new(),
         next: f.value_count(),
         is_entry: f.name == "main",
@@ -243,6 +250,7 @@ fn emit_function(out: &mut String, f: &Function, pool: &HashMap<Vec<u8>, usize>)
 struct FnGen<'a> {
     f: &'a Function,
     pool: &'a HashMap<Vec<u8>, usize>,
+    traced: bool,
     map: HashMap<Value, Ty>,
     next: Value,
     /// True for the synthesized program entry point, whose LLVM signature must
@@ -276,10 +284,23 @@ impl<'a> FnGen<'a> {
         // Block bookkeeping. LLVM requires every block to be terminated
         // explicitly before the next label, so when a block is still open we
         // emit an explicit branch to the label that follows it.
-        let mut block_open = false;
-        let mut terminated = true;
+        let roots = if self.traced {
+            crate::roots::live_roots(self.f)
+        } else {
+            vec![vec![]; self.f.body.len()]
+        };
+        let allocations = crate::roots::allocation_before(self.f);
+        let capacity = roots.iter().map(Vec::len).max().unwrap_or(0).max(1);
+        self.out.push_str("entry:\n");
+        if self.traced {
+            self.line("%gc.frame = alloca [3 x i64], align 8");
+            self.line(&format!("%gc.table = alloca [{capacity} x ptr], align 8"));
+            self.line("call void @pxr_gc_enter(ptr %gc.frame, ptr %gc.table)");
+        }
+        let mut block_open = true;
+        let mut terminated = false;
 
-        for inst in &self.f.body {
+        for (index, inst) in self.f.body.iter().enumerate() {
             if let Inst::Label(l) = inst {
                 if block_open && !terminated {
                     let _ = writeln!(self.out, "  br label %bb{l}");
@@ -293,6 +314,26 @@ impl<'a> FnGen<'a> {
                 let _ = writeln!(self.out, "entry:");
                 block_open = true;
                 terminated = false;
+            }
+            let control = matches!(inst, Inst::Branch { .. } | Inst::Jump(_) | Inst::Ret { .. });
+            if self.traced && crate::roots::safepoint(inst) && (!control || allocations[index]) {
+                self.spill_roots(&roots[index], true);
+                if let Inst::Call { dst, .. } = inst {
+                    // Arguments are rooted through the pre-call safepoint.
+                    // The callee publishes its own parameter roots before it
+                    // can collect, so dead transferred arguments must not be
+                    // retained by the caller for the whole callee lifetime.
+                    let after: Vec<_> = roots
+                        .get(index + 1)
+                        .into_iter()
+                        .flatten()
+                        .filter(
+                            |r| !matches!(r, crate::roots::Root::Value(v, _) if Some(*v) == *dst),
+                        )
+                        .copied()
+                        .collect();
+                    self.spill_roots(&after, false);
+                }
             }
             self.emit_inst(inst);
             if is_terminator(inst) {
@@ -308,6 +349,9 @@ impl<'a> FnGen<'a> {
                 "ret void"
             });
         } else if !terminated {
+            if self.traced {
+                self.line("call void @pxr_gc_leave(ptr %gc.frame)");
+            }
             self.line(if self.is_entry {
                 "ret i32 0"
             } else {
@@ -316,6 +360,36 @@ impl<'a> FnGen<'a> {
         }
 
         let _ = writeln!(self.out, "}}");
+    }
+
+    fn spill_roots(&mut self, roots: &[crate::roots::Root], collect: bool) {
+        for (i, root) in roots.iter().enumerate() {
+            let value = match root {
+                crate::roots::Root::Value(v, false) => *v,
+                crate::roots::Root::Value(v, true) => {
+                    let tmp = self.temp();
+                    self.line(&format!("%v{tmp} = inttoptr i64 %v{v} to ptr"));
+                    tmp
+                }
+                crate::roots::Root::Slot(s) => {
+                    let tmp = self.temp();
+                    self.line(&format!("%v{tmp} = load ptr, ptr %s{s}, align 8"));
+                    tmp
+                }
+            };
+            let address = self.temp();
+            self.line(&format!(
+                "%v{address} = getelementptr ptr, ptr %gc.table, i64 {i}"
+            ));
+            self.line(&format!("store ptr %v{value}, ptr %v{address}, align 8"));
+        }
+        self.line(&format!(
+            "call void @pxr_gc_roots(ptr %gc.frame, i64 {})",
+            roots.len()
+        ));
+        if collect {
+            self.line("call void @pxr_gc_safepoint()");
+        }
     }
 
     fn temp(&mut self) -> Value {
@@ -486,6 +560,9 @@ impl<'a> FnGen<'a> {
                 "br i1 %v{cond}, label %bb{then_label}, label %bb{else_label}"
             )),
             Inst::Ret { ty, src } => {
+                if self.traced {
+                    self.line("call void @pxr_gc_leave(ptr %gc.frame)");
+                }
                 if self.is_entry {
                     self.line("ret i32 0");
                 } else {

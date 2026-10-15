@@ -17,15 +17,15 @@ The same `main.php` can still run under PHP for comparison. Native programs link
 only the small PXR runtime; explicitly marked legacy boundaries use a PHP CLI
 worker when they execute.
 
-> **Project status: milestones 1–5 complete.**
+> **Project status: milestones 1–6 complete.**
 > M4 adds mixed scalar/null/array/object values, guard narrowing, dynamic
 > operators, runtime PHP include/call boundaries, and a migration report.
 > `examples/migration/main.php` runs a typed native entry point with untyped PHP.
 > M5 adds native specialization for generic functions, classes, interfaces, and
 > independent methods; nominal bounds, trait composition, and return inference.
-> M6 is in progress: tracked heap allocation and exit cleanup are implemented;
-> compile-time ownership and borrowing remain next. Async stays sequenced for M7.
-> See [`docs/GENERICS.md`](docs/GENERICS.md), [`docs/MILESTONES.md`](docs/MILESTONES.md),
+> M6 adds affine `owned<T>` handles, moves, call-scoped borrows, and precise
+> reclamation of dead values and cycles. Next is M7: async I/O and concurrency.
+> See [`docs/OWNERSHIP.md`](docs/OWNERSHIP.md), [`docs/GENERICS.md`](docs/GENERICS.md), [`docs/MILESTONES.md`](docs/MILESTONES.md),
 > [`docs/MIXED.md`](docs/MIXED.md), and [`docs/INTEROP.md`](docs/INTEROP.md).
 
 ---
@@ -156,15 +156,18 @@ and marked legacy files run in PHP. The boundary and differences are documented 
 ## Benchmarks
 
 `benchmarks/run.sh` builds each benchmark with `pxr build --opt 3` and compares
-against the PHP interpreter (best of N runs). On an Apple‑silicon laptop:
+against the PHP interpreter (best of N runs). M6 measurements on the reference
+Apple-silicon laptop (best of five, including process startup):
 
 | benchmark | PXR | PHP | speedup |
 | --- | ---: | ---: | ---: |
-| `fib.php` (naive recursive `fib(30)`) | ~7.5 ms | ~88 ms | ~12× |
-| `loop.php` (5M‑iteration integer loop) | ~2.4 ms | ~78 ms | ~33× |
+| `fib.php` (naive recursive `fib(30)`) | ~4.6 ms | ~88.8 ms | ~19.2× |
+| `loop.php` (5M‑iteration integer loop) | ~2.5 ms | ~76.4 ms | ~30.1× |
 
-These are illustrative, not a claim about all programs; re‑run them on your own
-machine with `./benchmarks/run.sh`.
+Memory-free scalar functions omit root frames; allocating functions retain
+collection safepoints. Scalar loops before the first possible allocation also
+omit polling. These are illustrative, not a claim about all programs; re-run them
+on your own machine with `./benchmarks/run.sh`.
 
 ## Architecture
 
@@ -202,7 +205,7 @@ Tracked honestly in [`docs/ROADMAP.md`](docs/ROADMAP.md). The larger items:
 keyed `foreach`, `echo` of arrays, nested array assignment, nullable
 annotations, overflow promotion for concrete `int` arithmetic, late static binding (`static::`),
 advanced trait adaptations and generic trait mixins,
-ownership & borrowing, the complex string‑interpolation forms (`"$a[0]"`,
+stored/named-lifetime borrows and owned fields, the complex string‑interpolation forms (`"$a[0]"`,
 `"{$expr}"`, `"${name}"`, `"$obj->p"`; the simple `"$name"` / `"{$name}"` work),
 native exceptions, C interop (`extern`), async/await and concurrency
 (planned for M7; see [`docs/ASYNC.md`](docs/ASYNC.md)), and broader PHP language/library coverage in compiled code.

@@ -9,7 +9,7 @@
  *   - Values are unboxed: int -> int64_t, float -> double, bool -> i1/_Bool,
  *     string -> `pxr_str *` (length-prefixed byte string; NUL- and binary-safe).
  *   - Runtime allocations use a tracked heap with deterministic exit cleanup.
- *     Compiler-inserted value drops and borrow checking remain M6 work.
+ *     Compiler liveness publishes precise roots; the collector reclaims cycles.
  *   - This file is embedded into the `pxr` binary at build time and compiled
  *     with the system C compiler on demand, then cached.
  */
@@ -31,12 +31,14 @@
 /* Private allocation headers never cross the generated-code ABI. A union
  * preserves malloc's alignment, including for zero-sized allocations. The heap
  * owns every block until explicit internal release or process shutdown. This
- * is the M6 foundation; it does not yet shorten language-value lifetimes. */
+ * is shared by explicit internal buffer release and precise tracing. */
 typedef union pxr_allocation pxr_allocation;
 union pxr_allocation {
     struct {
-        pxr_allocation *prev, *next;
+        pxr_allocation *prev, *next, *hash_next, *gray;
         size_t size;
+        unsigned kind, marked;
+        uint64_t serial;
     } h;
     max_align_t alignment;
 };
@@ -45,6 +47,29 @@ static pxr_allocation *pxr_heap_head = NULL;
 static size_t pxr_heap_blocks = 0;
 static size_t pxr_heap_bytes = 0;
 static int pxr_heap_initialized = 0;
+static pxr_allocation *pxr_heap_index[4096];
+enum { PXR_HEAP_RAW, PXR_HEAP_ARRAY, PXR_HEAP_OBJECT, PXR_HEAP_MIXED };
+static uint64_t pxr_heap_serial = 0;
+/* A C runtime operation may hold private temporaries when it calls native
+ * __toString. Protect its allocation snapshot, while allowing the callback's
+ * subsequent allocations to be collected through ordinary compiler roots. */
+typedef struct pxr_gc_guard {
+    struct pxr_gc_guard *previous;
+    uint64_t cutoff;
+    const void *result;
+} pxr_gc_guard;
+void pxr_gc_collect(void);
+static pxr_gc_guard *pxr_gc_guards = NULL;
+static int pxr_gc_external_pressure = 0;
+static size_t pxr_gc_collections = 0, pxr_heap_peak = 0;
+static size_t pxr_heap_bucket(const void *ptr) {
+    return ((uintptr_t)ptr >> 4) % 4096;
+}
+static pxr_allocation *pxr_heap_lookup(const void *ptr) {
+    for (pxr_allocation *b = pxr_heap_index[pxr_heap_bucket(ptr)]; b; b = b->h.hash_next)
+        if ((const void *)(b + 1) == ptr) return b;
+    return NULL; /* literals/null are outside the managed heap */
+}
 
 static void pxr_oom(void) {
     fputs("pxr: out of memory\n", stderr);
@@ -64,6 +89,9 @@ static size_t pxr_size_mul(size_t a, size_t b) {
 /* Terminal cleanup only: runtime roots must never be used after this call.
  * No graph traversal is needed, so cycles and shared object identity are safe. */
 static void pxr_heap_shutdown(void) {
+    if (getenv("PXR_GC_STATS"))
+        fprintf(stderr, "pxr-gc: collections=%zu peak_bytes=%zu remaining_bytes=%zu\n",
+            pxr_gc_collections, pxr_heap_peak, pxr_heap_bytes);
     while (pxr_heap_head) {
         pxr_allocation *next = pxr_heap_head->h.next;
         free(pxr_heap_head);
@@ -71,6 +99,7 @@ static void pxr_heap_shutdown(void) {
     }
     pxr_heap_blocks = 0;
     pxr_heap_bytes = 0;
+    memset(pxr_heap_index, 0, sizeof(pxr_heap_index));
 }
 
 static void *pxr_heap_alloc(size_t n) {
@@ -85,10 +114,19 @@ static void *pxr_heap_alloc(size_t n) {
     block->h.prev = NULL;
     block->h.next = pxr_heap_head;
     block->h.size = n;
+    block->h.kind = PXR_HEAP_RAW;
+    block->h.marked = 0;
+    if (pxr_heap_serial == UINT64_MAX) pxr_oom();
+    block->h.serial = ++pxr_heap_serial;
+    block->h.gray = NULL;
+    size_t bucket = pxr_heap_bucket(block + 1);
+    block->h.hash_next = pxr_heap_index[bucket];
+    pxr_heap_index[bucket] = block;
     if (pxr_heap_head) pxr_heap_head->h.prev = block;
     pxr_heap_head = block;
     pxr_heap_blocks++;
     pxr_heap_bytes = bytes;
+    if (bytes > pxr_heap_peak) pxr_heap_peak = bytes;
     return block + 1;
 }
 
@@ -100,6 +138,9 @@ static void pxr_heap_free(void *ptr) {
     if (block->h.prev) block->h.prev->h.next = block->h.next;
     else pxr_heap_head = block->h.next;
     if (block->h.next) block->h.next->h.prev = block->h.prev;
+    pxr_allocation **link = &pxr_heap_index[pxr_heap_bucket(ptr)];
+    while (*link != block) link = &(*link)->h.hash_next;
+    *link = block->h.hash_next;
     pxr_heap_blocks--;
     pxr_heap_bytes -= block->h.size;
     free(block);
@@ -688,6 +729,7 @@ static void pxr_array_grow(pxr_array *a, size_t at_least) {
 
 void *pxr_array_new(void) {
     pxr_array *a = (pxr_array *)pxr_heap_alloc(sizeof(pxr_array));
+    ((pxr_allocation *)a - 1)->h.kind = PXR_HEAP_ARRAY;
     a->ents = NULL;
     a->len = 0;
     a->cap = 0;
@@ -2128,6 +2170,7 @@ void *pxr_object_new(long long class_id, const pxr_str *name, long long num_prop
     if (num_props < 0) pxr_oom();
     size_t prop_bytes = pxr_size_mul(sizeof(int64_t), (size_t)num_props);
     pxr_object *obj = (pxr_object *)pxr_heap_alloc(sizeof(pxr_object));
+    ((pxr_allocation *)obj - 1)->h.kind = PXR_HEAP_OBJECT;
     obj->class_id = (int64_t)class_id;
     obj->remote_id = 0;
     obj->class_name = name;
@@ -2217,6 +2260,16 @@ void pxr_object_set_bits(void *p, long long prop_idx, long long tag, long long b
 /* Tagged mixed values: arrays copy by value; objects preserve identity. */
 typedef struct { int64_t tag; int64_t bits; } pxr_mixed;
 extern pxr_str *pxr_native_object_to_string(void *object);
+static pxr_str *pxr_invoke_stringifier(void *object) {
+    pxr_gc_guard guard = { pxr_gc_guards, pxr_heap_serial, NULL };
+    pxr_gc_guards = &guard;
+    pxr_str *text = pxr_native_object_to_string(object);
+    guard.result = text;
+    // Release callback garbage before another callback can snapshot it.
+    pxr_gc_collect();
+    pxr_gc_guards = guard.previous;
+    return text;
+}
 static pxr_str *pxr_php_stringify(const pxr_mixed *value);
 static void *pxr_php_binary(long long op, const pxr_mixed *left, const pxr_mixed *right);
 
@@ -2234,6 +2287,7 @@ void *pxr_array_to_mixed(void *p);
 void *pxr_mixed_box(long long tag, long long bits) {
     if (tag == PXR_TAG_ARR) bits = (int64_t)(intptr_t)pxr_array_to_mixed((void *)(intptr_t)bits);
     pxr_mixed *value = pxr_heap_alloc(sizeof(pxr_mixed));
+    ((pxr_allocation *)value - 1)->h.kind = PXR_HEAP_MIXED;
     value->tag = tag; value->bits = bits;
     return value;
 }
@@ -2335,7 +2389,7 @@ pxr_str *pxr_mixed_str(const void *p) {
     if (value->tag == PXR_TAG_OBJ) {
         pxr_object *object = (pxr_object *)(intptr_t)value->bits;
         if (object->remote_id) return pxr_php_stringify(value);
-        pxr_str *text = pxr_native_object_to_string(object);
+        pxr_str *text = pxr_invoke_stringifier(object);
         if (text) return text;
         fputs("Fatal error: Object could not be converted to string\n", stderr); exit(255);
     }
@@ -2474,7 +2528,7 @@ static int pxr_mixed_compare_depth(const pxr_mixed *left, const pxr_mixed *right
     if (lt == PXR_TAG_OBJ || rt == PXR_TAG_OBJ) {
         if (lt == PXR_TAG_STR || rt == PXR_TAG_STR) {
             const pxr_mixed *object = lt == PXR_TAG_OBJ ? left : right;
-            pxr_str *text = pxr_native_object_to_string((void *)(intptr_t)object->bits);
+            pxr_str *text = pxr_invoke_stringifier((void *)(intptr_t)object->bits);
             if (!text) return lt == PXR_TAG_OBJ ? 1 : -1;
             pxr_mixed string = { PXR_TAG_STR, (int64_t)(intptr_t)text };
             return lt == PXR_TAG_OBJ ? pxr_mixed_compare_depth(&string, right, depth + 1) : pxr_mixed_compare_depth(left, &string, depth + 1);
@@ -2743,6 +2797,7 @@ static void *pxr_php_receive_value(unsigned depth) {
         case PXR_TAG_BOOL: bits = pxr_php_read_byte() != 0; break;
         case PXR_TAG_STR: bits = (int64_t)(intptr_t)pxr_php_read_string(); break;
         case PXR_TAG_ARR: {
+            pxr_gc_external_pressure = 1;
             int64_t identity = (int64_t)pxr_php_read_u64();
             if (identity <= 0) pxr_php_fail("invalid PHP array handle");
             uint64_t count = pxr_php_read_u64();
@@ -2761,6 +2816,7 @@ static void *pxr_php_receive_value(unsigned depth) {
             break;
         }
         case PXR_TAG_OBJ: {
+            pxr_gc_external_pressure = 1;
             int64_t id = (int64_t)pxr_php_read_u64();
             pxr_str *name = pxr_php_read_string();
             pxr_php_handle *handle;
@@ -2778,6 +2834,7 @@ static void *pxr_php_receive_value(unsigned depth) {
     }
     // The array decoder already produced normalized boxes; avoid copying it.
     pxr_mixed *value = pxr_heap_alloc(sizeof(*value));
+    ((pxr_allocation *)value - 1)->h.kind = PXR_HEAP_MIXED;
     value->tag = tag; value->bits = bits;
     return value;
 }
@@ -2818,4 +2875,141 @@ static pxr_str *pxr_php_stringify(const pxr_mixed *value) {
     pxr_php_byte('S'); pxr_php_send_value(value, 0);
     const pxr_mixed *result = pxr_mixed_checked(pxr_php_response());
     return (pxr_str *)(intptr_t)result->bits;
+}
+
+/* ------------------------------------------------------- precise live roots
+ * Collection occurs only at compiler safepoints, never during a runtime
+ * operation. Stringifier callback guards protect C runtime temporaries.
+ * Frames and root tables live on the native stack and allocate no heap memory.
+ */
+typedef struct pxr_gc_frame {
+    struct pxr_gc_frame *previous;
+    void **roots;
+    size_t count;
+} pxr_gc_frame;
+static pxr_gc_frame *pxr_gc_frames = NULL;
+static size_t pxr_gc_limit = 1024 * 1024;
+void pxr_gc_enter(void *storage, void **roots) {
+    pxr_gc_frame *frame = storage;
+    frame->previous = pxr_gc_frames;
+    frame->roots = roots;
+    frame->count = 0;
+    pxr_gc_frames = frame;
+}
+void pxr_gc_roots(void *storage, size_t count) {
+    ((pxr_gc_frame *)storage)->count = count;
+}
+void pxr_gc_leave(void *storage) {
+    pxr_gc_frame *frame = storage;
+    if (pxr_gc_frames != frame) abort();
+    pxr_gc_frames = frame->previous;
+}
+
+static pxr_allocation *pxr_gc_gray = NULL;
+static void pxr_gc_mark(const void *ptr) {
+    pxr_allocation *block = pxr_heap_lookup(ptr);
+    if (!block || block->h.marked) return;
+    block->h.marked = 1;
+    block->h.gray = pxr_gc_gray;
+    pxr_gc_gray = block;
+}
+static void pxr_gc_mark_value(int64_t tag, int64_t bits) {
+    if (tag >= PXR_TAG_STR && tag <= PXR_TAG_MIXED)
+        pxr_gc_mark((void *)(intptr_t)bits);
+}
+void pxr_gc_collect(void) {
+    pxr_gc_external_pressure = 0;
+    pxr_gc_collections++;
+    if (pxr_gc_guards) {
+        for (pxr_gc_guard *g = pxr_gc_guards; g; g = g->previous) pxr_gc_mark(g->result);
+        for (pxr_allocation *b = pxr_heap_head; b; b = b->h.next)
+            if (b->h.serial <= pxr_gc_guards->cutoff) pxr_gc_mark(b + 1);
+    }
+    for (pxr_gc_frame *f = pxr_gc_frames; f; f = f->previous)
+        for (size_t i = 0; i < f->count; i++) pxr_gc_mark(f->roots[i]);
+    for (size_t i = 0; i < 256; i++) {
+        for (pxr_supertype *t = pxr_supertypes[i]; t; t = t->next) pxr_gc_mark(t);
+        for (pxr_static_class *c = pxr_static_classes[i]; c; c = c->next) {
+            pxr_gc_mark(c);
+            pxr_gc_mark(c->storage);
+        }
+    }
+    while (pxr_gc_gray) {
+        pxr_allocation *block = pxr_gc_gray;
+        pxr_gc_gray = block->h.gray;
+        void *ptr = block + 1;
+        switch (block->h.kind) {
+            case PXR_HEAP_ARRAY: {
+                pxr_array *a = ptr;
+                pxr_gc_mark(a->ents);
+                for (size_t i = 0; i < a->len; i++) {
+                    pxr_gc_mark(a->ents[i].ks);
+                    pxr_gc_mark_value(a->ents[i].vt, a->ents[i].bits);
+                }
+                break;
+            }
+            case PXR_HEAP_OBJECT: {
+                pxr_object *o = ptr;
+                pxr_gc_mark(o->class_name);
+                pxr_gc_mark(o->tags);
+                pxr_gc_mark(o->bits);
+                for (size_t i = 0; i < o->num_props; i++)
+                    pxr_gc_mark_value(o->tags[i], o->bits[i]);
+                break;
+            }
+            case PXR_HEAP_MIXED: {
+                pxr_mixed *v = ptr;
+                pxr_gc_mark_value(v->tag, v->bits);
+                break;
+            }
+        }
+    }
+    if (pxr_php_input) {
+        size_t objects = 0, arrays = 0;
+        for (pxr_php_handle *h = pxr_php_handles; h; h = h->next) {
+            pxr_allocation *b = pxr_heap_lookup(h->object);
+            if (b && b->h.marked) objects++;
+        }
+        for (pxr_allocation *b = pxr_heap_head; b; b = b->h.next)
+            if (b->h.marked && b->h.kind == PXR_HEAP_ARRAY) arrays++;
+        fflush(stdout);
+        pxr_php_byte('G'); pxr_php_u64(objects);
+        for (pxr_php_handle *h = pxr_php_handles; h; h = h->next) {
+            pxr_allocation *b = pxr_heap_lookup(h->object);
+            if (b && b->h.marked) pxr_php_u64((uint64_t)h->id);
+        }
+        pxr_php_u64(arrays);
+        for (pxr_allocation *b = pxr_heap_head; b; b = b->h.next)
+            if (b->h.marked && b->h.kind == PXR_HEAP_ARRAY)
+                pxr_php_u64((uint64_t)((pxr_array *)(b + 1))->identity);
+        (void)pxr_php_response(); /* null response is swept below */
+    }
+    /* Native handle cache is weak. The PHP worker retains its own values;
+     * a future transfer can recreate a native proxy with the same remote ID. */
+    pxr_php_handle **handle = &pxr_php_handles;
+    while (*handle) {
+        pxr_allocation *object = pxr_heap_lookup((*handle)->object);
+        if (object && object->h.marked) {
+            pxr_allocation *record = pxr_heap_lookup(*handle);
+            record->h.marked = 1; /* leaf cache record, links handled here */
+            handle = &(*handle)->next;
+        } else {
+            *handle = (*handle)->next;
+        }
+    }
+    pxr_allocation *block = pxr_heap_head;
+    while (block) {
+        pxr_allocation *next = block->h.next;
+        if (!block->h.marked) pxr_heap_free(block + 1);
+        else block->h.marked = 0;
+        block = next;
+    }
+    size_t baseline = 1024 * 1024;
+    pxr_gc_limit = pxr_heap_bytes > (SIZE_MAX - baseline) / 2
+        ? SIZE_MAX : pxr_heap_bytes * 2 + baseline;
+}
+void pxr_gc_safepoint(void) {
+    static int stress = -1;
+    if (stress < 0) stress = getenv("PXR_GC_STRESS") != NULL;
+    if (stress || pxr_gc_external_pressure || pxr_heap_bytes >= pxr_gc_limit) pxr_gc_collect();
 }

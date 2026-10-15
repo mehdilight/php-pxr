@@ -210,8 +210,8 @@ annotation. Ambiguous or ungrounded cycles fail with `E0284`; see
 [`INFERENCE.md`](INFERENCE.md) for joining rules and limits.
 
 Partial type-argument lists, default type arguments, and constructor type-argument inference
-remain unsupported. They produce diagnostics. Async remains planned for M7
-after the ownership work in M6.
+remain unsupported. They produce diagnostics. `owned<T>` and call-scoped borrows
+are delivered in M6; see [`OWNERSHIP.md`](OWNERSHIP.md). Async remains planned for M7.
 
 Run [`../examples/generics.php`](../examples/generics.php) with
 `pxr run examples/generics.php` for recursion, forwarding, nested arrays,

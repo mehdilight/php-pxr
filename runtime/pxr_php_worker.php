@@ -50,6 +50,7 @@ function readValue(array &$objects, array &$arrays, int $depth = 0): mixed {
     }
 }
 function writeValue(mixed $value, \SplObjectStorage $ids, array &$objects, array &$arrays, int $depth = 0): string {
+    global $__pxr_next_object, $__pxr_next_array;
     if ($depth > 128) { throw new \RuntimeException('cyclic or excessively nested interop value'); }
     if ($value === null) { return "\0"; }
     if (is_int($value)) { return "\1" . pack('P', $value); }
@@ -57,7 +58,7 @@ function writeValue(mixed $value, \SplObjectStorage $ids, array &$objects, array
     if (is_bool($value)) { return "\3" . ($value ? "\1" : "\0"); }
     if (is_string($value)) { return "\4" . writeString($value); }
     if (is_array($value)) {
-        $id = count($arrays) + 1;
+        $id = ++$__pxr_next_array;
         $arrays[$id] = $value;
         $result = "\5" . pack('P', $id) . pack('P', count($value));
         foreach ($value as $key => $item) {
@@ -71,7 +72,7 @@ function writeValue(mixed $value, \SplObjectStorage $ids, array &$objects, array
     }
     if (is_object($value)) {
         if (!$ids->contains($value)) {
-            $id = count($objects) + 1;
+            $id = ++$__pxr_next_object;
             $ids[$value] = $id;
             $objects[$id] = $value;
         }
@@ -92,9 +93,30 @@ $__pxr_out = fopen('php://fd/3', 'wb');
 $__pxr_ids = new \SplObjectStorage();
 $__pxr_objects = [];
 $__pxr_arrays = [];
+$__pxr_next_object = 0;
+$__pxr_next_array = 0;
 while (($__pxr_op = fread(STDIN, 1)) !== false && $__pxr_op !== '') {
     try {
-        if ($__pxr_op === 'I') {
+        if ($__pxr_op === 'G') {
+            // Native precise roots determine which transfer handles still need
+            // strong retention here. PHP globals keep their own references.
+            $__pxr_keep_objects = [];
+            for ($__pxr_i = readInt(); $__pxr_i > 0; $__pxr_i--) { $__pxr_keep_objects[readInt()] = true; }
+            $__pxr_keep_arrays = [];
+            for ($__pxr_i = readInt(); $__pxr_i > 0; $__pxr_i--) { $__pxr_keep_arrays[readInt()] = true; }
+            foreach ($__pxr_objects as $__pxr_id => $__pxr_object) {
+                if (!isset($__pxr_keep_objects[$__pxr_id])) {
+                    $__pxr_ids->detach($__pxr_object);
+                    unset($__pxr_objects[$__pxr_id]);
+                }
+            }
+            foreach ($__pxr_arrays as $__pxr_id => $__pxr_unused) {
+                if (!isset($__pxr_keep_arrays[$__pxr_id])) { unset($__pxr_arrays[$__pxr_id]); }
+            }
+            unset($__pxr_object, $__pxr_unused, $__pxr_keep_objects, $__pxr_keep_arrays);
+            gc_collect_cycles();
+            $__pxr_result = null;
+        } elseif ($__pxr_op === 'I') {
             $__pxr_mode = ord(readBytes(1));
             $__pxr_path = readString();
             // Execute includes in the worker's global scope, preserving their
@@ -147,4 +169,6 @@ while (($__pxr_op = fread(STDIN, 1)) !== false && $__pxr_op !== '') {
         $__pxr_offset += $__pxr_written;
     }
     fflush($__pxr_out);
+    // Request temporaries must not become accidental persistent roots.
+    unset($__pxr_result, $__pxr_args, $__pxr_left, $__pxr_right, $__pxr_error, $__pxr_response);
 }

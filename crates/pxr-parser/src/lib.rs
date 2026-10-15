@@ -916,7 +916,8 @@ impl Parser {
     fn is_type_start(&self) -> bool {
         matches!(
             self.peek().kind,
-            TokenKind::KwInt
+            TokenKind::Amp
+                | TokenKind::KwInt
                 | TokenKind::KwFloat
                 | TokenKind::KwString
                 | TokenKind::KwBool
@@ -952,6 +953,24 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<TypeRef, ()> {
+        if self.at(&TokenKind::Amp) {
+            let start = self.advance().span;
+            let mutable = matches!(&self.peek().kind, TokenKind::Ident(n) if n == "mut");
+            if mutable {
+                self.advance();
+            }
+            let inner = self.parse_type()?;
+            return Ok(TypeRef::Applied(
+                if mutable {
+                    "$pxr_borrow_mut"
+                } else {
+                    "$pxr_borrow"
+                }
+                .into(),
+                vec![inner],
+                start,
+            ));
+        }
         if matches!(
             self.peek().kind,
             TokenKind::Ident(_) | TokenKind::Backslash | TokenKind::Namespace
@@ -960,7 +979,11 @@ impl Parser {
             if self.type_params.contains(&name) || self.future_type_params.contains(&name) {
                 return Ok(TypeRef::Param(name, span));
             }
-            let name = self.resolve_name(&name, false).0;
+            let name = if name.eq_ignore_ascii_case("owned") {
+                "$pxr_owned".into()
+            } else {
+                self.resolve_name(&name, false).0
+            };
             let args = self.parse_type_arguments()?;
             return Ok(if args.is_empty() {
                 TypeRef::Named(name)
@@ -1472,6 +1495,28 @@ impl Parser {
     fn parse_unary(&mut self) -> Result<Expr, ()> {
         let start = self.peek().span;
         match self.peek().kind {
+            TokenKind::Amp => {
+                self.advance();
+                let mutable = matches!(&self.peek().kind, TokenKind::Ident(n) if n == "mut");
+                if mutable {
+                    self.advance();
+                }
+                let value = self.parse_unary()?;
+                let span = start.merge(value.span());
+                Ok(Expr::Call {
+                    fallback: None,
+                    callee: if mutable {
+                        "$pxr_borrow_mut"
+                    } else {
+                        "$pxr_borrow"
+                    }
+                    .into(),
+                    callee_span: start,
+                    type_args: vec![],
+                    args: vec![value],
+                    span,
+                })
+            }
             TokenKind::Minus => {
                 self.advance();
                 let e = self.parse_unary()?;
@@ -1742,7 +1787,12 @@ impl Parser {
                         }
                     }
                     let close = self.expect(&TokenKind::RParen, "`)` after arguments")?;
-                    let (callee, fallback) = self.resolve_name(&name, true);
+                    let (callee, fallback) =
+                        if name.eq_ignore_ascii_case("move") || name.eq_ignore_ascii_case("drop") {
+                            (format!("$pxr_{}", name.to_ascii_lowercase()), None)
+                        } else {
+                            self.resolve_name(&name, true)
+                        };
                     Ok(Expr::Call {
                         fallback,
                         callee,

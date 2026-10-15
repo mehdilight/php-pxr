@@ -284,7 +284,19 @@ impl Lowerer {
                 if vt != *ty {
                     v = self.cast(v, &vt, ty);
                 }
-                self.lower_store(target, ty.clone(), v);
+                if is_pass(value) {
+                    if let TTarget::Var { slot, .. } = target {
+                        self.emit(Inst::SlotSet {
+                            slot: *slot,
+                            src: v,
+                            ty: ty.clone(),
+                        });
+                    } else {
+                        self.lower_store(target, ty.clone(), v);
+                    }
+                } else {
+                    self.lower_store(target, ty.clone(), v);
+                }
             }
             TStmt::AssignOp {
                 target,
@@ -357,7 +369,11 @@ impl Lowerer {
                 let v = value.as_ref().map(|e| {
                     let value = self.lower_expr(e);
                     let value = self.cast(value, &e.ty(), ret);
-                    self.maybe_copy_array(value, ret)
+                    if is_pass(e) {
+                        value
+                    } else {
+                        self.maybe_copy_array(value, ret)
+                    }
                 });
                 self.terminator(Inst::Ret {
                     ty: ret.clone(),
@@ -454,6 +470,7 @@ impl Lowerer {
     fn lower_expr(&mut self, e: &TExpr) -> Value {
         match e {
             TExpr::Deferred => unreachable!("deferred inference cannot reach lowering"),
+            TExpr::Pass { expr, .. } => self.lower_expr(expr),
             TExpr::Coerce { expr, ty } => {
                 let v = self.lower_expr(expr);
                 self.cast(v, &expr.ty(), ty)
@@ -591,7 +608,11 @@ impl Lowerer {
                     let mut args = vec![obj];
                     for arg in ctor_args {
                         let value = self.lower_expr(arg);
-                        args.push(self.maybe_copy_array(value, &arg.ty()));
+                        args.push(if is_pass(arg) {
+                            value
+                        } else {
+                            self.maybe_copy_array(value, &arg.ty())
+                        });
                     }
                     self.emit(Inst::Call {
                         dst: None,
@@ -2071,7 +2092,11 @@ impl Lowerer {
                     // arrays (PHP passes arrays by value).
                     let want = params.get(i).cloned().unwrap_or_else(|| arg_tys[i].clone());
                     let v = self.cast(v, &arg_tys[i], &want);
-                    vals.push(self.maybe_copy_array(v, &want));
+                    vals.push(if is_pass(a) {
+                        v
+                    } else {
+                        self.maybe_copy_array(v, &want)
+                    });
                 }
                 if *ret == Ty::Void {
                     self.emit(Inst::Call {
@@ -2418,4 +2443,14 @@ fn cast_op(from: &Ty, to: &Ty) -> (CastOp, bool) {
         _ => return (IntToFloat, false),
     };
     (op, true)
+}
+
+// Constructors and some contextual calls wrap validated arguments in a coercion
+// even when their representation is unchanged. Preserve the ownership marker.
+fn is_pass(expr: &TExpr) -> bool {
+    match expr {
+        TExpr::Pass { .. } => true,
+        TExpr::Coerce { expr, .. } => is_pass(expr),
+        _ => false,
+    }
 }

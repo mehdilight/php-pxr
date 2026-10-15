@@ -87,7 +87,7 @@ behavioural divergence.
 | `number_format` | Not yet |
 | Traits, enums, closures | Not yet |
 | Runtime include/require | Supported for explicitly marked PHP files; see [interop](INTEROP.md) |
-| `global`, function-local `static`, references `&` | Available inside PHP boundaries; compiled syntax remains restricted |
+| `global`, function-local `static`, PHP reference aliases | Available inside PHP boundaries; compiled syntax remains restricted |
 | Exceptions, generators, attributes | Not yet |
 
 ### Notes
@@ -308,6 +308,24 @@ behavior. Class methods override traits; trait methods override inherited
 methods. Conflicts fail explicitly. Adaptations, abstract trait requirements,
 duplicate trait properties, and generic trait declarations are outside this
 subset. See [`TRAITS.md`](TRAITS.md).
+
+**Ownership (PXR extension).** `owned<T>` local/parameter/result bindings use
+explicit `move($value)` transfer and optional `drop($value)`. `&T` / `&mut T`
+parameters use explicit call-scoped borrow arguments. Shared borrow mutation,
+escaping/stored borrows, copying owners, conflicting loans, and use after
+move/drop fail with `E0290`. Mutable views apply to arrays/objects, not scalar
+variable aliases; borrowed bindings cannot be rebound. Owned fields, nested
+qualifiers, shared borrow method calls, and arbitrary PHP `&` references remain
+rejected. See [`OWNERSHIP.md`](OWNERSHIP.md).
+
+Existing array-copy/object-identity semantics remain intact. Native liveness and
+tracing reclaim dead values and cycles. The PHP worker releases unreachable
+transfer-table roots, so legacy destructor timing follows reachability and
+collection safepoints rather than native PHP variable-scope timing. Shared child
+objects keep their shared semantics; affine handles do not yet establish thread
+transfer safety. Native destructors and deterministic resource cleanup are not
+part of this memory-management milestone. Native `__destruct` declarations fail
+explicitly with `E0290`; PHP-boundary destructors remain PHP behavior.
 
 **Fail loud, never silent.** Features not yet implemented (such as
 keyed `foreach`, nested array assignment, complex interpolation forms)

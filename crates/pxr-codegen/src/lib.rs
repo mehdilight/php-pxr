@@ -9,6 +9,7 @@
 
 pub mod llvm;
 pub mod lower;
+mod roots;
 
 pub use llvm::{emit_llvm, LlvmOptions};
 pub use lower::lower_program;
