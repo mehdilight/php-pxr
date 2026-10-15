@@ -364,7 +364,29 @@ the word‑count block at the end of `examples/compat.php` does exactly this. �
   hierarchies, constructors, modifier order, and invalid declarations — 62 CLI
   tests total. Example: `examples/abstract.php`.
 
-**Next:** interfaces, then static members, namespaces, and module resolution.
+**Delivered (M3.4: interfaces & implementation contracts slice).**
+
+* `interface` declarations with public typed method signatures, multiple interface
+  inheritance (`extends A, B`), and class declarations with `implements A, B`.
+* Interface names share the class type namespace. Interface types work in
+  parameters, return annotations, and other named-type positions. Implementations
+  and inherited implementations must satisfy every contract, including constructor
+  signatures; abstract classes can defer implementation to concrete descendants.
+* Calls through interface types dispatch to concrete implementations, including
+  inherited interface methods and overrides in implementing subclasses.
+* `instanceof` recognizes directly implemented interfaces, extended interfaces,
+  and interfaces inherited through parent classes. Runtime registration stores
+  the complete supertype relation in arena-allocated hash buckets.
+* Invalid graph edges, duplicate supertypes, unknown interfaces, cycles, method
+  bodies/properties in interfaces, incompatible signatures, visibility violations,
+  and interface instantiation produce compile-time errors. Interface method
+  parameters are invariant in this initial subset; named return types may narrow.
+  Numeric widening remains an expression coercion and is rejected in overrides.
+* Four new CLI tests cover PHP output comparisons, interface dispatch, multiple
+  inheritance, constructors, covariance, unused interfaces, and rejection cases —
+  66 CLI tests total. Example: `examples/interfaces.php`.
+
+**Next:** static members, namespaces, and module resolution.
 
 ## ⛔ M4 — Gradual migration
 

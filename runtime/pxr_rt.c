@@ -1985,7 +1985,7 @@ long long pxr_printf(const pxr_str *fmt, void *args) {
 
 /*
  * ===========================================================================
- * Object runtime (M3.1, M3.2): instantiation, properties, inheritance, instanceof.
+ * Object runtime: instantiation, properties, class/interface membership.
  * ===========================================================================
  */
 
@@ -1997,12 +1997,21 @@ typedef struct {
     int64_t *bits;
 } pxr_object;
 
-static int64_t pxr_parent_table[4096];
+/* Compiler registers every transitive supertype, including interfaces. */
+typedef struct pxr_supertype {
+    int64_t class_id;
+    int64_t super_id;
+    struct pxr_supertype *next;
+} pxr_supertype;
+static pxr_supertype *pxr_supertypes[256];
 
-void pxr_class_register(long long class_id, long long parent_id) {
-    if (class_id >= 0 && class_id < 4096) {
-        pxr_parent_table[class_id] = (int64_t)parent_id;
-    }
+void pxr_class_register(long long class_id, long long super_id) {
+    size_t bucket = (uint64_t)class_id % 256;
+    pxr_supertype *entry = pxr_arena_alloc(sizeof(pxr_supertype));
+    entry->class_id = class_id;
+    entry->super_id = super_id;
+    entry->next = pxr_supertypes[bucket];
+    pxr_supertypes[bucket] = entry;
 }
 
 void *pxr_object_new(long long class_id, const pxr_str *name, long long num_props) {
@@ -2036,14 +2045,9 @@ long long pxr_instanceof(void *p, long long target_class_id) {
     }
     pxr_object *obj = (pxr_object *)p;
     int64_t cid = obj->class_id;
-    while (cid > 0) {
-        if (cid == (int64_t)target_class_id) {
-            return 1;
-        }
-        if (cid >= 4096) {
-            break;
-        }
-        cid = pxr_parent_table[cid];
+    if (cid == target_class_id) return 1;
+    for (pxr_supertype *entry = pxr_supertypes[(uint64_t)cid % 256]; entry; entry = entry->next) {
+        if (entry->class_id == cid && entry->super_id == target_class_id) return 1;
     }
     return 0;
 }

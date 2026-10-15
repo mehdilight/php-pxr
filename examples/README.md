@@ -14,6 +14,7 @@ Run any of these with `pxr run <file>`, or from a release build:
 | `objects.php` | Classes, properties, methods, constructors, visibility | ✅ |
 | `inheritance.php` | Inheritance, overriding, `parent::`, `instanceof` | ✅ |
 | `abstract.php` | Abstract classes, abstract methods, polymorphic dispatch | ✅ |
+| `interfaces.php` | Interface contracts, multiple interface inheritance, dispatch, `instanceof` | ✅ |
 
 `compat.php` and `quicksort.php` are compatibility proofs: they compile with
 `pxr` and run under `php`, and both produce the same bytes.

@@ -73,6 +73,12 @@ fn assert_matches_php(name: &str, src: &str) {
     let r = run_ok(&["run", f.to_str().unwrap()]);
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     let php = Command::new("php").arg(&f).output().unwrap();
+    assert!(
+        php.status.success(),
+        "PHP failed for `{name}`: {}{}",
+        String::from_utf8_lossy(&php.stdout),
+        String::from_utf8_lossy(&php.stderr)
+    );
     assert_eq!(
         r.stdout,
         String::from_utf8_lossy(&php.stdout),
@@ -1640,4 +1646,106 @@ $a = new Child(42);
 $a->show();
 "#,
     );
+}
+
+#[test]
+fn interfaces_dispatch_and_membership_match_php() {
+    if !have_cc() {
+        return;
+    }
+    let src = include_str!("../../../examples/interfaces.php");
+    let f = temp_php("interfaces", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "human:10\nnamed\nranked\nhuman:20\nnamed\nranked\nrobot:30\nnamed\nunranked\nhuman\n"
+    );
+    assert_matches_php("interfaces_php", src);
+}
+
+#[test]
+fn interface_inheritance_and_covariant_returns_match_php() {
+    assert_matches_php(
+        "interface_covariance",
+        r#"<?php
+class Animal {}
+class Dog extends Animal {}
+interface Factory { function make(): Animal; }
+interface DogFactory { function make(): Dog; }
+interface Combined extends Factory, DogFactory { function make(): Dog; }
+interface ChildFactory extends Combined {}
+interface OrderedFactory extends DogFactory, Factory {}
+class Maker implements ChildFactory { public function make(): Dog { return new Dog(); } }
+function create(ChildFactory $f): Animal { return $f->make(); }
+echo (create(new Maker()) instanceof Dog ? "dog" : "other") . "\n";
+interface Constructible { function __construct(int $n); function value(): int; }
+class Built implements Constructible {
+    private int $n;
+    public function __construct(int $n) { $this->n = $n; }
+    public function value(): int { return $this->n; }
+}
+function rebuild(Constructible $v): void { $v->__construct(7); echo $v->value() . "\n"; }
+rebuild(new Built(3));
+"#,
+    );
+}
+
+#[test]
+fn unused_interfaces_build() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "unused_interfaces",
+        r#"<?php
+interface ParentContract { function value(): string; }
+interface ChildContract extends ParentContract {}
+function unused(ChildContract $c): string { return $c->value(); }
+class ForwardImplementation implements ForwardContract { public function n(): int { return 1; } }
+interface ForwardContract { function n(): int; }
+interface Marker {}
+class Tagged implements Marker {}
+echo (new Tagged() instanceof Marker ? "yes" : "no") . "\n";
+"#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "yes\n");
+}
+
+#[test]
+fn invalid_interface_programs_are_rejected() {
+    let cases = [
+        ("missing", "interface I { function f(): int; } class A implements I {}", "E0269"),
+        ("unknown", "class A implements Unknown {}", "E0205"),
+        ("class_extends", "interface I {} class A extends I {}", "E0270"),
+        ("class_implements", "class A {} class B implements A {}", "E0270"),
+        ("interface_extends", "class A {} interface I extends A {}", "E0270"),
+        ("cycle", "interface I extends J {} interface J extends I {}", "E0201"),
+        ("self", "interface I extends I {}", "E0201"),
+        ("duplicate", "interface I {} class A implements I, i {}", "E0270"),
+        ("collision", "interface I {} class I {}", "E0201"),
+        ("private", "interface I { private function f(): int; }", "E0270"),
+        ("protected", "interface I { protected function f(): int; }", "E0270"),
+        ("visibility", "interface I { function f(): int; } class A implements I { protected function f(): int { return 1; } }", "E0265"),
+        ("signature", "interface I { function f(int $n): int; } class A implements I { public function f(string $n): int { return 1; } }", "E0208"),
+        ("conflict", "interface I { function f(): int; } interface J { function f(): string; } interface K extends I, J {}", "E0208"),
+        ("numeric_return", "interface I { function f(): float; } class A implements I { public function f(): int { return 1; } }", "E0208"),
+        ("inherited_covariance_order", "class A {} class B extends A {} interface I { function f(): A; } interface J { function f(): B; } interface K extends I, J {}", "E0208"),
+        ("abstract_covariance_order", "class A {} class B extends A {} interface I { function f(): A; } interface J { function f(): B; } abstract class K implements I, J {}", "E0208"),
+        ("inherited", "class A { public function f(): string { return \"a\"; } } interface I { function f(): int; } class B extends A implements I {}", "E0208"),
+        ("constructor", "interface I { function __construct(int $n); } class A implements I { public function __construct(string $n) {} }", "E0208"),
+        ("body", "interface I { function f(): int { return 1; } }", "E0100"),
+        ("property", "interface I { public int $x; }", "E0100"),
+        ("abstract_modifier", "interface I { abstract function f(): int; }", "E0100"),
+        ("instantiate", "interface I {} $a = new I();", "E0269"),
+        ("not_implemented", "interface I {} class A {} function f(I $i): void {} f(new A());", "E0231"),
+    ];
+    for (name, source, code) in cases {
+        let f = temp_php(&format!("interface_invalid_{name}"), source);
+        let r = run_ok(&["check", f.to_str().unwrap()]);
+        assert_ne!(r.code, 0, "accepted {name}");
+        assert!(r.stderr.contains(code), "{name}: {}", r.stderr);
+    }
 }

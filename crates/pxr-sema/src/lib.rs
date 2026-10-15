@@ -457,6 +457,8 @@ pub struct TProgram {
 
 #[derive(Clone, Debug)]
 pub struct ClassInfo {
+    pub is_interface: bool,
+    pub interfaces: Vec<String>,
     pub is_abstract: bool,
     pub class_id: u32,
     pub name: String,
@@ -576,16 +578,20 @@ pub fn analyze(program: &ast::Program) -> (Option<TProgram>, Diagnostics) {
 
 impl Analyzer {
     pub fn is_subclass_of(&self, child: &str, parent: &str) -> bool {
-        let mut curr = child.to_ascii_lowercase();
+        let mut pending = vec![child.to_ascii_lowercase()];
         let target = parent.to_ascii_lowercase();
-        while let Some(c) = self.classes.get(&curr) {
-            if let Some(p) = &c.parent {
-                if *p == target {
-                    return true;
+        let mut visited = std::collections::HashSet::new();
+        while let Some(key) = pending.pop() {
+            if !visited.insert(key.clone()) {
+                continue;
+            }
+            if let Some(c) = self.classes.get(&key) {
+                for ancestor in c.parent.iter().chain(c.interfaces.iter()) {
+                    if *ancestor == target {
+                        return true;
+                    }
+                    pending.push(ancestor.clone());
                 }
-                curr = p.clone();
-            } else {
-                break;
             }
         }
         false
@@ -601,6 +607,13 @@ impl Analyzer {
             (Ty::Named(child), Ty::Named(parent)) => self.is_subclass_of(child, parent),
             _ => false,
         }
+    }
+
+    // Numeric widening is an expression coercion, not signature covariance:
+    // dispatch must preserve the implementation's ABI.
+    fn compatible_return(&self, from: &Ty, to: &Ty) -> bool {
+        from == to
+            || matches!((from, to), (Ty::Named(_), Ty::Named(_))) && self.is_assignable(from, to)
     }
 
     fn check_member_visibility(
@@ -848,6 +861,9 @@ impl Analyzer {
 
     fn run(&mut self, program: &ast::Program) -> Option<TProgram> {
         self.collect_classes(program);
+        if self.diags.has_errors() {
+            return None;
+        }
         self.collect_signatures(program);
 
         let mut funcs = Vec::new();
@@ -868,8 +884,7 @@ impl Analyzer {
         for class_key in self.classes.keys().cloned().collect::<Vec<_>>() {
             let class = self.classes.get(&class_key).unwrap().clone();
             for method in class.methods.values() {
-                if method.declaring_class.eq_ignore_ascii_case(&class.name)
-                    && method.name != "__construct"
+                if (method.name != "__construct" || method.ast_method.is_abstract)
                     && self.method_has_overrides(&class.name, &method.name)
                 {
                     let disp_tf = self.synthesize_dispatcher(&class, method);
@@ -900,19 +915,16 @@ impl Analyzer {
             return None;
         }
 
-        let class_registrations: Vec<(u32, u32)> = self
-            .classes
-            .values()
-            .map(|c| {
-                let parent_id = c
-                    .parent
-                    .as_ref()
-                    .and_then(|p| self.classes.get(p))
-                    .map(|pc| pc.class_id)
-                    .unwrap_or(0);
-                (c.class_id, parent_id)
-            })
-            .collect();
+        // Register the transitive closure, including interface membership.
+        let mut class_registrations = Vec::new();
+        for class in self.classes.values() {
+            for ancestor in self.classes.values() {
+                if self.is_subclass_of(&class.name, &ancestor.name) {
+                    class_registrations.push((class.class_id, ancestor.class_id));
+                }
+            }
+        }
+        class_registrations.sort_unstable();
 
         Some(TProgram {
             funcs,
@@ -942,6 +954,12 @@ impl Analyzer {
             self.classes.insert(
                 key,
                 ClassInfo {
+                    is_interface: c.is_interface,
+                    interfaces: c
+                        .interfaces
+                        .iter()
+                        .map(|(n, _)| n.to_ascii_lowercase())
+                        .collect(),
                     is_abstract: c.is_abstract,
                     class_id,
                     name: c.name.clone(),
@@ -955,55 +973,60 @@ impl Analyzer {
             );
         }
 
-        // Step 2: validate parent class existence and check for inheritance cycles
+        // Validate the class/interface graph before resolving any members.
         for item in &program.items {
             let ast::Stmt::ClassDecl(c) = item else {
                 continue;
             };
-            if let Some(parent_name) = &c.extends {
-                let parent_key = parent_name.to_ascii_lowercase();
-                let parent_span = c.extends_span.unwrap_or(c.name_span);
-                if parent_key == c.name.to_ascii_lowercase() {
-                    self.diags.emit(
-                        Diagnostic::error(format!("class `{}` cannot extend itself", c.name))
-                            .with_code("E0201")
-                            .with_span(parent_span),
-                    );
-                    continue;
-                }
-                if !self.classes.contains_key(&parent_key) {
+            let mut seen = std::collections::HashSet::new();
+            let edges = c
+                .extends
+                .iter()
+                .map(|n| (n, c.extends_span.unwrap_or(c.name_span), false))
+                .chain(c.interfaces.iter().map(|(n, span)| (n, *span, true)));
+            for (name, span, want_interface) in edges {
+                let key = name.to_ascii_lowercase();
+                let Some(target) = self.classes.get(&key) else {
                     self.diags.emit(
                         Diagnostic::error(format!(
-                            "class `{}` extends unknown class `{parent_name}`",
-                            c.name
+                            "unknown {} `{name}`",
+                            if want_interface { "interface" } else { "class" }
                         ))
                         .with_code("E0205")
-                        .with_span(parent_span),
+                        .with_span(span),
                     );
                     continue;
+                };
+                if !seen.insert(key.clone()) {
+                    self.diags.emit(
+                        Diagnostic::error(format!("duplicate supertype `{name}`"))
+                            .with_code("E0270")
+                            .with_span(span),
+                    );
                 }
-                // Check cycle
-                let mut visited = std::collections::HashSet::new();
-                visited.insert(c.name.to_ascii_lowercase());
-                let mut curr_opt = Some(parent_key);
-                while let Some(curr) = curr_opt {
-                    if visited.contains(&curr) {
-                        self.diags.emit(
-                            Diagnostic::error(format!(
-                                "circular inheritance detected involving class `{}`",
-                                c.name
-                            ))
+                if target.is_interface != want_interface {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "`{name}` must be {} here",
+                            if want_interface {
+                                "an interface"
+                            } else {
+                                "a class"
+                            }
+                        ))
+                        .with_code("E0270")
+                        .with_span(span),
+                    );
+                }
+                if key == c.name.to_ascii_lowercase() || self.is_subclass_of(name, &c.name) {
+                    self.diags.emit(
+                        Diagnostic::error(format!("circular inheritance involving `{}`", c.name))
                             .with_code("E0201")
-                            .with_span(c.name_span),
-                        );
-                        break;
-                    }
-                    visited.insert(curr.clone());
-                    curr_opt = self.classes.get(&curr).and_then(|info| info.parent.clone());
+                            .with_span(span),
+                    );
                 }
             }
         }
-
         if self.diags.has_errors() {
             return;
         }
@@ -1022,7 +1045,7 @@ impl Analyzer {
             }
             visited.insert(key.to_string());
             if let Some(info) = classes.get(key) {
-                if let Some(parent) = &info.parent {
+                for parent in info.parent.iter().chain(info.interfaces.iter()) {
                     visit(parent, classes, visited, order);
                 }
             }
@@ -1162,6 +1185,13 @@ impl Analyzer {
                         }
                     }
                     ast::ClassMember::Method(m) => {
+                        if c.is_interface && m.visibility != ast::Visibility::Public {
+                            self.diags.emit(
+                                Diagnostic::error("interface methods must be public")
+                                    .with_code("E0270")
+                                    .with_span(m.name_span),
+                            );
+                        }
                         if m.is_abstract && m.visibility == ast::Visibility::Private {
                             self.diags.emit(
                                 Diagnostic::error("abstract methods cannot be private")
@@ -1301,7 +1331,9 @@ impl Analyzer {
                                         .with_span(m.name_span),
                                     );
                                 }
-                                if ret != existing.ret && !self.is_assignable(&ret, &existing.ret) {
+                                if ret != existing.ret
+                                    && !self.compatible_return(&ret, &existing.ret)
+                                {
                                     self.diags.emit(
                                         Diagnostic::error(format!(
                                             "return type `{ret}` in `{}::{}` must be compatible with `{}` in `{}::{}`",
@@ -1330,6 +1362,60 @@ impl Analyzer {
                             },
                         );
                     }
+                }
+            }
+
+            // Check every contract, including interfaces inherited by a parent class.
+            // This also validates overrides in descendants against those contracts.
+            // Resolve contracts in declaration order, with parent-class contracts
+            // first. This preserves PHP's method selection when abstract contracts
+            // with covariant return types are inherited from multiple interfaces.
+            let mut lineage = vec![class_key.clone()];
+            while let Some(parent) = self
+                .classes
+                .get(lineage.last().unwrap())
+                .and_then(|i| i.parent.clone())
+            {
+                lineage.push(parent);
+            }
+            lineage.reverse();
+            let contracts: Vec<_> = lineage
+                .iter()
+                .flat_map(|name| self.classes[name].interfaces.iter())
+                .filter_map(|name| self.classes.get(name))
+                .flat_map(|i| i.methods.iter().map(|(key, m)| (key.clone(), m.clone())))
+                .collect();
+            for (key, requirement) in contracts {
+                if let Some(implementation) = methods.get(&key) {
+                    if implementation.visibility != ast::Visibility::Public {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "implementation of `{}::{}` must be public",
+                                requirement.declaring_class, requirement.name
+                            ))
+                            .with_code("E0265")
+                            .with_span(implementation.name_span),
+                        );
+                    }
+                    // Parameter types are invariant in this initial typed subset.
+                    if implementation.params != requirement.params
+                        || (implementation.ret != requirement.ret
+                            && !self.compatible_return(&implementation.ret, &requirement.ret))
+                    {
+                        self.diags.emit(
+                            Diagnostic::error(format!(
+                                "method `{}::{}` is incompatible with interface `{}::{}`",
+                                c.name,
+                                implementation.name,
+                                requirement.declaring_class,
+                                requirement.name
+                            ))
+                            .with_code("E0208")
+                            .with_span(c.name_span),
+                        );
+                    }
+                } else {
+                    methods.insert(key, requirement);
                 }
             }
 

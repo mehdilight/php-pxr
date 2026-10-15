@@ -170,6 +170,9 @@ pub enum Visibility {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClassDecl {
+    pub is_interface: bool,
+    /// Implemented interfaces, or extended interfaces for an interface declaration.
+    pub interfaces: Vec<(String, Span)>,
     pub is_abstract: bool,
     pub name: String,
     pub name_span: Span,

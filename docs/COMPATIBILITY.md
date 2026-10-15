@@ -82,7 +82,7 @@ behavioural divergence.
 | Leading‑zero octal literal (`0755`) | **Warning** `W0001`, read as decimal |
 | Functions that return `string|false` / `int|false` (`strpos`, `strstr`, `base64_decode`, `hex2bin`, `substr_compare`, …) | Not yet — needs a union / `false` value type; only the never-failing encoders above are provided |
 | `number_format` | Not yet |
-| Interfaces, traits, enums, namespaces, closures | Not yet |
+| Traits, enums, namespaces, closures | Not yet |
 | `include`/`require`, `global`, `static`, references `&` | Not yet |
 | Exceptions, generators, attributes | Not yet |
 
@@ -226,7 +226,17 @@ abstract classes, private abstract methods, and `parent::` calls to abstract
 methods are compile-time errors (`E0269`). As with other PXR methods, parameter
 and return types are required (constructors may omit their return type).
 
-**Fail loud, never silent.** Features not yet implemented (such as interfaces,
+**Interfaces.** Interfaces support public typed method signatures, multiple
+interface inheritance, and multiple class implementation contracts. Calls through
+interface types and `instanceof` preserve interface membership inherited from
+parent classes and parent interfaces. Abstract classes may defer implementations;
+concrete classes must provide compatible public methods, including constructors.
+Parameters must have identical types in this initial subset (PHP permits broader
+contravariant overrides); named return types may narrow covariantly. Numeric
+`int` to `float` widening is not valid signature covariance. Constants, static
+interface methods, and interface property declarations are not implemented.
+
+**Fail loud, never silent.** Features not yet implemented (such as
 `null`, keyed `foreach`, nested array assignment, complex interpolation forms)
 produce a compile error with a specific code — never a silently different program.
 

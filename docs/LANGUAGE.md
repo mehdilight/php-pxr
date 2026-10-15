@@ -370,7 +370,8 @@ are `W020x`.
 | `E0265` | Cannot access private or protected member / narrowing visibility |
 | `E0267` | Cannot re-assign `$this` |
 | `E0268` | Cannot use `$this` outside object context / property type mismatch |
-| `E0269` | Invalid abstract declaration, missing implementation, abstract instantiation, or abstract parent call |
+| `E0269` | Invalid abstract declaration, missing implementation, abstract/interface instantiation, or abstract parent call |
+| `E0270` | Invalid class/interface inheritance edge, duplicate supertype, or non-public interface method |
 | `W0202` | `return` with a value at top level is ignored |
 
 ## Classes, Inheritance & Polymorphism
@@ -397,3 +398,16 @@ are `W020x`.
   Abstract methods have no body and cannot be private. Implementations obey the
   existing signature and visibility rules. Calling an abstract method through
   `parent::` is rejected; object calls use dynamic dispatch.
+
+* **Interfaces**: `interface Name [extends A, B] { public function f(Type $x): Ret; }`.
+  Methods are implicitly abstract and must be public; visibility may be omitted.
+  Bodies, explicit `abstract` modifiers, properties, constants, and static members
+  are not supported in this slice.
+* **Implementation**: `class Name [extends Parent] implements A, B { ... }`.
+  Concrete classes must implement all interface methods, including constructors;
+  inherited public methods can satisfy a contract. Abstract classes can defer
+  implementations. Parameter types are invariant; named return types may narrow
+  to a subtype. Multiple inherited method contracts must all be compatible.
+* Interface types can be used wherever named object types are accepted. Calls
+  through interface types dispatch to the concrete object's method. `instanceof`
+  includes interfaces inherited through classes and other interfaces.

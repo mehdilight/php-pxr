@@ -164,7 +164,7 @@ void  *pxr_array_copy(void *a);                /* deep copy (value semantics) */
 void      *pxr_object_new(long long class_id, const pxr_str *class_name, long long num_props);
 long long  pxr_object_get_bits(void *obj, long long prop_idx);
 void       pxr_object_set_bits(void *obj, long long prop_idx, long long tag, long long bits);
-void       pxr_class_register(long long class_id, long long parent_id);
+void       pxr_class_register(long long class_id, long long super_id);
 long long  pxr_object_get_class_id(void *obj);
 long long  pxr_instanceof(void *obj, long long target_class_id);
 ```
@@ -191,12 +191,17 @@ Property reads and writes operate on 64‑bit payloads and type tags via
 encoding/decoding machinery as array elements. Null object dereferencing aborts
 with a PHP-faithful fatal error.
 
-Inheritance relationships are registered at startup via `pxr_class_register(class_id, parent_id)`.
+The compiler computes the transitive supertype relation, including all parent
+classes and interfaces. Each pair is registered at startup via
+`pxr_class_register(class_id, super_id)` into arena-allocated hash buckets keyed
+by the concrete class ID. Empty roots require no registration.
 Method dispatch lowered directly to concrete symbols `pxr$m$<class>$<method>` when
 no overrides exist, and to jump-table dispatchers `pxr$disp$<root>$<method>` checking
 `pxr_object_get_class_id` when dynamic overrides exist in the class hierarchy.
-The `instanceof` operator calls `pxr_instanceof(obj, target_class_id)` traversing the
-runtime parent table.
+The `instanceof` operator calls `pxr_instanceof(obj, target_class_id)`, checking
+identity first and then the registered supertype pairs. The same lookup handles
+class inheritance, multiple interface inheritance, and inherited implementation
+contracts. Calls through interface types use the same dispatcher mechanism.
 
 Array values cross the ABI as a **type tag plus a 64‑bit payload**: `int` is the
 value itself, `bool` is zero‑extended, `float` is its IEEE‑754 bits

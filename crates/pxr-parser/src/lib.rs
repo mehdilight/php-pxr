@@ -189,7 +189,7 @@ impl Parser {
                 Ok(Some(Stmt::Print(e, start.merge(semi.span))))
             }
             TokenKind::Function => self.parse_fn().map(|f| Some(Stmt::FnDecl(Box::new(f)))),
-            TokenKind::Class | TokenKind::Abstract => self
+            TokenKind::Class | TokenKind::Abstract | TokenKind::Interface => self
                 .parse_class()
                 .map(|c| Some(Stmt::ClassDecl(Box::new(c)))),
             TokenKind::Return => {
@@ -370,8 +370,16 @@ impl Parser {
 
     fn parse_class(&mut self) -> Result<ClassDecl, ()> {
         let start = self.peek().span;
-        let is_abstract = self.eat(&TokenKind::Abstract);
-        self.expect(&TokenKind::Class, "`class` after `abstract`")?;
+        let explicit_abstract = self.eat(&TokenKind::Abstract);
+        let is_interface = self.eat(&TokenKind::Interface);
+        if is_interface && explicit_abstract {
+            self.error(start, "interfaces cannot have an `abstract` modifier");
+            return Err(());
+        }
+        let is_abstract = explicit_abstract || is_interface;
+        if !is_interface {
+            self.expect(&TokenKind::Class, "`class` after `abstract`")?;
+        }
         let name_tok = self.expect_ident("class name")?;
         let name = match name_tok.kind {
             TokenKind::Ident(n) => n,
@@ -380,7 +388,12 @@ impl Parser {
         let name_span = name_tok.span;
         let mut extends = None;
         let mut extends_span = None;
-        if self.eat(&TokenKind::Extends) {
+        let mut interfaces = Vec::new();
+        if is_interface {
+            if self.eat(&TokenKind::Extends) {
+                interfaces = self.parse_interface_names()?;
+            }
+        } else if self.eat(&TokenKind::Extends) {
             let parent_tok = self.expect_ident("parent class name after `extends`")?;
             let parent_name = match parent_tok.kind {
                 TokenKind::Ident(n) => n,
@@ -389,11 +402,14 @@ impl Parser {
             extends = Some(parent_name);
             extends_span = Some(parent_tok.span);
         }
+        if !is_interface && self.eat(&TokenKind::Implements) {
+            interfaces = self.parse_interface_names()?;
+        }
         self.expect(&TokenKind::LBrace, "`{` after class header")?;
         let mut members = Vec::new();
         while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
             let before = self.pos;
-            match self.parse_class_member() {
+            match self.parse_class_member(is_interface) {
                 Ok(m) => members.push(m),
                 Err(()) => self.recover(),
             }
@@ -403,6 +419,8 @@ impl Parser {
         }
         let close = self.expect(&TokenKind::RBrace, "`}` after class body")?;
         Ok(ClassDecl {
+            is_interface,
+            interfaces,
             is_abstract,
             name,
             name_span,
@@ -413,7 +431,21 @@ impl Parser {
         })
     }
 
-    fn parse_class_member(&mut self) -> Result<ClassMember, ()> {
+    fn parse_interface_names(&mut self) -> Result<Vec<(String, Span)>, ()> {
+        let mut names = Vec::new();
+        loop {
+            let token = self.expect_ident("interface name")?;
+            if let TokenKind::Ident(name) = token.kind {
+                names.push((name, token.span));
+            }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(names)
+    }
+
+    fn parse_class_member(&mut self, is_interface: bool) -> Result<ClassMember, ()> {
         let start = self.peek().span;
         let mut is_abstract = self.eat(&TokenKind::Abstract);
         let (vis, has_vis) = match self.peek().kind {
@@ -439,13 +471,20 @@ impl Parser {
             }
             is_abstract = true;
         }
+        if is_interface && is_abstract {
+            self.error(start, "interface methods are implicitly abstract");
+            return Err(());
+        }
         if self.at(&TokenKind::Function) {
-            let m = self.parse_method(start, vis, is_abstract)?;
+            let m = self.parse_method(start, vis, is_abstract || is_interface)?;
             return Ok(ClassMember::Method(m));
         }
 
-        if is_abstract {
-            self.error(start, "`abstract` applies only to methods");
+        if is_abstract || is_interface {
+            self.error(
+                start,
+                "expected an interface method signature or class method",
+            );
             return Err(());
         }
         if !has_vis {

@@ -47,10 +47,10 @@ fn lower_main(tf: &TFunc, class_registrations: &[(u32, u32)]) -> Function {
         });
     }
 
-    for (cid, pid) in class_registrations {
+    for (cid, super_id) in class_registrations {
         let cid_val = lw.emit_const(Literal::Int(*cid as i64));
-        let pid_val = lw.emit_const(Literal::Int(*pid as i64));
-        lw.rt_call("pxr_class_register", vec![cid_val, pid_val], Ty::Void);
+        let super_val = lw.emit_const(Literal::Int(*super_id as i64));
+        lw.rt_call("pxr_class_register", vec![cid_val, super_val], Ty::Void);
     }
 
     lw.lower_stmts(&tf.body);
