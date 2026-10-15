@@ -17,15 +17,12 @@ The same `main.php` can still be run by the traditional interpreter for
 comparison; PXR programs themselves run **without PHP**, linking only the small
 PXR runtime.
 
-> **Project status: milestone 2 complete — strings & standard library.** On top of the
-> milestone‑1 breadth (arrays, control flow, operators), PXR now has **owned
-> NUL‑safe byte strings** (`pxr_str`), simple double‑quoted string interpolation
-> (`"$name"` / `"{$name}"`), formatted printing (`sprintf` / `printf`), and an
-> extensive suite of byte‑exact standard‑library builtins (strings, encoding,
-> array transforms). The *language surface* is still deliberately small and grows
-> by documented milestones. Nothing below is claimed unless it is implemented
-> and covered by tests; see [`docs/MILESTONES.md`](docs/MILESTONES.md) and the
-> "Not implemented yet" section.
+> **Project status: milestone 3 in progress — user types & modules.**
+> Milestones 1 and 2 are complete (control flow, arrays, byte strings, and
+> standard-library builtins). M3 now supports classes, typed properties,
+> constructors, visibility, inheritance, polymorphic method dispatch, `parent::`,
+> `instanceof`, and abstract classes and methods. Interfaces, static members,
+> namespaces, and modules remain planned. See [`docs/MILESTONES.md`](docs/MILESTONES.md).
 
 ---
 
@@ -111,6 +108,9 @@ migration path possible.
 * **Control flow** — `if`/`elseif`/`else`, `while`, `do…while`, `for`,
   `foreach`, `switch`, `match`, `break`/`continue` (with levels), blocks,
   `return`, `echo`/`print`, short‑circuit `&&`/`||`.
+* **Objects** — classes, typed properties, methods, constructors, visibility,
+  single inheritance, dynamic dispatch, `parent::`, `instanceof`, and abstract
+  classes and methods.
 * **Data** — homogeneous `array<T>` values (PHP ordered‑map semantics) with
   `[...]`/`array(...)` literals, indexing, append, `count`, and `foreach`.
 * **Operators** — ternary `? :`, null coalescing `??`, spaceship `<=>`,
@@ -184,7 +184,8 @@ automatically when no C compiler is available.
 
 Tracked honestly in [`docs/ROADMAP.md`](docs/ROADMAP.md). The larger items:
 keyed `foreach`, `echo` of arrays, nested array assignment, `null`/nullable
-types, integer‑overflow → `float` promotion, classes/objects, generics,
+types, integer‑overflow → `float` promotion, interfaces, static members,
+namespaces, generics,
 ownership & borrowing, the complex string‑interpolation forms (`"$a[0]"`,
 `"{$expr}"`, `"${name}"`, `"$obj->p"`; the simple `"$name"` / `"{$name}"` work),
 exceptions, modules/`include`, C interop (`extern`), concurrency, and the

@@ -1560,3 +1560,84 @@ if ($x instanceof TargetCls) { echo "bad"; }
     assert!(r5.stderr.contains("E0260") || r5.stdout.contains("E0260"));
 }
 
+#[test]
+fn abstract_classes_and_dispatch_match_php() {
+    let src = include_str!("../../../examples/abstract.php");
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php("abstract_classes", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "square\narea=16\nshape\narea=1\nshape\narea=3.14\nshape\n"
+    );
+    assert_matches_php("abstract_classes_php", src);
+}
+
+#[test]
+fn abstract_declarations_without_concrete_descendants_build() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "abstract_unused",
+        r#"<?php
+abstract class Root {
+    abstract public function value(): string;
+    public function describe(): string { return $this->value(); }
+}
+abstract class Child extends Root { abstract public function value(): string; }
+echo "ok\n";
+"#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "ok\n");
+}
+
+#[test]
+fn abstract_class_diagnostics_are_rejected() {
+    let cases = [
+        ("instantiate", "abstract class A {} $a = new A();", "E0269"),
+        ("missing", "abstract class A { abstract public function f(): int; } class B extends A {}", "E0269"),
+        ("not_abstract", "class A { abstract public function f(): int; }", "E0269"),
+        ("private", "abstract class A { abstract private function f(): int; }", "E0269"),
+        ("parent", "abstract class A { abstract public function f(): int; } class B extends A { public function f(): int { return parent::f(); } }", "E0269"),
+        ("concrete_parent", "class A { public function f(): int { return 1; } } abstract class B extends A { abstract public function f(): int; }", "E0269"),
+        ("signature", "abstract class A { abstract public function f(int $n): int; } class B extends A { public function f(string $n): int { return 1; } }", "E0208"),
+        ("visibility", "abstract class A { abstract public function f(): int; } class B extends A { protected function f(): int { return 1; } }", "E0265"),
+        ("body", "abstract class A { abstract public function f(): int { return 1; } }", "E0100"),
+        ("property", "abstract class A { abstract public int $x; }", "E0100"),
+        ("constructor", "abstract class A { abstract public function __construct(int $n); } class B extends A { public function __construct(string $n) {} }", "E0208"),
+    ];
+    for (name, src, code) in cases {
+        let f = temp_php(&format!("abstract_{name}"), src);
+        let r = run_ok(&["check", f.to_str().unwrap()]);
+        assert_ne!(r.code, 0, "accepted {name}");
+        assert!(r.stderr.contains(code), "{name}: {}", r.stderr);
+    }
+}
+
+#[test]
+fn abstract_constructors_and_modifier_order_match_php() {
+    assert_matches_php(
+        "abstract_constructors",
+        r#"<?php
+AbStRaCt class Base {
+    public abstract function __construct(int $value);
+    protected abstract function value(): int;
+    public function show(): void { echo $this->value() . "\n"; }
+}
+class Concrete extends Base {
+    private int $n;
+    public function __construct(int $value) { $this->n = $value; }
+    protected function value(): int { return $this->n; }
+}
+class Child extends Concrete {}
+$a = new Child(42);
+$a->show();
+"#,
+    );
+}

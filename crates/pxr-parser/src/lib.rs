@@ -189,7 +189,7 @@ impl Parser {
                 Ok(Some(Stmt::Print(e, start.merge(semi.span))))
             }
             TokenKind::Function => self.parse_fn().map(|f| Some(Stmt::FnDecl(Box::new(f)))),
-            TokenKind::Class => self
+            TokenKind::Class | TokenKind::Abstract => self
                 .parse_class()
                 .map(|c| Some(Stmt::ClassDecl(Box::new(c)))),
             TokenKind::Return => {
@@ -369,7 +369,9 @@ impl Parser {
     }
 
     fn parse_class(&mut self) -> Result<ClassDecl, ()> {
-        let start = self.advance().span; // `class`
+        let start = self.peek().span;
+        let is_abstract = self.eat(&TokenKind::Abstract);
+        self.expect(&TokenKind::Class, "`class` after `abstract`")?;
         let name_tok = self.expect_ident("class name")?;
         let name = match name_tok.kind {
             TokenKind::Ident(n) => n,
@@ -401,6 +403,7 @@ impl Parser {
         }
         let close = self.expect(&TokenKind::RBrace, "`}` after class body")?;
         Ok(ClassDecl {
+            is_abstract,
             name,
             name_span,
             extends,
@@ -412,6 +415,7 @@ impl Parser {
 
     fn parse_class_member(&mut self) -> Result<ClassMember, ()> {
         let start = self.peek().span;
+        let mut is_abstract = self.eat(&TokenKind::Abstract);
         let (vis, has_vis) = match self.peek().kind {
             TokenKind::Public => {
                 self.advance();
@@ -428,11 +432,22 @@ impl Parser {
             _ => (Visibility::Public, false),
         };
 
+        if self.eat(&TokenKind::Abstract) {
+            if is_abstract {
+                self.error(start, "duplicate `abstract` modifier");
+                return Err(());
+            }
+            is_abstract = true;
+        }
         if self.at(&TokenKind::Function) {
-            let m = self.parse_method(start, vis)?;
+            let m = self.parse_method(start, vis, is_abstract)?;
             return Ok(ClassMember::Method(m));
         }
 
+        if is_abstract {
+            self.error(start, "`abstract` applies only to methods");
+            return Err(());
+        }
         if !has_vis {
             let span = self.peek().span;
             self.error(
@@ -474,7 +489,12 @@ impl Parser {
         }))
     }
 
-    fn parse_method(&mut self, start: Span, visibility: Visibility) -> Result<MethodDecl, ()> {
+    fn parse_method(
+        &mut self,
+        start: Span,
+        visibility: Visibility,
+        is_abstract: bool,
+    ) -> Result<MethodDecl, ()> {
         self.expect(&TokenKind::Function, "`function`")?;
         let name_tok = self.expect_ident("method name")?;
         let name = match name_tok.kind {
@@ -517,9 +537,15 @@ impl Parser {
             None
         };
 
-        let body = self.parse_block()?;
+        let body = if is_abstract {
+            self.expect(&TokenKind::Semicolon, "`;` after abstract method signature")?;
+            Vec::new()
+        } else {
+            self.parse_block()?
+        };
         let end = self.peek().span;
         Ok(MethodDecl {
+            is_abstract,
             visibility,
             name,
             name_span,

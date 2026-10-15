@@ -170,6 +170,7 @@ pub enum Visibility {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClassDecl {
+    pub is_abstract: bool,
     pub name: String,
     pub name_span: Span,
     pub extends: Option<String>,
@@ -196,6 +197,7 @@ pub struct PropertyDecl {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MethodDecl {
+    pub is_abstract: bool,
     pub visibility: Visibility,
     pub name: String,
     pub name_span: Span,

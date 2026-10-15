@@ -82,7 +82,7 @@ behavioural divergence.
 | Leading‑zero octal literal (`0755`) | **Warning** `W0001`, read as decimal |
 | Functions that return `string|false` / `int|false` (`strpos`, `strstr`, `base64_decode`, `hex2bin`, `substr_compare`, …) | Not yet — needs a union / `false` value type; only the never-failing encoders above are provided |
 | `number_format` | Not yet |
-| Class inheritance (`extends`), interfaces, traits, enums, namespaces, closures | Not yet |
+| Interfaces, traits, enums, namespaces, closures | Not yet |
 | `include`/`require`, `global`, `static`, references `&` | Not yet |
 | Exceptions, generators, attributes | Not yet |
 
@@ -219,8 +219,15 @@ overriding, `parent::__construct` / `parent::method`, member visibility (`public
 output fidelity to PHP 8.4. Polymorphic method calls dynamically dispatch to subclass
 overrides via runtime class tags.
 
+**Abstract classes and methods.** Abstract classes can contain concrete methods,
+typed properties, and abstract signatures. Concrete descendants must implement
+all abstract methods with compatible signatures and visibility. Instantiation of
+abstract classes, private abstract methods, and `parent::` calls to abstract
+methods are compile-time errors (`E0269`). As with other PXR methods, parameter
+and return types are required (constructors may omit their return type).
+
 **Fail loud, never silent.** Features not yet implemented (such as interfaces,
-abstract classes, `null`, keyed `foreach`, nested array assignment, complex interpolation forms)
+`null`, keyed `foreach`, nested array assignment, complex interpolation forms)
 produce a compile error with a specific code — never a silently different program.
 
 ## Runtime independence

@@ -370,6 +370,7 @@ are `W020x`.
 | `E0265` | Cannot access private or protected member / narrowing visibility |
 | `E0267` | Cannot re-assign `$this` |
 | `E0268` | Cannot use `$this` outside object context / property type mismatch |
+| `E0269` | Invalid abstract declaration, missing implementation, abstract instantiation, or abstract parent call |
 | `W0202` | `return` with a value at top level is ignored |
 
 ## Classes, Inheritance & Polymorphism
@@ -387,3 +388,12 @@ are `W020x`.
   * `$obj instanceof ClassName` returns `bool`, traversing the parent hierarchy at runtime.
   * Left operand must be an object type (`E0260`).
 
+
+* **Abstract classes**: `abstract class Name [extends ParentName] { ... }`.
+  Abstract classes cannot be instantiated. Concrete subclasses must implement all
+  inherited abstract methods, including abstract constructors.
+* **Abstract methods**: `abstract public|protected function name(Type $arg): RetType;`.
+  Visibility may also precede `abstract`; omitting it defaults to public.
+  Abstract methods have no body and cannot be private. Implementations obey the
+  existing signature and visibility rules. Calling an abstract method through
+  `parent::` is rejected; object calls use dynamic dispatch.

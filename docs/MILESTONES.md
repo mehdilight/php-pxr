@@ -345,6 +345,27 @@ the word‑count block at the end of `examples/compat.php` does exactly this. �
   `instanceof_hierarchy_matches_php`, `inheritance_diagnostics_rejected`) — 58 CLI tests total;
   `examples/inheritance.php` added and verified 100% byte-for-byte identical to PHP 8.4.
 
+**Delivered (M3.3: abstract classes & methods slice).**
+
+* `abstract class`, abstract method signatures ending in `;`, and both
+  `abstract public` and `public abstract` modifier orders.
+* Concrete descendants must implement all inherited abstract methods, including
+  obligations carried through intermediate abstract classes. Implementations
+  follow the existing signature and visibility checks; abstract constructors
+  also enforce signature compatibility.
+* Calls through abstract parent types and `$this` in inherited concrete methods
+  dispatch to the concrete implementation. Abstract declarations remain linkable
+  even when a hierarchy has no concrete descendants; unreachable fallbacks abort.
+* Compile-time `E0269` errors for instantiating abstract classes, missing
+  implementations, private abstract methods, replacing inherited concrete methods
+  with abstract declarations, and calling abstract methods via `parent::`.
+  Abstract methods with bodies and abstract properties are syntax errors (`E0100`).
+* Four new CLI tests cover native execution, PHP output compatibility, unused
+  hierarchies, constructors, modifier order, and invalid declarations — 62 CLI
+  tests total. Example: `examples/abstract.php`.
+
+**Next:** interfaces, then static members, namespaces, and module resolution.
+
 ## ⛔ M4 — Gradual migration
 
 * An opt‑in dynamic `mixed` type with runtime tags, and `is_*` narrowing.

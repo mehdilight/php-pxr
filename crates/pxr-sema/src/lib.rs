@@ -457,6 +457,7 @@ pub struct TProgram {
 
 #[derive(Clone, Debug)]
 pub struct ClassInfo {
+    pub is_abstract: bool,
     pub class_id: u32,
     pub name: String,
     pub name_span: Span,
@@ -738,7 +739,10 @@ impl Analyzer {
             if self.is_subclass_of(&sub.name, &root_class.name) {
                 if let Some(sub_m) = sub.methods.get(&mkey) {
                     if sub_m.mangled != method.mangled {
-                        groups.entry(sub_m.mangled.clone()).or_default().push(sub.class_id);
+                        groups
+                            .entry(sub_m.mangled.clone())
+                            .or_default()
+                            .push(sub.class_id);
                     }
                 }
             }
@@ -938,6 +942,7 @@ impl Analyzer {
             self.classes.insert(
                 key,
                 ClassInfo {
+                    is_abstract: c.is_abstract,
                     class_id,
                     name: c.name.clone(),
                     name_span: c.name_span,
@@ -1157,6 +1162,13 @@ impl Analyzer {
                         }
                     }
                     ast::ClassMember::Method(m) => {
+                        if m.is_abstract && m.visibility == ast::Visibility::Private {
+                            self.diags.emit(
+                                Diagnostic::error("abstract methods cannot be private")
+                                    .with_code("E0269")
+                                    .with_span(m.name_span),
+                            );
+                        }
                         let mkey = m.name.to_ascii_lowercase();
                         let mut params = Vec::new();
                         let mut param_names = Vec::new();
@@ -1230,6 +1242,15 @@ impl Analyzer {
                                 );
                                 continue;
                             }
+                            if m.is_abstract && !existing.ast_method.is_abstract {
+                                self.diags.emit(
+                                    Diagnostic::error(
+                                        "cannot make an inherited concrete method abstract",
+                                    )
+                                    .with_code("E0269")
+                                    .with_span(m.name_span),
+                                );
+                            }
                             // Overriding inherited method
                             if existing.visibility == ast::Visibility::Public
                                 && m.visibility != ast::Visibility::Public
@@ -1254,7 +1275,7 @@ impl Analyzer {
                                     .with_span(m.name_span),
                                 );
                             }
-                            if mkey != "__construct" {
+                            if mkey != "__construct" || existing.ast_method.is_abstract {
                                 if params.len() != existing.params.len() {
                                     self.diags.emit(
                                         Diagnostic::error(format!(
@@ -1312,6 +1333,18 @@ impl Analyzer {
                 }
             }
 
+            if !c.is_abstract {
+                for method in methods.values().filter(|m| m.ast_method.is_abstract) {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "concrete class `{}` must implement abstract method `{}`",
+                            c.name, method.name
+                        ))
+                        .with_code("E0269")
+                        .with_span(c.name_span),
+                    );
+                }
+            }
             if let Some(info) = self.classes.get_mut(&class_key) {
                 info.properties = properties;
                 info.prop_indices = prop_indices;
@@ -1457,8 +1490,25 @@ impl Analyzer {
         for (name, ty) in method.param_names.iter().zip(method.params.iter()) {
             ctx.declare(name, ty.clone());
         }
-        let body = self.analyze_stmts(&method.ast_method.body, &mut ctx);
-        if method.name != "__construct" && method.ret != Ty::Void {
+        // Abstract declarations still need a linkable fallback for dispatchers in
+        // hierarchies with no concrete descendants. No valid object can reach it.
+        let body = if method.ast_method.is_abstract {
+            vec![TStmt::Expr(TExpr::Call {
+                callee: Callee::User {
+                    mangled: "abort".into(),
+                    name: "abort".into(),
+                    params: vec![],
+                },
+                ret: Ty::Void,
+                args: vec![],
+                arg_tys: vec![],
+                span: method.name_span,
+            })]
+        } else {
+            self.analyze_stmts(&method.ast_method.body, &mut ctx)
+        };
+        if !method.ast_method.is_abstract && method.name != "__construct" && method.ret != Ty::Void
+        {
             let sig = Signature {
                 mangled: method.mangled.clone(),
                 display: format!("{class_name}::{}", method.name),
@@ -2609,7 +2659,12 @@ impl Analyzer {
                 };
 
                 let prop = &class.properties[prop_idx];
-                if !self.check_member_visibility(&prop.declaring_class, prop.visibility, *name_span, ctx) {
+                if !self.check_member_visibility(
+                    &prop.declaring_class,
+                    prop.visibility,
+                    *name_span,
+                    ctx,
+                ) {
                     return None;
                 }
 
@@ -2671,7 +2726,12 @@ impl Analyzer {
                     }
                 };
 
-                if !self.check_member_visibility(&method.declaring_class, method.visibility, *name_span, ctx) {
+                if !self.check_member_visibility(
+                    &method.declaring_class,
+                    method.visibility,
+                    *name_span,
+                    ctx,
+                ) {
                     return None;
                 }
 
@@ -2749,9 +2809,25 @@ impl Analyzer {
                     }
                 };
 
+                if class.is_abstract {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "cannot instantiate abstract class `{}`",
+                            class.name
+                        ))
+                        .with_code("E0269")
+                        .with_span(*class_span),
+                    );
+                    return None;
+                }
                 let ctor = class.methods.get("__construct").cloned();
                 let ctor_info = if let Some(ctor) = &ctor {
-                    if !self.check_member_visibility(&ctor.declaring_class, ctor.visibility, *span, ctx) {
+                    if !self.check_member_visibility(
+                        &ctor.declaring_class,
+                        ctor.visibility,
+                        *span,
+                        ctx,
+                    ) {
                         return None;
                     }
 
@@ -2933,6 +3009,14 @@ impl Analyzer {
                         return None;
                     }
                 };
+                if parent_method.ast_method.is_abstract {
+                    self.diags.emit(
+                        Diagnostic::error("cannot call abstract method using `parent::`")
+                            .with_code("E0269")
+                            .with_span(*method_span),
+                    );
+                    return None;
+                }
                 if parent_method.visibility == ast::Visibility::Private {
                     self.diags.emit(
                         Diagnostic::error(format!(
@@ -2950,7 +3034,11 @@ impl Analyzer {
                             "method `{}::{method}` expects {} argument{}, found {}",
                             parent_class.name,
                             parent_method.params.len(),
-                            if parent_method.params.len() == 1 { "" } else { "s" },
+                            if parent_method.params.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            },
                             args.len()
                         ))
                         .with_code("E0207")

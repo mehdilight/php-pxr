@@ -11,6 +11,9 @@ Run any of these with `pxr run <file>`, or from a release build:
 | `types.php` | All scalar types, widening, builtins | ❌ PXR-only annotations |
 | `compat.php` | The shared PHP∩PXR subset; output is asserted identical to PHP | ✅ |
 | `quicksort.php` | Arrays, `for`/`while`/`foreach`, `continue`, index assignment | ✅ |
+| `objects.php` | Classes, properties, methods, constructors, visibility | ✅ |
+| `inheritance.php` | Inheritance, overriding, `parent::`, `instanceof` | ✅ |
+| `abstract.php` | Abstract classes, abstract methods, polymorphic dispatch | ✅ |
 
 `compat.php` and `quicksort.php` are compatibility proofs: they compile with
 `pxr` and run under `php`, and both produce the same bytes.
