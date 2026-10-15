@@ -480,9 +480,32 @@ using `mixed`.
   mixed array storage, and invalid programs — 80 CLI tests total.
   Example: `examples/mixed.php`. Details: [`MIXED.md`](MIXED.md).
 
-**Next:** M4.2 — sound flow narrowing after `is_*` guards, including assignment
-invalidation and control-flow joins. Broader boxed values, migration reporting,
-and runtime PHP interop follow; M4 is not complete.
+**Delivered (M4.2: guard-based scalar narrowing slice).**
+
+* Local mixed variables and parameters narrow after `is_int`, `is_float`,
+  `is_bool`, and `is_string` guards, including negation, `elseif`/`else`, early
+  returns, short-circuit `&&`/`||`, ternaries, boolean predicate comparisons,
+  and successful strict comparisons with concrete scalar values.
+* Reachable branch joins merge scalar possibility sets; returning paths do not
+  erase facts needed by the surviving path. Exhausted scalar alternatives can
+  identify the remaining type. User functions named like predicates do not
+  create builtin type facts.
+* Assignments invalidate previous facts. Loop analysis invalidates potential
+  loop-carried writes before typing repeated code; `while`/`for` guards narrow
+  bodies, and `for` updates retain guard facts only for values not rebound by
+  the body. Fallthrough switch cases and reused foreach variables cannot retain
+  stale refinements.
+* Guarded compound numeric assignments and increment/decrement read the proven
+  scalar type and store a newly boxed result. Storage remains mixed even when a
+  read is narrowed. Foreach also boxes concrete elements when its destination
+  variable was declared mixed.
+* Four CLI tests cover PHP output comparisons, guard forms, mutation, loop
+  iterations, branch joins, and rejection of unsound stale facts — 84 CLI tests
+  total. Example: `examples/narrowing.php`.
+
+**Next:** broader boxed values and dynamic operations, migration reporting, and
+runtime PHP interop. Property/array-element guards and more precise loop
+fixed-point analysis remain follow-up work; M4 is not complete.
 
 ## ⛔ M5 — Generics & inference
 

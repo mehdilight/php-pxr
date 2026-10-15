@@ -474,9 +474,23 @@ Predicates: `is_int`, `is_float`, `is_bool`, `is_string`, `is_scalar`, `is_array
 Mixed values support echo/print, concatenation, interpolation, boolean contexts,
 strict comparisons, `match` against scalar conditions, and scalar/mixed branch
 results. Direct arithmetic, ordering, loose comparisons, and implicit unboxing
-are rejected. Guards do not yet narrow types; convert explicitly inside guards.
+are rejected unless scalar guard facts prove a concrete operand type. Guards
+narrow local mixed variables/parameters; rebinding invalidates previous facts.
 
 Only scalar boxing is implemented. Null, arrays, and objects cannot yet become
 mixed values. Arrays can store boxed scalars as `array<mixed>`; use explicitly
 boxed elements rather than converting an entire concrete array. See
 [`MIXED.md`](MIXED.md) for examples and remaining limits.
+
+## Guard-based scalar narrowing (M4.2)
+
+`if (is_int($value)) { echo $value + 1; }` narrows a local mixed slot to `int`
+inside the true branch. The other scalar predicates work similarly. Negation,
+`elseif`/`else`, early returns, `&&`/`||`, ternaries, and successful strict scalar
+comparisons propagate facts. Branch joins merge reachable possibilities; guarded
+reads never change the slot's boxed storage representation.
+
+Assignments invalidate earlier facts. Repeated loop code is checked without
+assuming values retain a type that can be changed by a body/update path. Loop
+guards can establish fresh facts. Property and array-element reads do not yet
+receive persistent refinements; guarding a local copy is supported.

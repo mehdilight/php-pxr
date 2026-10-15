@@ -2144,11 +2144,6 @@ fn unsupported_mixed_operations_are_rejected() {
             "E0215",
         ),
         (
-            "no_narrowing_yet",
-            "function f(mixed $v): int { if (is_int($v)) { return $v + 1; } return 0; }",
-            "E0274",
-        ),
-        (
             "array_box",
             "function f(mixed $v): void {} f([1]);",
             "E0231",
@@ -2186,5 +2181,105 @@ fn unsupported_mixed_operations_are_rejected() {
         let r = run_ok(&["check", f.to_str().unwrap()]);
         assert_ne!(r.code, 0, "accepted {name}");
         assert!(r.stderr.contains(code), "{name}: {}", r.stderr);
+    }
+}
+
+#[test]
+fn mixed_guard_narrowing_and_mutation_match_php() {
+    assert_matches_php(
+        "mixed_narrowing",
+        include_str!("../../../examples/narrowing.php"),
+    );
+    assert_matches_php(
+        "mixed_narrowing_widening",
+        r#"<?php
+function increase(mixed $value): float {
+    if (!is_int($value)) { return 0.0; }
+    $value += 0.5;
+    return $value;
+}
+echo increase(3) . "\n";
+"#,
+    );
+}
+
+#[test]
+fn mixed_short_circuit_and_ternary_narrowing_match_php() {
+    assert_matches_php(
+        "mixed_narrowing_expressions",
+        r#"<?php
+function accept(mixed $value): bool { return !is_int($value) || $value > 2; }
+function length(mixed $value): int { return is_string($value) ? strlen($value) : 0; }
+function guarded(mixed $value): int {
+    if (is_int($value) === false) { return 0; }
+    return $value + 1;
+}
+function literal(mixed $value): int { if ($value === 4) { return $value + 1; } return 0; }
+echo accept("x") . ":" . accept(3) . ":" . accept(1) . "\n";
+echo length("hello") . ":" . length(false) . "\n";
+echo guarded(4) . ":" . guarded("4") . "\n";
+echo literal(4) . ":" . literal("4") . "\n";
+"#,
+    );
+}
+
+#[test]
+fn mixed_loop_guards_and_continue_narrowing_match_php() {
+    assert_matches_php(
+        "mixed_narrowing_loops",
+        r#"<?php
+function boxedLoop(mixed $value): void {
+    $i = 0;
+    while (is_int($value) && $i < 2) {
+        echo $value + 1;
+        $value++;
+        $i++;
+    }
+    echo "\n";
+}
+boxedLoop(2); boxedLoop("x");
+function item(mixed $value): void {
+    $i = 0;
+    while ($i < 2) {
+        $i++;
+        if (!is_int($value)) { continue; }
+        echo $value + 1;
+    }
+    echo "\n";
+}
+item(4); item("x");
+function forGuard(mixed $value): void {
+    $i = 0;
+    for (; is_int($value) && $i < 2; $value++) { echo $value; $i++; }
+    echo "\n";
+}
+forGuard(2); forGuard("x");
+function reused(mixed $value): void {
+    if (!is_string($value)) { return; }
+    foreach ([1, 2] as $value) {
+        if (is_int($value)) { echo $value + 1; }
+    }
+    echo "\n";
+}
+reused("start");
+"#,
+    );
+}
+
+#[test]
+fn mixed_narrowing_invalidates_assignments_and_joins() {
+    let cases = [
+        ("assignment", "function f(mixed $v): int { if (is_int($v)) { $v = 'changed'; return $v + 1; } return 0; }"),
+        ("branch_join", "function f(mixed $v, bool $b): int { if (!is_int($v)) { return 0; } if ($b) { $v = 'changed'; } return $v + 1; }"),
+        ("loop_backedge", "function f(mixed $v): void { if (is_int($v)) { $i = 0; while ($i < 2) { echo $v + 1; $v = 'changed'; $i++; } } }"),
+        ("loop_exit", "function f(mixed $v): int { if (!is_int($v)) { return 0; } while (true) { $v = 'changed'; break; } return $v + 1; }"),
+        ("or_does_not_prove", "function f(mixed $v, bool $b): int { if (is_int($v) || $b) { return $v + 1; } return 0; }"),
+        ("user_function", "function is_int(mixed $v): bool { return true; } function f(mixed $v): int { if (is_int($v)) { return $v + 1; } return 0; }"),
+    ];
+    for (name, source) in cases {
+        let file = temp_php(&format!("narrowing_invalid_{name}"), source);
+        let r = run_ok(&["check", file.to_str().unwrap()]);
+        assert_ne!(r.code, 0, "accepted unsound refinement: {name}");
+        assert!(r.stderr.contains("E0274"), "{name}: {}", r.stderr);
     }
 }

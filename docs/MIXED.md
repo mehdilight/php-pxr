@@ -1,7 +1,7 @@
-# Scalar mixed values — M4.1
+# Mixed values and guard narrowing — M4.1–M4.2
 
 `mixed` is an explicit opt-in to runtime scalar tags. Concrete variables and
-functions retain their existing static checks. This first slice supports `int`,
+functions retain their existing static checks. The current implementation supports `int`,
 `float`, `bool`, and byte-string values; M4 remains in progress.
 
 ```php
@@ -10,7 +10,7 @@ function boxed(mixed $value): mixed { return $value; }
 
 function describe(mixed $value): string {
     if (is_int($value)) {
-        return "integer: " . intval($value);
+        return "integer: " . ($value + 1);
     }
     return strval($value);
 }
@@ -56,12 +56,24 @@ converted to `array<mixed>`; box its elements explicitly. Untyped function
 inference, union types, nullable types, runtime PHP includes, and a migration
 report are still planned.
 
-Predicates currently return booleans without changing a variable's static type.
-Even inside `if (is_int($value))`, arithmetic requires `intval($value)`. Sound flow
-narrowing is the next M4 slice, including invalidation after assignments and
-merging information across branches and loops.
+Scalar predicates narrow local mixed variables and parameters. Inside
+`if (is_int($value))`, integer operations and typed calls can use `$value`
+directly. Negation, surviving paths after early returns, `elseif`/`else`,
+short-circuit boolean expressions, ternaries, and successful strict scalar
+comparisons also propagate facts. Assignments invalidate old guards; reachable
+branch joins retain only facts valid on every surviving path. Guarded numeric
+compound assignments and increments preserve mixed storage while updating the
+known scalar result type.
 
-Mixed arithmetic, ordering, and loose comparisons are rejected with `E0274`.
+Loop analysis discards facts for values that can be rebound across iterations.
+While/for guards can establish new facts for each body execution. It is
+conservative: a safe operation may still require another guard or an explicit
+conversion if its type cannot be proved across loop paths. Guards currently
+refine local slots, not repeated property or array-element reads; copy such a
+value into a local variable before guarding it.
+
+Unguarded mixed arithmetic, ordering, and loose comparisons are rejected with
+`E0274`; proven concrete scalar values use the existing typed operators.
 Implicit conversion from mixed to a concrete parameter/return/property type is
 also rejected; use the explicit conversion functions. Read potentially missing
 mixed array keys through `??`; direct missing-key reads have no scalar box and

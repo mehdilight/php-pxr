@@ -265,15 +265,17 @@ This is a static module resolver; runtime inclusion of untyped PHP remains M4.
 **Scalar mixed values.** `mixed` annotations accept scalar values (`int`, `float`,
 `bool`, `string`) using runtime tags. Printing, truthiness, conversions,
 concatenation, strict comparisons, and scalar `match` cases are supported. Type
-predicates work on boxed scalars and concrete values, but do not yet narrow
-static types. Concrete variables still cannot change type unless opted into
+predicates work on boxed scalars and concrete values. Guards narrow local mixed
+variables and parameters; assignments and control-flow joins invalidate stale
+facts. Concrete variables still cannot change type unless opted into
 `mixed`. Typed-only operations require explicit scalar conversion.
 
 This is an initial subset of PHP's broader `mixed`: null, arrays, and objects
-cannot yet be boxed. Mixed arithmetic, ordering, and loose comparisons fail at
-compile time (`E0274`). Mixed parameters and returns still require explicit
+cannot yet be boxed. Unguarded mixed arithmetic, ordering, and loose comparisons fail at
+compile time (`E0274`); guarded concrete scalars use the typed operators. Mixed parameters and returns still require explicit
 annotations. Existing scalar numeric conversion semantics are reused; broader
-PHP coercion fidelity and flow narrowing remain future work. See
+PHP coercion fidelity and refinements of repeated property/element reads remain
+future work. See
 [`MIXED.md`](MIXED.md).
 
 **Fail loud, never silent.** Features not yet implemented (such as

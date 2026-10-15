@@ -364,6 +364,12 @@ impl TExpr {
 /// A typed assignment target.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TTarget {
+    /// A mixed slot read through a proven scalar refinement; stores remain boxed.
+    MixedVar {
+        name: String,
+        slot: u32,
+        ty: Ty,
+    },
     Var {
         name: String,
         slot: u32,
@@ -388,6 +394,179 @@ pub enum TTarget {
         prop_idx: u32,
         ty: Ty,
     },
+}
+
+impl TTarget {
+    pub fn storage_ty(&self) -> Ty {
+        match self {
+            Self::MixedVar { .. } => Ty::Mixed,
+            Self::Var { ty, .. } | Self::Property { ty, .. } => ty.clone(),
+            Self::Index { elem_ty, .. } | Self::Push { elem_ty, .. } => elem_ty.clone(),
+        }
+    }
+}
+
+// Scalar possibility sets for local mixed slots. Facts describe values, never
+// alter slot storage types, and are joined only across reachable paths.
+const SCALAR_MASK: u8 = 15;
+#[derive(Clone, Debug)]
+struct FlowState {
+    types: HashMap<u32, u8>,
+    reachable: bool,
+}
+impl Default for FlowState {
+    fn default() -> Self {
+        Self {
+            types: HashMap::new(),
+            reachable: true,
+        }
+    }
+}
+impl FlowState {
+    fn mask(&self, slot: u32) -> u8 {
+        self.types.get(&slot).copied().unwrap_or(SCALAR_MASK)
+    }
+    fn restrict(&mut self, slot: u32, mask: u8) {
+        let mask = self.mask(slot) & mask;
+        self.types.insert(slot, mask);
+        if mask == 0 {
+            self.reachable = false;
+        }
+    }
+    fn narrowed(&self, slot: u32) -> Option<Ty> {
+        match self.mask(slot) {
+            1 => Some(Ty::Int),
+            2 => Some(Ty::Float),
+            4 => Some(Ty::Bool),
+            8 => Some(Ty::String),
+            _ => None,
+        }
+    }
+    fn merge(paths: &[Self]) -> Self {
+        let paths: Vec<_> = paths.iter().filter(|p| p.reachable).collect();
+        let mut result = Self::default();
+        result.reachable = !paths.is_empty();
+        for slot in paths.iter().flat_map(|p| p.types.keys()) {
+            result
+                .types
+                .insert(*slot, paths.iter().fold(0, |mask, p| mask | p.mask(*slot)));
+        }
+        result
+    }
+    fn condition(&self, expression: &TExpr, truth: bool) -> Self {
+        match expression {
+            TExpr::Un {
+                op: AUnOp::Not,
+                expr,
+                ..
+            } => self.condition(expr, !truth),
+            TExpr::Bin {
+                op: ABinOp::And,
+                lhs,
+                rhs,
+                ..
+            } => {
+                if truth {
+                    self.condition(lhs, true).condition(rhs, true)
+                } else {
+                    Self::merge(&[
+                        self.condition(lhs, false),
+                        self.condition(lhs, true).condition(rhs, false),
+                    ])
+                }
+            }
+            TExpr::Bin {
+                op: ABinOp::Or,
+                lhs,
+                rhs,
+                ..
+            } => {
+                if !truth {
+                    self.condition(lhs, false).condition(rhs, false)
+                } else {
+                    Self::merge(&[
+                        self.condition(lhs, true),
+                        self.condition(lhs, false).condition(rhs, true),
+                    ])
+                }
+            }
+            TExpr::Bool(value) => {
+                let mut result = self.clone();
+                result.reachable &= *value == truth;
+                result
+            }
+            TExpr::Bin { op, lhs, rhs, .. }
+                if matches!(op, ABinOp::Identical | ABinOp::NotIdentical) =>
+            {
+                let equal = truth == (*op == ABinOp::Identical);
+                if let TExpr::Bool(value) = &**rhs {
+                    if lhs.ty() == Ty::Bool {
+                        return self.condition(lhs, equal == *value);
+                    }
+                }
+                if let TExpr::Bool(value) = &**lhs {
+                    if rhs.ty() == Ty::Bool {
+                        return self.condition(rhs, equal == *value);
+                    }
+                }
+                let mut result = self.clone();
+                if equal {
+                    if let Some(slot) = mixed_slot(lhs) {
+                        if rhs.ty().is_scalar() {
+                            result.restrict(slot, scalar_mask(&rhs.ty()));
+                        }
+                    }
+                    if let Some(slot) = mixed_slot(rhs) {
+                        if lhs.ty().is_scalar() {
+                            result.restrict(slot, scalar_mask(&lhs.ty()));
+                        }
+                    }
+                }
+                result
+            }
+            TExpr::Call {
+                callee: Callee::Builtin { kind, .. },
+                args,
+                ..
+            } => {
+                let mask = match kind {
+                    Builtin::IsInt => 1,
+                    Builtin::IsFloat => 2,
+                    Builtin::IsBool => 4,
+                    Builtin::IsString => 8,
+                    Builtin::IsScalar => SCALAR_MASK,
+                    Builtin::IsArray | Builtin::IsObject | Builtin::IsNull => 0,
+                    _ => return self.clone(),
+                };
+                let mut result = self.clone();
+                if let Some(slot) = args.first().and_then(mixed_slot) {
+                    result.restrict(slot, if truth { mask } else { SCALAR_MASK & !mask });
+                }
+                result
+            }
+            _ => self.clone(),
+        }
+    }
+}
+fn mixed_slot(expression: &TExpr) -> Option<u32> {
+    match expression {
+        TExpr::Var {
+            slot,
+            ty: Ty::Mixed,
+            ..
+        } => Some(*slot),
+        TExpr::Coerce { expr, .. } => mixed_slot(expr),
+        _ => None,
+    }
+}
+fn scalar_mask(ty: &Ty) -> u8 {
+    match ty {
+        Ty::Int => 1,
+        Ty::Float => 2,
+        Ty::Bool => 4,
+        Ty::String => 8,
+        _ => SCALAR_MASK,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -548,6 +727,7 @@ struct Signature {
 
 /// Result of analysing one function body.
 struct FnCtx {
+    flow: FlowState,
     slots: Vec<Ty>,
     vars: HashMap<String, u32>,
     ret: Ty,
@@ -563,6 +743,7 @@ struct FnCtx {
 impl FnCtx {
     fn new(ret: Ty, is_main: bool) -> Self {
         FnCtx {
+            flow: FlowState::default(),
             slots: Vec::new(),
             vars: HashMap::new(),
             ret,
@@ -1656,7 +1837,9 @@ impl Analyzer {
             ctx.declare(name, ty.clone());
         }
         let body = self.analyze_stmts(&f.body, &mut ctx);
-        self.check_termination(&f.body, &sig, f.name_span);
+        if ctx.flow.reachable {
+            self.check_termination(&f.body, &sig, f.name_span);
+        }
 
         Some(TFunc {
             name: sig.mangled,
@@ -1704,7 +1887,9 @@ impl Analyzer {
                 ret: method.ret.clone(),
                 span: method.name_span,
             };
-            self.check_termination(&method.ast_method.body, &sig, method.name_span);
+            if ctx.flow.reachable {
+                self.check_termination(&method.ast_method.body, &sig, method.name_span);
+            }
         }
 
         let mut all_params = if method.ast_method.is_static {
@@ -1799,6 +1984,9 @@ impl Analyzer {
     fn analyze_stmts(&mut self, stmts: &[ast::Stmt], ctx: &mut FnCtx) -> Vec<TStmt> {
         let mut out = Vec::new();
         for s in stmts {
+            if !ctx.flow.reachable {
+                break;
+            }
             if let Some(ts) = self.analyze_stmt(s, ctx) {
                 out.push(ts);
             }
@@ -1890,7 +2078,11 @@ impl Analyzer {
                 );
                 None
             }
-            ast::Stmt::Return(value, span) => self.analyze_return(value.as_ref(), *span, ctx),
+            ast::Stmt::Return(value, span) => {
+                let result = self.analyze_return(value.as_ref(), *span, ctx);
+                ctx.flow.reachable = false;
+                result
+            }
             ast::Stmt::If {
                 cond,
                 then_branch,
@@ -1898,19 +2090,30 @@ impl Analyzer {
                 else_branch,
                 ..
             } => {
+                let incoming = ctx.flow.clone();
                 let cond_t = self.infer(cond, ctx)?;
                 let cond_ty = cond_t.ty();
                 self.expect_truthy(&cond_ty, cond.span());
+                ctx.flow = incoming.condition(&cond_t, true);
                 let then_t = self.analyze_stmts(then_branch, ctx);
+                let mut paths = vec![ctx.flow.clone()];
+                let mut pending = incoming.condition(&cond_t, false);
                 let mut elifs_t = Vec::new();
                 for (c, b) in elifs {
+                    ctx.flow = pending.clone();
                     let ct = self.infer(c, ctx)?;
                     let cty = ct.ty();
                     self.expect_truthy(&cty, c.span());
+                    ctx.flow = pending.condition(&ct, true);
                     let bt = self.analyze_stmts(b, ctx);
+                    paths.push(ctx.flow.clone());
+                    pending = pending.condition(&ct, false);
                     elifs_t.push((ct, cty, bt));
                 }
+                ctx.flow = pending;
                 let else_t = else_branch.as_ref().map(|b| self.analyze_stmts(b, ctx));
+                paths.push(ctx.flow.clone());
+                ctx.flow = FlowState::merge(&paths);
                 Some(TStmt::If {
                     cond: cond_t,
                     cond_ty,
@@ -1920,12 +2123,16 @@ impl Analyzer {
                 })
             }
             ast::Stmt::While { cond, body, .. } => {
+                invalidate_writes(body, ctx);
+                let incoming = ctx.flow.clone();
                 let cond_t = self.infer(cond, ctx)?;
                 let cond_ty = cond_t.ty();
                 self.expect_truthy(&cond_ty, cond.span());
+                ctx.flow = incoming.condition(&cond_t, true);
                 ctx.loop_depth += 1;
                 let body_t = self.analyze_stmts(body, ctx);
                 ctx.loop_depth -= 1;
+                ctx.flow = incoming;
                 Some(TStmt::While {
                     cond: cond_t,
                     cond_ty,
@@ -1940,12 +2147,16 @@ impl Analyzer {
                 ..
             } => self.analyze_for(init, cond, update, body, ctx),
             ast::Stmt::DoWhile { body, cond, .. } => {
+                invalidate_writes(body, ctx);
+                let incoming = ctx.flow.clone();
                 ctx.loop_depth += 1;
                 let body_t = self.analyze_stmts(body, ctx);
                 ctx.loop_depth -= 1;
+                ctx.flow = incoming.clone();
                 let cond_t = self.infer(cond, ctx)?;
                 let cond_ty = cond_t.ty();
                 self.expect_truthy(&cond_ty, cond.span());
+                ctx.flow = incoming;
                 Some(TStmt::DoWhile {
                     body: body_t,
                     cond: cond_t,
@@ -1970,8 +2181,20 @@ impl Analyzer {
                 ctx,
             ),
             ast::Stmt::Switch { subject, cases, .. } => self.analyze_switch(subject, cases, ctx),
-            ast::Stmt::Break(level, span) => self.analyze_jump(*level, *span, ctx, false),
-            ast::Stmt::Continue(level, span) => self.analyze_jump(*level, *span, ctx, true),
+            ast::Stmt::Break(level, span) => {
+                let result = self.analyze_jump(*level, *span, ctx, false);
+                if result.is_some() {
+                    ctx.flow.reachable = false;
+                }
+                result
+            }
+            ast::Stmt::Continue(level, span) => {
+                let result = self.analyze_jump(*level, *span, ctx, true);
+                if result.is_some() {
+                    ctx.flow.reachable = false;
+                }
+                result
+            }
         }
     }
 
@@ -1994,6 +2217,9 @@ impl Analyzer {
         ctx: &mut FnCtx,
     ) -> Option<TStmt> {
         let init_t = self.analyze_stmts(init, ctx);
+        invalidate_writes(body, ctx);
+        invalidate_writes(update, ctx);
+        let incoming = ctx.flow.clone();
         let mut cond_t = None;
         if !cond.is_empty() {
             if cond.len() > 1 {
@@ -2008,10 +2234,20 @@ impl Analyzer {
             self.expect_truthy(&cty, cond[0].span());
             cond_t = Some((c, cty));
         }
+        if let Some((condition, _)) = &cond_t {
+            ctx.flow = incoming.condition(condition, true);
+        }
         ctx.loop_depth += 1;
         let body_t = self.analyze_stmts(body, ctx);
         ctx.loop_depth -= 1;
+        ctx.flow = if let Some((condition, _)) = &cond_t {
+            incoming.condition(condition, true)
+        } else {
+            incoming.clone()
+        };
+        invalidate_writes(body, ctx);
         let update_t = self.analyze_stmts(update, ctx);
+        ctx.flow = incoming;
         Some(TStmt::For {
             init: init_t,
             cond: cond_t,
@@ -2080,14 +2316,18 @@ impl Analyzer {
             }
             None => ctx.declare(value, elem.clone()),
         };
+        invalidate_writes(body, ctx);
+        ctx.flow.types.remove(&vslot);
+        let incoming = ctx.flow.clone();
         ctx.loop_depth += 1;
         let body_t = self.analyze_stmts(body, ctx);
         ctx.loop_depth -= 1;
+        ctx.flow = incoming;
         Some(TStmt::Foreach {
             base: subj,
             base_ty: sty,
             value_slot: vslot,
-            value_ty: elem,
+            value_ty: ctx.slot_ty(vslot),
             body: body_t,
         })
     }
@@ -2100,9 +2340,14 @@ impl Analyzer {
     ) -> Option<TStmt> {
         let subj = self.infer(subject, ctx)?;
         let sty = subj.ty();
+        for case in cases {
+            invalidate_writes(&case.body, ctx);
+        }
+        let incoming = ctx.flow.clone();
         let mut tcases = Vec::new();
         ctx.switch_depth += 1;
         for c in cases {
+            ctx.flow = incoming.clone();
             let (test_t, test_ty) = match &c.test {
                 Some(t) => {
                     let te = self.infer(t, ctx)?;
@@ -2128,6 +2373,7 @@ impl Analyzer {
             });
         }
         ctx.switch_depth -= 1;
+        ctx.flow = incoming;
         Some(TStmt::Switch {
             subject: subj,
             subject_ty: sty,
@@ -2243,6 +2489,7 @@ impl Analyzer {
                     return None;
                 }
 
+                ctx.flow.types.remove(&slot);
                 Some(TStmt::Assign {
                     target: TTarget::Var {
                         name: name.clone(),
@@ -2406,7 +2653,9 @@ impl Analyzer {
         let (elem, base) = match target {
             TTarget::Index { elem_ty, base, .. } => (elem_ty.clone(), base),
             TTarget::Push { elem_ty, base } => (elem_ty.clone(), base),
-            TTarget::Var { ty, .. } | TTarget::Property { ty, .. } => return ty.clone(),
+            TTarget::MixedVar { ty, .. }
+            | TTarget::Var { ty, .. }
+            | TTarget::Property { ty, .. } => return ty.clone(),
         };
         if elem == Ty::Null {
             if let TExpr::Var { slot, .. } = &**base {
@@ -2430,7 +2679,7 @@ impl Analyzer {
         let val = self.infer(value, ctx)?;
         let vty = val.ty();
         let result_ty = self.binary_type(op, &tty, &vty, span)?;
-        if !self.is_assignable(&result_ty, &tty) {
+        if !self.is_assignable(&result_ty, &ttarget.storage_ty()) {
             self.diags.emit(
                 Diagnostic::error(format!(
                     "result of `{}=` has type `{result_ty}`, which cannot be stored back into a target of type `{tty}`",
@@ -2440,6 +2689,11 @@ impl Analyzer {
                 .with_span(span),
             );
             return None;
+        }
+        if let ast::LValue::Var { name, .. } = target {
+            if let Some(slot) = ctx.slot_of(name) {
+                ctx.flow.types.insert(slot, scalar_mask(&result_ty));
+            }
         }
         Some(TStmt::AssignOp {
             target: ttarget,
@@ -2466,6 +2720,11 @@ impl Analyzer {
                 .with_span(span),
             );
             return None;
+        }
+        if let ast::LValue::Var { name, .. } = target {
+            if let Some(slot) = ctx.slot_of(name) {
+                ctx.flow.types.insert(slot, scalar_mask(&tty));
+            }
         }
         Some(TStmt::IncDec {
             target: ttarget,
@@ -2504,6 +2763,18 @@ impl Analyzer {
                     }
                 };
                 let ty = ctx.slot_ty(slot);
+                if ty == Ty::Mixed {
+                    if let Some(narrowed) = ctx.flow.narrowed(slot) {
+                        return Some((
+                            TTarget::MixedVar {
+                                name: name.clone(),
+                                slot,
+                                ty: narrowed.clone(),
+                            },
+                            narrowed,
+                        ));
+                    }
+                }
                 Some((
                     TTarget::Var {
                         name: name.clone(),
@@ -2518,7 +2789,9 @@ impl Analyzer {
                 let ty = match &t {
                     TTarget::Index { elem_ty, .. } => elem_ty.clone(),
                     TTarget::Push { elem_ty, .. } => elem_ty.clone(),
-                    TTarget::Var { ty, .. } | TTarget::Property { ty, .. } => ty.clone(),
+                    TTarget::MixedVar { ty, .. }
+                    | TTarget::Var { ty, .. }
+                    | TTarget::Property { ty, .. } => ty.clone(),
                 };
                 if ty == Ty::Null {
                     self.diags.emit(
@@ -2780,10 +3053,22 @@ impl Analyzer {
                 match ctx.slot_of(name) {
                     Some(slot) => {
                         let ty = ctx.slot_ty(slot);
-                        Some(TExpr::Var {
+                        let expression = TExpr::Var {
                             name: name.clone(),
                             slot,
-                            ty,
+                            ty: ty.clone(),
+                        };
+                        Some(if ty == Ty::Mixed {
+                            if let Some(narrowed) = ctx.flow.narrowed(slot) {
+                                TExpr::Coerce {
+                                    expr: Box::new(expression),
+                                    ty: narrowed,
+                                }
+                            } else {
+                                expression
+                            }
+                        } else {
+                            expression
                         })
                     }
                     None => {
@@ -3510,7 +3795,13 @@ impl Analyzer {
         ctx: &mut FnCtx,
     ) -> Option<TExpr> {
         let lt = self.infer(lhs, ctx)?;
-        let rt = self.infer(rhs, ctx)?;
+        let incoming = ctx.flow.clone();
+        if matches!(op, ABinOp::And | ABinOp::Or) {
+            ctx.flow = incoming.condition(&lt, op == ABinOp::And);
+        }
+        let result = self.infer(rhs, ctx);
+        ctx.flow = incoming;
+        let rt = result?;
         let l = lt.ty();
         let r = rt.ty();
         let ty = self.binary_type(op, &l, &r, span)?;
@@ -3722,10 +4013,16 @@ impl Analyzer {
         let c = self.infer(cond, ctx)?;
         let cty = c.ty();
         self.expect_truthy(&cty, cond.span());
-        let eb = self.infer(else_branch, ctx)?;
+        let incoming = ctx.flow.clone();
+        ctx.flow = incoming.condition(&c, false);
+        let eb_result = self.infer(else_branch, ctx);
+        ctx.flow = incoming.condition(&c, true);
+        let tt_result = then.map(|t| self.infer(t, ctx));
+        ctx.flow = incoming;
+        let eb = eb_result?;
         match then {
-            Some(t) => {
-                let tt = self.infer(t, ctx)?;
+            Some(_) => {
+                let tt = tt_result.flatten()?;
                 let ty = self.unify_types(&tt.ty(), &eb.ty(), span)?;
                 Some(TExpr::Ternary {
                     cond: Box::new(c),
@@ -4776,5 +5073,57 @@ fn contains_mixed(ty: &Ty) -> bool {
         Ty::Mixed => true,
         Ty::Array(element) => contains_mixed(element),
         _ => false,
+    }
+}
+
+// Invalidate values written on any loop/fallthrough path before typing repeated
+// code. Function calls cannot rebind locals: references are not part of PXR yet.
+fn invalidate_writes(statements: &[ast::Stmt], ctx: &mut FnCtx) {
+    for statement in statements {
+        match statement {
+            ast::Stmt::Assign { target, .. }
+            | ast::Stmt::AssignOp { target, .. }
+            | ast::Stmt::IncDec { target, .. } => {
+                if let Some(slot) = ctx.slot_of(target.root_name()) {
+                    ctx.flow.types.remove(&slot);
+                }
+            }
+            ast::Stmt::Block(body, _)
+            | ast::Stmt::While { body, .. }
+            | ast::Stmt::DoWhile { body, .. } => invalidate_writes(body, ctx),
+            ast::Stmt::If {
+                then_branch,
+                elifs,
+                else_branch,
+                ..
+            } => {
+                invalidate_writes(then_branch, ctx);
+                for (_, body) in elifs {
+                    invalidate_writes(body, ctx);
+                }
+                if let Some(body) = else_branch {
+                    invalidate_writes(body, ctx);
+                }
+            }
+            ast::Stmt::For {
+                init, body, update, ..
+            } => {
+                invalidate_writes(init, ctx);
+                invalidate_writes(body, ctx);
+                invalidate_writes(update, ctx);
+            }
+            ast::Stmt::Foreach { value, body, .. } => {
+                if let Some(slot) = ctx.slot_of(value) {
+                    ctx.flow.types.remove(&slot);
+                }
+                invalidate_writes(body, ctx);
+            }
+            ast::Stmt::Switch { cases, .. } => {
+                for case in cases {
+                    invalidate_writes(&case.body, ctx);
+                }
+            }
+            _ => {}
+        }
     }
 }

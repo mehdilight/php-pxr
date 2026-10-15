@@ -253,14 +253,17 @@ impl Lowerer {
                 let vt = value.ty();
                 let result = self.lower_bin_expr(*op, &cur_ty, cur, &vt, v);
                 // Coerce the operator result to the destination representation.
-                let value = self.cast(result.0, &result.1, ty);
-                self.lower_store(target, ty.clone(), value);
+                let storage = target.storage_ty();
+                let value = self.cast(result.0, &result.1, &storage);
+                self.lower_store(target, storage, value);
             }
             TStmt::IncDec { target, ty, delta } => {
                 let (cur, cur_ty) = self.lower_load(target, ty.clone());
                 let dx = self.emit_const(Literal::Int(*delta));
                 let res = self.lower_bin_expr(pxr_sema::TBinOp::Add, &cur_ty, cur, &Ty::Int, dx);
-                self.lower_store(target, res.1, res.0);
+                let storage = target.storage_ty();
+                let value = self.cast(res.0, &res.1, &storage);
+                self.lower_store(target, storage, value);
             }
             TStmt::If {
                 cond,
@@ -1307,6 +1310,14 @@ impl Lowerer {
         // through an index target store the element's value, so the copy below
         // covers both plain variables and array elements.
         match target {
+            TTarget::MixedVar { slot, .. } => {
+                let value = self.cast(v, &ty, &Ty::Mixed);
+                self.emit(Inst::SlotSet {
+                    slot: *slot,
+                    src: value,
+                    ty: Ty::Mixed,
+                });
+            }
             TTarget::Var { slot, .. } => {
                 let v = self.maybe_copy_array(v, &ty);
                 self.emit(Inst::SlotSet {
@@ -1361,6 +1372,17 @@ impl Lowerer {
     /// `++`/`--`).
     fn lower_load(&mut self, target: &TTarget, ty: Ty) -> (Value, Ty) {
         match target {
+            TTarget::MixedVar {
+                slot, ty: narrowed, ..
+            } => {
+                let value = self.fresh();
+                self.emit(Inst::SlotGet {
+                    dst: value,
+                    slot: *slot,
+                    ty: Ty::Mixed,
+                });
+                (self.cast(value, &Ty::Mixed, narrowed), narrowed.clone())
+            }
             TTarget::Var { slot, .. } => {
                 let dst = self.fresh();
                 self.emit(Inst::SlotGet {
@@ -1504,7 +1526,7 @@ impl Lowerer {
 
     fn lower_coalesce_assign(&mut self, target: &TTarget, ty: &Ty, value: &TExpr) {
         match target {
-            TTarget::Var { .. } | TTarget::Property { .. } => {
+            TTarget::MixedVar { .. } | TTarget::Var { .. } | TTarget::Property { .. } => {
                 // PXR variables and properties are always set; `??=` is a no-op.
             }
             TTarget::Index {
@@ -1674,7 +1696,9 @@ impl Lowerer {
         self.switch_to(body_l);
         let iv2 = self.load_slot(idx, Ty::Int);
         let bits = self.array_val_at(arr, iv2);
-        let v = self.decode_bits(bits, value_ty);
+        let element_ty = base_ty.array_elem().expect("foreach subject is an array");
+        let v = self.decode_bits(bits, element_ty);
+        let v = self.cast(v, element_ty, value_ty);
         // The loop variable receives a copy of each value (PHP `foreach` by
         // value), so mutating it cannot touch the iterated array.
         let v = self.maybe_copy_array(v, value_ty);

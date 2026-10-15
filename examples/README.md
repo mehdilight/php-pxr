@@ -19,6 +19,7 @@ Run any of these with `pxr run <file>`, or from a release build:
 | `namespaces.php` | Namespace blocks, aliases, qualified names, function fallback | ✅ |
 | `modules.php` | Compile-time dependencies in `modules/`, aliases, cross-file types | ✅ |
 | `mixed.php` | Tagged scalar values, predicates, conversions, properties, strict comparisons | ✅ |
+| `narrowing.php` | Scalar guards, early returns, short-circuiting, guarded mixed mutation | ✅ |
 
 `compat.php` and `quicksort.php` are compatibility proofs: they compile with
 `pxr` and run under `php`, and both produce the same bytes.

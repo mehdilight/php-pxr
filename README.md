@@ -18,9 +18,10 @@ comparison; PXR programs themselves run **without PHP**, linking only the small
 PXR runtime.
 
 > **Project status: milestone 4 in progress — gradual migration.**
-> Milestones 1–3 are complete. The first M4 slice adds opt-in scalar `mixed`
-> values, runtime type predicates, conversions, and strict comparisons. Flow
-> narrowing, container/object/null boxing, and runtime PHP interop remain planned.
+> Milestones 1–3 are complete. M4 now provides opt-in scalar `mixed`
+> values, runtime type predicates, conversions, strict comparisons, and guard-based
+> narrowing for local mixed variables. Container/object/null boxing and runtime
+> PHP interop remain planned.
 > Classes, namespaces, and declaration-only compile-time modules are available.
 > See [`docs/MILESTONES.md`](docs/MILESTONES.md) and [`docs/MIXED.md`](docs/MIXED.md).
 
@@ -113,8 +114,8 @@ migration path possible.
   classes and methods, interface contracts, calls through interface types, and
   static properties/methods via `Class::`, `self::`, and `parent::`.
 * **Gradual typing (M4.1)** — opt-in scalar `mixed` parameters, returns, variables,
-  and properties; `is_*` checks, scalar conversions, strict comparisons, and
-  arrays of explicitly boxed scalars.
+  and properties; `is_*` checks, guarded scalar narrowing, conversions, strict
+  comparisons, and arrays of explicitly boxed scalars.
 * **Modules** — braced and unbraced namespaces, qualified names, class/namespace
   aliases, `use function`, and compile-time `require`/`require_once` dependencies
   with diagnostics pointing to the originating file.
@@ -197,7 +198,7 @@ ownership & borrowing, the complex string‑interpolation forms (`"$a[0]"`,
 `"{$expr}"`, `"${name}"`, `"$obj->p"`; the simple `"$name"` / `"{$name}"` work),
 exceptions, runtime `include`/`require` interop, C interop (`extern`), async/await and concurrency
 (planned for M7; see [`docs/ASYNC.md`](docs/ASYNC.md)), and the
-full dynamic `mixed` support and flow narrowing for gradual migration.
+full dynamic `mixed` support for gradual migration.
 
 ## License
 

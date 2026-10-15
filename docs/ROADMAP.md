@@ -20,7 +20,7 @@ Two commitments make this practical rather than a rewrite‑everything exercise:
 2. **The migration is gradual.** Modern PHP is already mostly typed
    (`function f(int $x): string`). PXR accepts that syntax directly and adds
    strictness; M4 is adding an explicit `mixed` escape hatch, starting with
-   scalar values and then flow narrowing and dynamic interop.
+   scalar values and guard narrowing, followed by broader values and dynamic interop.
 
 ## Design principles
 
@@ -47,7 +47,7 @@ today     typed scalars, arrays, control flow, LLVM backend, tests, benchmarks
   ├─ M1  arrays, loops, switch/match, compound ops        ✅ done
   ├─ M2  owned strings + a real standard library          ✅ done
   ├─ M3  classes, namespaces, compile-time modules        ✅ done
-  ├─ M4  scalar mixed; narrowing + interop next           🚧 in progress
+  ├─ M4  scalar mixed + narrowing; interop next           🚧 in progress
   ├─ M5  generics + inference                             (zero-cost abstraction)
   ├─ M6  ownership & borrowing, no leaks                  (memory safety)
   ├─ M7  async/await + structured tasks, then threads     (I/O + parallelism)
