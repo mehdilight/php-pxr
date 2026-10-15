@@ -11,6 +11,8 @@ use std::fmt;
 /// A PXR value type.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Ty {
+    /// Internal bottom type while return inference reaches a fixed point.
+    Infer,
     /// No value; only valid as a function return type.
     Void,
     Bool,
@@ -31,6 +33,9 @@ pub enum Ty {
 }
 
 impl Ty {
+    pub fn contains_infer(&self) -> bool {
+        matches!(self, Ty::Infer) || matches!(self, Ty::Array(element) if element.contains_infer())
+    }
     /// Construct `array<elem>`.
     pub fn array(elem: Ty) -> Ty {
         Ty::Array(Box::new(elem))
@@ -77,6 +82,7 @@ impl Ty {
 
     pub fn name(&self) -> &str {
         match self {
+            Ty::Infer => "<unresolved return>",
             Ty::Void => "void",
             Ty::Bool => "bool",
             Ty::Int => "int",

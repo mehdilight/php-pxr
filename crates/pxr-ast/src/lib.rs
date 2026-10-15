@@ -266,6 +266,7 @@ impl LValue {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FnDecl {
     pub type_params: Vec<(String, Span)>,
+    pub bounds: Vec<(String, Vec<TypeRef>)>,
     pub name: String,
     pub name_span: Span,
     pub params: Vec<Param>,
@@ -292,6 +293,9 @@ pub enum Visibility {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClassDecl {
     pub type_params: Vec<(String, Span)>,
+    pub bounds: Vec<(String, Vec<TypeRef>)>,
+    pub is_trait: bool,
+    pub trait_uses: Vec<ClassRef>,
     pub is_interface: bool,
     /// Implemented interfaces, or extended interfaces for an interface declaration.
     pub interfaces: Vec<ClassRef>,
@@ -330,6 +334,7 @@ pub struct PropertyDecl {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MethodDecl {
     pub type_params: Vec<(String, Span)>,
+    pub bounds: Vec<(String, Vec<TypeRef>)>,
     pub is_static: bool,
     pub is_abstract: bool,
     pub visibility: Visibility,

@@ -26,6 +26,9 @@ Run any of these with `pxr run <file>`, or from a release build:
 | `generics.php` | Generic functions, explicit/inferred calls, native specialization, recursion | ❌ PXR generic syntax |
 | `generic_classes.php` | Generic classes, function/class inference, nested types, array copies, identity | ❌ PXR generic syntax |
 | `generic_methods.php` | Independent method parameters, static calls, parent calls, generic interface methods | ❌ PXR generic syntax |
+| `constraints.php` | Nominal generic bounds and interface intersections on functions/classes/methods | ❌ PXR generic syntax |
+| `traits.php` | Nested trait composition, private properties, and static state | ✅ |
+| `inference.php` | Inferred returns, recursion, numeric joins, generic function/method results | ❌ PXR generic syntax |
 
 `compat.php` and `quicksort.php` are compatibility proofs: they compile with
 `pxr` and run under `php`, and both produce the same bytes.

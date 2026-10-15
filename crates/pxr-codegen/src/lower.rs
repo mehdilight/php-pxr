@@ -453,6 +453,7 @@ impl Lowerer {
 
     fn lower_expr(&mut self, e: &TExpr) -> Value {
         match e {
+            TExpr::Deferred => unreachable!("deferred inference cannot reach lowering"),
             TExpr::Coerce { expr, ty } => {
                 let v = self.lower_expr(expr);
                 self.cast(v, &expr.ty(), ty)

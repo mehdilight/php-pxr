@@ -15,12 +15,16 @@ pub(super) struct ClassExpander {
     method_displays: HashMap<(String, String), String>,
     virtual_methods: HashMap<(String, String), (String, Vec<Ty>)>,
     methods_pending: bool,
+    inferred_returns: HashMap<String, Ty>,
+    return_updates: HashMap<String, usize>,
+    returns_pending: bool,
     pub diags: Diagnostics,
 }
 
 pub(super) fn type_ref(ty: &Ty) -> ast::TypeRef {
     use ast::TypeRef as R;
     match ty {
+        Ty::Infer => unreachable!("unresolved arguments are deferred before specialization"),
         Ty::Void => R::Void,
         Ty::Int => R::Int,
         Ty::Float => R::Float,
@@ -71,6 +75,9 @@ impl ClassExpander {
             method_displays: HashMap::new(),
             virtual_methods: HashMap::new(),
             methods_pending: false,
+            inferred_returns: HashMap::new(),
+            return_updates: HashMap::new(),
+            returns_pending: false,
             diags: Diagnostics::new(),
         };
         for item in &program.items {
@@ -97,13 +104,56 @@ impl ClassExpander {
     }
 
     pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty() || self.methods_pending
+        !self.pending.is_empty() || self.methods_pending || self.returns_pending
     }
 
     pub fn method_display(&self, class: &str, name: &str) -> Option<&str> {
         self.method_displays
             .get(&(class.to_ascii_lowercase(), name.to_ascii_lowercase()))
             .map(String::as_str)
+    }
+
+    pub fn inferred_return(&self, name: &str) -> Ty {
+        self.inferred_returns
+            .get(name)
+            .cloned()
+            .unwrap_or(Ty::Infer)
+    }
+
+    pub fn next_inference_epoch(&self, program: &ast::Program) -> Option<Self> {
+        if !self.returns_pending {
+            return None;
+        }
+        // Type widening can invalidate a speculative class/method demand.
+        // Rediscover artifacts from the source while retaining solved returns.
+        let mut next = Self::new(program);
+        next.inferred_returns = self.inferred_returns.clone();
+        next.return_updates = self.return_updates.clone();
+        Some(next)
+    }
+
+    pub fn record_return(&mut self, name: &str, ty: Ty, span: Span) {
+        fn depth(ty: &Ty) -> usize {
+            match ty {
+                Ty::Array(element) => 1 + depth(element),
+                _ => 0,
+            }
+        }
+        if self.inferred_return(name) == ty {
+            return;
+        }
+        let updates = self.return_updates.entry(name.into()).or_default();
+        *updates += 1;
+        if *updates > 64 || depth(&ty) > 64 {
+            self.error(
+                "E0284",
+                span,
+                "return inference grows recursively; add an explicit return annotation".into(),
+            );
+            return;
+        }
+        self.inferred_returns.insert(name.into(), ty);
+        self.returns_pending = true;
     }
 
     pub fn request_virtual_method(
@@ -352,6 +402,7 @@ impl ClassExpander {
     }
 
     pub fn program(&mut self, original: &ast::Program) -> ast::Program {
+        self.returns_pending = false;
         self.methods_pending = false;
         let mut program = original.clone();
         program.items.retain(
@@ -392,6 +443,7 @@ impl ClassExpander {
     }
 
     pub fn function(&mut self, function: &mut ast::FnDecl, bindings: &Bindings) {
+        self.bounds(&mut function.bounds, bindings);
         for parameter in &mut function.params {
             self.annotation(&mut parameter.ty, bindings);
         }
@@ -408,6 +460,7 @@ impl ClassExpander {
     }
 
     fn class(&mut self, class: &mut ast::ClassDecl, bindings: &Bindings) {
+        self.bounds(&mut class.bounds, bindings);
         for reference in class.extends.iter_mut().chain(class.interfaces.iter_mut()) {
             self.class_reference(
                 &mut reference.name,
@@ -432,6 +485,14 @@ impl ClassExpander {
     }
 
     fn method(&mut self, method: &mut ast::MethodDecl, bindings: &Bindings) {
+        // Imported trait methods retain their own lexical parameters even when
+        // a consuming generic class uses the same spelling.
+        let mut scoped = bindings.clone();
+        for (name, _) in &method.type_params {
+            scoped.remove(name);
+        }
+        let bindings = &scoped;
+        self.bounds(&mut method.bounds, bindings);
         for parameter in &mut method.params {
             self.annotation(&mut parameter.ty, bindings);
         }
@@ -441,6 +502,40 @@ impl ClassExpander {
                 self.statement(statement, bindings);
             }
         }
+    }
+
+    fn bounds(&mut self, bounds: &mut [(String, Vec<ast::TypeRef>)], bindings: &Bindings) {
+        for (_, requirements) in bounds {
+            for requirement in requirements {
+                self.rewrite_type(requirement, bindings);
+            }
+        }
+    }
+
+    pub fn class_constraints(
+        &self,
+    ) -> Vec<(
+        String,
+        Vec<(String, Vec<ast::TypeRef>)>,
+        HashMap<String, Ty>,
+        Span,
+    )> {
+        self.declarations
+            .iter()
+            .filter(|class| !class.bounds.is_empty())
+            .map(|class| {
+                let bindings = self.class_bindings[&class.name.to_ascii_lowercase()]
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), concrete_type(ty)))
+                    .collect();
+                (
+                    class.name.clone(),
+                    class.bounds.clone(),
+                    bindings,
+                    class.name_span,
+                )
+            })
+            .collect()
     }
 
     fn class_reference(

@@ -20,7 +20,10 @@ use pxr_types::Ty;
 use std::collections::{HashMap, VecDeque};
 
 mod class_generics;
+mod constraints;
 mod generics;
+mod return_inference;
+mod traits;
 
 /// Aliases re-exported so downstream stages can refer to the operator enums
 /// through the semantic layer.
@@ -251,6 +254,8 @@ pub enum Callee {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TExpr {
+    /// Internal inference placeholder; never reaches IR generation.
+    Deferred,
     Coerce {
         expr: Box<TExpr>,
         ty: Ty,
@@ -350,6 +355,7 @@ pub struct TArm {
 impl TExpr {
     pub fn ty(&self) -> Ty {
         match self {
+            TExpr::Deferred => Ty::Infer,
             TExpr::Coerce { ty, .. } => ty.clone(),
             TExpr::Int(_) => Ty::Int,
             TExpr::Float(_) => Ty::Float,
@@ -762,6 +768,8 @@ pub struct MethodInfo {
 }
 
 pub struct Analyzer {
+    unresolved_returns: Vec<(String, Span)>,
+    return_contract_errors: Vec<Diagnostic>,
     class_expander: class_generics::ClassExpander,
     validating_template: bool,
     php_interop: bool,
@@ -787,6 +795,9 @@ struct Signature {
 
 /// Result of analysing one function body.
 struct FnCtx {
+    infer_return: bool,
+    inference_failed: bool,
+    return_types: Vec<(Ty, Span)>,
     flow: FlowState,
     type_bindings: HashMap<String, Ty>,
     slots: Vec<Ty>,
@@ -804,6 +815,9 @@ struct FnCtx {
 impl FnCtx {
     fn new(ret: Ty, is_main: bool) -> Self {
         FnCtx {
+            infer_return: false,
+            inference_failed: false,
+            return_types: Vec::new(),
             flow: FlowState::default(),
             type_bindings: HashMap::new(),
             slots: Vec::new(),
@@ -853,13 +867,20 @@ fn uses_php(statement: &ast::Stmt) -> bool {
 }
 
 pub fn analyze(program: &ast::Program) -> (Option<TProgram>, Diagnostics) {
+    let (expanded_traits, diagnostics) = traits::expand(program);
+    if diagnostics.has_errors() {
+        return (None, diagnostics);
+    }
+    let program = &expanded_traits;
     let mut class_expander = class_generics::ClassExpander::new(program);
-    loop {
+    for _ in 0..2048 {
         let expanded = class_expander.program(program);
         if class_expander.diags.has_errors() {
             return (None, class_expander.diags);
         }
         let mut a = Analyzer {
+            unresolved_returns: Vec::new(),
+            return_contract_errors: Vec::new(),
             class_expander,
             validating_template: false,
             php_interop: program.items.iter().any(uses_php),
@@ -871,6 +892,10 @@ pub fn analyze(program: &ast::Program) -> (Option<TProgram>, Diagnostics) {
             classes: HashMap::new(),
         };
         let result = a.run(&expanded);
+        if let Some(next) = a.class_expander.next_inference_epoch(program) {
+            class_expander = next;
+            continue;
+        }
         if a.class_expander.diags.has_errors() {
             return (None, a.class_expander.diags);
         }
@@ -882,6 +907,15 @@ pub fn analyze(program: &ast::Program) -> (Option<TProgram>, Diagnostics) {
         // only diagnostics from the complete graph are externally visible.
         class_expander = a.class_expander;
     }
+    let mut diagnostics = Diagnostics::new();
+    diagnostics.emit(
+        Diagnostic::error(
+            "return/class inference did not converge; add explicit return annotations",
+        )
+        .with_code("E0284")
+        .with_span(program.span),
+    );
+    (None, diagnostics)
 }
 
 impl Analyzer {
@@ -906,6 +940,9 @@ impl Analyzer {
     }
 
     pub fn is_assignable(&self, from: &Ty, to: &Ty) -> bool {
+        if from.contains_infer() || to.contains_infer() {
+            return true;
+        }
         if from == to {
             return true;
         }
@@ -937,6 +974,9 @@ impl Analyzer {
     // Numeric widening is an expression coercion, not signature covariance:
     // dispatch must preserve the implementation's ABI.
     fn compatible_return(&self, from: &Ty, to: &Ty) -> bool {
+        if from.contains_infer() || to.contains_infer() {
+            return true;
+        }
         from == to
             || matches!((from, to), (Ty::Named(_), Ty::Named(_))) && self.is_assignable(from, to)
     }
@@ -1186,6 +1226,10 @@ impl Analyzer {
 
     fn run(&mut self, program: &ast::Program) -> Option<TProgram> {
         self.collect_classes(program);
+        for (name, bounds, bindings, span) in self.class_expander.class_constraints() {
+            self.validate_bounds(&bounds);
+            self.check_bounds(&name, &bounds, &bindings, span);
+        }
         if self.diags.has_errors() {
             return None;
         }
@@ -1277,10 +1321,31 @@ impl Analyzer {
             funcs.push(function);
         }
 
+        if !self.class_expander.has_pending() {
+            for diagnostic in std::mem::take(&mut self.return_contract_errors) {
+                self.diags.emit(diagnostic);
+            }
+        }
         if self.diags.has_errors() {
             return None;
         }
 
+        if !self.class_expander.has_pending() && !self.unresolved_returns.is_empty() {
+            for (name, span) in &self.unresolved_returns {
+                self.diags.emit(Diagnostic::error(format!("cannot resolve the recursive return type of `{name}`; add an explicit return annotation")).with_code("E0284").with_span(*span));
+            }
+            return None;
+        }
+        if !self.class_expander.has_pending()
+            && (funcs.iter().any(|function| {
+                function.ret.contains_infer() || function.slots.iter().any(Ty::contains_infer)
+            }) || main
+                .as_ref()
+                .is_some_and(|function| function.slots.iter().any(Ty::contains_infer)))
+        {
+            self.diags.emit(Diagnostic::error("return inference left unresolved value types; add an explicit return annotation").with_code("E0284").with_span(program.span));
+            return None;
+        }
         // Register the transitive closure, including interface membership.
         let mut class_registrations = Vec::new();
         for class in self.classes.values() {
@@ -1633,6 +1698,7 @@ impl Analyzer {
                             );
                         }
                         self.validating_template = !m.type_params.is_empty();
+                        self.validate_bounds(&m.bounds);
                         let bindings: HashMap<_, _> = m
                             .type_params
                             .iter()
@@ -1700,18 +1766,13 @@ impl Analyzer {
                         } else {
                             match &m.ret {
                                 Some(t) => self.resolve_type_with(t, &bindings),
-                                None => {
-                                    self.diags.emit(
-                                        Diagnostic::error(format!(
-                                            "method `{}` needs an explicit return type",
-                                            m.name
-                                        ))
-                                        .with_code("E0204")
-                                        .with_span(m.name_span)
-                                        .with_note("write e.g. `public function f(): int`"),
-                                    );
-                                    Ty::Int
+                                None if m.is_abstract => {
+                                    self.diags.emit(Diagnostic::error("abstract/interface methods require a return annotation").with_code("E0204").with_span(m.name_span));
+                                    Ty::Infer
                                 }
+                                None => self
+                                    .class_expander
+                                    .inferred_return(&mangle_method(&c.name, &m.name)),
                             }
                         };
 
@@ -1805,14 +1866,17 @@ impl Analyzer {
                                 if ret != existing.ret
                                     && !self.compatible_return(&ret, &existing.ret)
                                 {
-                                    self.diags.emit(
-                                        Diagnostic::error(format!(
+                                    let diagnostic = Diagnostic::error(format!(
                                             "return type `{ret}` in `{}::{}` must be compatible with `{}` in `{}::{}`",
                                             c.name, m.name, existing.ret, existing.declaring_class, m.name
                                         ))
                                         .with_code("E0208")
-                                        .with_span(m.name_span),
-                                    );
+                                        .with_span(m.name_span);
+                                    if m.ret.is_none() || existing.ast_method.ret.is_none() {
+                                        self.return_contract_errors.push(diagnostic);
+                                    } else {
+                                        self.diags.emit(diagnostic);
+                                    }
                                 }
                             }
                         }
@@ -1891,17 +1955,23 @@ impl Analyzer {
                         || (implementation.ret != requirement.ret
                             && !self.compatible_return(&implementation.ret, &requirement.ret))
                     {
-                        self.diags.emit(
-                            Diagnostic::error(format!(
-                                "method `{}::{}` is incompatible with interface `{}::{}`",
-                                c.name,
-                                implementation.name,
-                                requirement.declaring_class,
-                                requirement.name
-                            ))
-                            .with_code("E0208")
-                            .with_span(c.name_span),
-                        );
+                        let diagnostic = Diagnostic::error(format!(
+                            "method `{}::{}` is incompatible with interface `{}::{}`",
+                            c.name,
+                            implementation.name,
+                            requirement.declaring_class,
+                            requirement.name
+                        ))
+                        .with_code("E0208")
+                        .with_span(c.name_span);
+                        if implementation.params == requirement.params
+                            && (implementation.ast_method.ret.is_none()
+                                || requirement.ast_method.ret.is_none())
+                        {
+                            self.return_contract_errors.push(diagnostic);
+                        } else {
+                            self.diags.emit(diagnostic);
+                        }
                     }
                 } else {
                     methods.insert(key, requirement);
@@ -1981,6 +2051,7 @@ impl Analyzer {
                 .map(|(name, _)| (name.clone(), Ty::Mixed))
                 .collect();
             self.validating_template = !f.type_params.is_empty();
+            self.validate_bounds(&f.bounds);
             let mut params = Vec::new();
             let mut param_names = Vec::new();
             for p in &f.params {
@@ -2020,18 +2091,7 @@ impl Analyzer {
 
             let ret = match &f.ret {
                 Some(t) => self.resolve_type_with(t, &bindings),
-                None => {
-                    self.diags.emit(
-                        Diagnostic::error(format!(
-                            "function `{}` needs an explicit return type",
-                            f.name
-                        ))
-                        .with_code("E0204")
-                        .with_span(f.name_span)
-                        .with_note("write e.g. `function f(): int` or `: void`"),
-                    );
-                    Ty::Int
-                }
+                None => self.class_expander.inferred_return(&mangle_fn(&f.name)),
             };
 
             self.validating_template = false;
@@ -2138,11 +2198,15 @@ impl Analyzer {
             .function(&mut declaration, &substitutions);
         let f = &declaration;
         let mut ctx = FnCtx::new(sig.ret.clone(), false);
+        ctx.infer_return = f.ret.is_none();
         ctx.type_bindings = bindings;
         for (name, ty) in sig.param_names.iter().zip(sig.params.iter()) {
             ctx.declare(name, ty.clone());
         }
+        let before_errors = self.diags.error_count();
         let body = self.analyze_stmts(&f.body, &mut ctx);
+        ctx.inference_failed = self.diags.error_count() != before_errors;
+        self.finish_return_inference(&sig.mangled, &sig.display, f.name_span, &ctx);
         if ctx.flow.reachable {
             self.check_termination(&f.body, &sig, f.name_span);
         }
@@ -2189,6 +2253,9 @@ impl Analyzer {
 
     fn analyze_method_inner(&mut self, class_name: &str, method: &MethodInfo) -> Option<TFunc> {
         let mut ctx = FnCtx::new(method.ret.clone(), false);
+        ctx.infer_return = method.ast_method.ret.is_none()
+            && method.name != "__construct"
+            && !method.ast_method.is_abstract;
         ctx.current_class = Some(class_name.to_string());
         if !method.ast_method.is_static {
             ctx.declare("this", Ty::Named(class_name.to_string()));
@@ -2198,6 +2265,7 @@ impl Analyzer {
         }
         // Abstract declarations still need a linkable fallback for dispatchers in
         // hierarchies with no concrete descendants. No valid object can reach it.
+        let before_errors = self.diags.error_count();
         let body = if method.ast_method.is_abstract {
             vec![TStmt::Expr(TExpr::Call {
                 callee: Callee::User {
@@ -2213,6 +2281,13 @@ impl Analyzer {
         } else {
             self.analyze_stmts(&method.ast_method.body, &mut ctx)
         };
+        ctx.inference_failed = self.diags.error_count() != before_errors;
+        self.finish_return_inference(
+            &method.mangled,
+            &format!("{class_name}::{}", method.name),
+            method.name_span,
+            &ctx,
+        );
         if !method.ast_method.is_abstract && method.name != "__construct" && method.ret != Ty::Void
         {
             let sig = Signature {
@@ -2537,6 +2612,9 @@ impl Analyzer {
     }
 
     fn expect_truthy(&mut self, ty: &Ty, span: Span) {
+        if ty.contains_infer() {
+            return;
+        }
         if !is_truthy(ty) {
             self.diags.emit(
                 Diagnostic::error(format!("condition must be a scalar value, found `{ty}`"))
@@ -2793,6 +2871,19 @@ impl Analyzer {
                 let (slot, decl_ty) = match ctx.slot_of(name) {
                     Some(slot) => {
                         let existing = ctx.slot_ty(slot);
+                        if existing == Ty::Infer && !val_ty.contains_infer() && annotated.is_none()
+                        {
+                            ctx.slots[slot as usize] = val_ty.clone();
+                            return Some(TStmt::Assign {
+                                target: TTarget::Var {
+                                    name: name.clone(),
+                                    slot,
+                                    ty: val_ty.clone(),
+                                },
+                                ty: val_ty,
+                                value: val,
+                            });
+                        }
                         if let Some(a) = &annotated {
                             if *a != existing {
                                 self.diags.emit(
@@ -3315,6 +3406,26 @@ impl Analyzer {
             return Some(TStmt::Return { value: None, ret });
         }
 
+        if ctx.infer_return {
+            let typed = match value {
+                Some(value) => Some(self.infer_for_type(value, ctx, &ret)?),
+                None => None,
+            };
+            let ty = typed.as_ref().map(TExpr::ty).unwrap_or(Ty::Void);
+            if typed.is_some() && ty == Ty::Void {
+                self.diags.emit(
+                    Diagnostic::error(
+                        "cannot return a void expression; call it before a bare return",
+                    )
+                    .with_code("E0214")
+                    .with_span(span),
+                );
+                return None;
+            }
+            ctx.return_types.push((ty, span));
+            return Some(TStmt::Return { value: typed, ret });
+        }
+
         match (value, &ret) {
             (None, Ty::Void) => Some(TStmt::Return { value: None, ret }),
             (None, _) => {
@@ -3408,6 +3519,9 @@ impl Analyzer {
             ast::Expr::Unary { op, expr, span } => {
                 let operand = self.infer(expr, ctx)?;
                 let oty = operand.ty();
+                if oty.contains_infer() {
+                    return Some(TExpr::Deferred);
+                }
                 match op {
                     AUnOp::Neg => {
                         if !oty.is_numeric() && oty != Ty::Mixed {
@@ -3526,6 +3640,9 @@ impl Analyzer {
             } => {
                 let base_expr = self.infer(base, ctx)?;
                 let base_ty = base_expr.ty();
+                if base_ty.contains_infer() {
+                    return Some(TExpr::Deferred);
+                }
                 let class_name = match &base_ty {
                     Ty::Named(cn) => cn.clone(),
                     other => {
@@ -3603,6 +3720,9 @@ impl Analyzer {
             } => {
                 let base_expr = self.infer(base, ctx)?;
                 let base_ty = base_expr.ty();
+                if base_ty.contains_infer() {
+                    return Some(TExpr::Deferred);
+                }
                 let class_name = match &base_ty {
                     Ty::Named(cn) => cn.clone(),
                     other => {
@@ -4222,6 +4342,9 @@ impl Analyzer {
     /// Validate the operands of a binary operator and compute its result type.
     /// Shared by expression inference and compound assignment.
     fn binary_type(&mut self, op: ABinOp, l: &Ty, r: &Ty, span: Span) -> Option<Ty> {
+        if l.contains_infer() || r.contains_infer() {
+            return Some(Ty::Infer);
+        }
         if *l == Ty::Mixed || *r == Ty::Mixed {
             if *l == Ty::Void || *r == Ty::Void {
                 return self.bad_operands(op, l, r, span);
@@ -4402,6 +4525,12 @@ impl Analyzer {
     /// The common type of two branch results (`?:`, `??`, `match`, array
     /// literals). Allows the same `int`/`float` widening as assignment.
     fn unify_types(&mut self, a: &Ty, b: &Ty, span: Span) -> Option<Ty> {
+        if *a == Ty::Infer {
+            return Some(b.clone());
+        }
+        if *b == Ty::Infer {
+            return Some(a.clone());
+        }
         if a == b {
             return Some(a.clone());
         }
@@ -4473,6 +4602,9 @@ impl Analyzer {
     ) -> Option<TExpr> {
         let b = self.infer(base, ctx)?;
         let bty = b.ty();
+        if bty == Ty::Infer {
+            return Some(TExpr::Deferred);
+        }
         let elem = match bty.array_elem() {
             Some(e) if !matches!(e, Ty::Null) => e.clone(),
             Some(_) => {

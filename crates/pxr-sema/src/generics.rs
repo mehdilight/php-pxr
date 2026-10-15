@@ -79,6 +79,7 @@ fn infer_bindings(
 
 fn encode_type(ty: &Ty) -> String {
     match ty {
+        Ty::Infer => unreachable!("unresolved arguments cannot be specialized"),
         Ty::Void => "v".into(),
         Ty::Int => "i".into(),
         Ty::Float => "f".into(),
@@ -99,6 +100,7 @@ pub(super) fn hex_name(name: &str) -> String {
 }
 
 struct GenericCall {
+    deferred: bool,
     key: (String, Vec<Ty>),
     signature: Signature,
     bindings: HashMap<String, Ty>,
@@ -106,6 +108,22 @@ struct GenericCall {
 }
 
 impl GenericCall {
+    fn deferred(span: Span) -> Self {
+        Self {
+            deferred: true,
+            key: (String::new(), Vec::new()),
+            signature: Signature {
+                mangled: String::new(),
+                display: String::new(),
+                params: Vec::new(),
+                param_names: Vec::new(),
+                ret: Ty::Infer,
+                span,
+            },
+            bindings: HashMap::new(),
+            values: Vec::new(),
+        }
+    }
     fn expression(self, span: Span) -> TExpr {
         let arg_tys = self.values.iter().map(TExpr::ty).collect();
         TExpr::Call {
@@ -155,6 +173,27 @@ impl Analyzer {
         {
             return false;
         }
+        let normalized_bounds = |method: &ast::MethodDecl| {
+            method
+                .type_params
+                .iter()
+                .map(|(name, _)| {
+                    let mut bounds: Vec<_> = method
+                        .bounds
+                        .iter()
+                        .find(|(parameter, _)| parameter == name)
+                        .into_iter()
+                        .flat_map(|(_, bounds)| bounds)
+                        .map(|bound| shape(bound, &method.type_params))
+                        .collect();
+                    bounds.sort();
+                    bounds
+                })
+                .collect::<Vec<_>>()
+        };
+        if normalized_bounds(method) != normalized_bounds(inherited) {
+            return false;
+        }
         method
             .params
             .iter()
@@ -169,7 +208,7 @@ impl Analyzer {
                 (Some(left), Some(right)) => {
                     shape(left, &method.type_params) == shape(right, &inherited.type_params)
                 }
-                _ => false,
+                _ => true,
             }
     }
 
@@ -185,6 +224,7 @@ impl Analyzer {
         virtual_call: bool,
     ) -> Option<TExpr> {
         let declaration = ast::FnDecl {
+            bounds: method.ast_method.bounds.clone(),
             type_params: method.ast_method.type_params.clone(),
             name: format!("{}::{}", method.declaring_class, method.name),
             name_span: method.name_span,
@@ -193,13 +233,23 @@ impl Analyzer {
             body: Vec::new(),
             span: method.ast_method.span,
         };
-        let prepared = self.prepare_generic_call(&declaration, type_args, args, span, ctx)?;
+        let mut prepared = self.prepare_generic_call(&declaration, type_args, args, span, ctx)?;
+        if prepared.deferred {
+            return Some(TExpr::Deferred);
+        }
         let types = &prepared.key.1;
         let member = format!(
             "$g${}${}",
             method.name.to_ascii_lowercase(),
             types.iter().map(encode_type).collect::<Vec<_>>().join("$")
         );
+        if method.ast_method.ret.is_none() {
+            prepared.signature.ret = class
+                .methods
+                .get(&member)
+                .map(|method| method.ret.clone())
+                .unwrap_or(Ty::Infer);
+        }
         // Materialize the same concrete member in every applicable implementation
         // and contract. The ordinary inheritance checker and dispatcher then
         // operate on concrete types, including interface and abstract calls.
@@ -278,6 +328,9 @@ impl Analyzer {
         ctx: &mut FnCtx,
     ) -> Option<TExpr> {
         let prepared = self.prepare_generic_call(declaration, type_args, args, span, ctx)?;
+        if prepared.deferred {
+            return Some(TExpr::Deferred);
+        }
         if !self.specializations.contains_key(&prepared.key) {
             self.specializations
                 .insert(prepared.key.clone(), prepared.signature.clone());
@@ -351,6 +404,9 @@ impl Analyzer {
             } else {
                 self.infer(argument, ctx)?
             };
+            if value.ty().contains_infer() {
+                return Some(GenericCall::deferred(span));
+            }
             if value.ty() == Ty::Void {
                 self.diags.emit(
                     Diagnostic::error("a generic argument must produce a value")
@@ -397,6 +453,9 @@ impl Analyzer {
         }
 
         let key = (declaration.name.to_ascii_lowercase(), concrete.clone());
+        if !self.check_bounds(&declaration.name, &declaration.bounds, &bindings, span) {
+            return None;
+        }
         let signature = if let Some(signature) = self.specializations.get(&key) {
             signature.clone()
         } else {
@@ -421,17 +480,21 @@ impl Analyzer {
                 .iter()
                 .map(|parameter| self.resolve_type_with(parameter.ty.as_ref().unwrap(), &bindings))
                 .collect();
-            let ret = self.resolve_type_with(declaration.ret.as_ref()?, &bindings);
+            let mangled = format!(
+                "pxr$g${}${}",
+                hex_name(&key.0),
+                concrete
+                    .iter()
+                    .map(encode_type)
+                    .collect::<Vec<_>>()
+                    .join("$")
+            );
+            let ret = match &declaration.ret {
+                Some(ret) => self.resolve_type_with(ret, &bindings),
+                None => self.class_expander.inferred_return(&mangled),
+            };
             Signature {
-                mangled: format!(
-                    "pxr$g${}${}",
-                    hex_name(&key.0),
-                    concrete
-                        .iter()
-                        .map(encode_type)
-                        .collect::<Vec<_>>()
-                        .join("$")
-                ),
+                mangled,
                 display: format!(
                     "{}<{}>",
                     declaration.name,
@@ -466,6 +529,7 @@ impl Analyzer {
             }
         }
         Some(GenericCall {
+            deferred: false,
             key,
             signature,
             bindings,

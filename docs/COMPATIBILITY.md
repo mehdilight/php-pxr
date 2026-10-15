@@ -28,7 +28,7 @@ and whose output the test suite asserts is byte‑identical.
 | `++` / `--`, compound assignment `+=` etc. | as *statements* only (see below) |
 | String literals with escapes; hex / binary / `0o` octal / `_`‑separated ints | |
 | **Double‑quoted interpolation** `"$name"`, `"{$name}"` | equivalent to `"" . $name`; `$` not followed by a name start stays literal (`"$"`, `"$1"`, `"foo$"`, `"$$x"`); the array, property and `${...}` forms are rejected (see below) |
-| Infrastructure: typed params, return types, recursion | types are **required** (see below) |
+| Infrastructure: typed params, return types, recursion | parameter annotations required; concrete-body returns inferred when omitted |
 | Arrays `[...]` / `array(...)` | ordered maps, `int`/`string` keys, insertion order |
 | **Array value semantics** | assignment, function arguments, returns and `foreach` all operate on copies (copy‑on‑write, realised as an eager deep copy) |
 | **Array key unification** | a canonical decimal‑integer string key *is* the integer key: `$a["1"]` ≡ `$a[1]` (`"01"`, `"1.5"`, `"+1"`, `" 1"` stay strings) |
@@ -67,7 +67,8 @@ behavioural divergence.
 
 | PHP feature | PXR status |
 | --- | --- |
-| Untyped parameters / missing return type | **Error** `E0202`, `E0204` — PXR requires types |
+| Untyped parameters | **Error** `E0202`; returns can be inferred for concrete bodies |
+| Missing abstract/interface return type | **Error** `E0204`; these signatures have no body to infer |
 | Bare `array` type hint | **Error** — write the element type, `array<T>` (a PXR extension) |
 | A concrete variable changing type (`$x = 1; $x = "s";`) | **Error** — opt into `mixed` to allow type changes |
 | Complex interpolation: `"$a[0]"`, `"$a[$k]"`, `"{$a[0]}"`, `"$obj->p"`, `"${name}"` | **Error** `E0008` — simple `"$name"` / `"{$name}"` work; write these as a concatenation instead |
@@ -228,7 +229,8 @@ typed properties, and abstract signatures. Concrete descendants must implement
 all abstract methods with compatible signatures and visibility. Instantiation of
 abstract classes, private abstract methods, and `parent::` calls to abstract
 methods are compile-time errors (`E0269`). As with other PXR methods, parameter
-and return types are required (constructors may omit their return type).
+types are required for parameters and abstract/interface returns. Concrete
+method returns can be inferred; constructors retain implicit void.
 
 **Interfaces.** Interfaces support public typed method signatures, multiple
 interface inheritance, and multiple class implementation contracts. Calls through
@@ -294,9 +296,18 @@ patterns. Methods can declare independent parameters with explicit/inferred
 instance/static calls, interface/abstract contracts, and native virtual dispatch.
 Generic overrides preserve signature shape up to parameter renaming. Generic
 constructors/magic methods and class-parameter shadowing are rejected.
-Constraints and return-type inference remain unsupported.
+Bounds such as `<T: Printable & Named>` are checked nominally for explicit and
+inferred instantiations. Concrete bodies can omit return annotations; ambiguous
+cycles require an annotation (`E0284`). See [`INFERENCE.md`](INFERENCE.md).
 Scalar widening does not convert `array<int>` storage to `array<float>`; such
 calls fail at compile time. See [`GENERICS.md`](GENERICS.md).
+
+**Traits.** Native traits compose typed properties and methods, including nested
+trait use, namespace/module aliases, and consuming-class visibility/static
+behavior. Class methods override traits; trait methods override inherited
+methods. Conflicts fail explicitly. Adaptations, abstract trait requirements,
+duplicate trait properties, and generic trait declarations are outside this
+subset. See [`TRAITS.md`](TRAITS.md).
 
 **Fail loud, never silent.** Features not yet implemented (such as
 keyed `foreach`, nested array assignment, complex interpolation forms)

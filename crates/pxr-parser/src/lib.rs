@@ -26,6 +26,7 @@ pub struct Parser {
     declared_types: Vec<String>,
     declared_functions: Vec<String>,
     type_params: Vec<String>,
+    future_type_params: Vec<String>,
 }
 
 pub fn parse(src: &str) -> (Option<Program>, Diagnostics) {
@@ -62,6 +63,7 @@ pub fn parse_at(src: &str, offset: usize) -> (Option<Program>, Diagnostics) {
         declared_types: Vec::new(),
         declared_functions: Vec::new(),
         type_params: Vec::new(),
+        future_type_params: Vec::new(),
     };
     let program = p.parse_program();
     let mut diags = shifted;
@@ -405,9 +407,10 @@ impl Parser {
                 Ok(Some(Stmt::Print(e, start.merge(semi.span))))
             }
             TokenKind::Function => self.parse_fn().map(|f| Some(Stmt::FnDecl(Box::new(f)))),
-            TokenKind::Class | TokenKind::Abstract | TokenKind::Interface => self
-                .parse_class()
-                .map(|c| Some(Stmt::ClassDecl(Box::new(c)))),
+            TokenKind::Class | TokenKind::Abstract | TokenKind::Interface | TokenKind::Trait => {
+                self.parse_class()
+                    .map(|c| Some(Stmt::ClassDecl(Box::new(c))))
+            }
             TokenKind::Require
             | TokenKind::RequireOnce
             | TokenKind::Include
@@ -587,24 +590,7 @@ impl Parser {
         }
         self.declared_functions.push(name.to_ascii_lowercase());
         let name = self.declared_name(&name);
-        let mut type_params = Vec::new();
-        if self.eat(&TokenKind::Lt) {
-            loop {
-                let parameter = self.expect_ident("generic type parameter")?;
-                let TokenKind::Ident(name) = parameter.kind else {
-                    unreachable!()
-                };
-                if self.type_params.contains(&name) {
-                    self.error(parameter.span, format!("duplicate type parameter `{name}`"));
-                }
-                self.type_params.push(name.clone());
-                type_params.push((name, parameter.span));
-                if !self.eat(&TokenKind::Comma) {
-                    break;
-                }
-            }
-            self.expect_type_close()?;
-        }
+        let (type_params, bounds) = self.parse_type_parameters()?;
 
         self.expect(&TokenKind::LParen, "`(` after function name")?;
         let mut params = Vec::new();
@@ -644,6 +630,7 @@ impl Parser {
         let end = self.peek().span;
         Ok(FnDecl {
             type_params,
+            bounds,
             name,
             name_span,
             params,
@@ -664,12 +651,13 @@ impl Parser {
         let start = self.peek().span;
         let explicit_abstract = self.eat(&TokenKind::Abstract);
         let is_interface = self.eat(&TokenKind::Interface);
+        let is_trait = self.eat(&TokenKind::Trait);
         if is_interface && explicit_abstract {
             self.error(start, "interfaces cannot have an `abstract` modifier");
             return Err(());
         }
         let is_abstract = explicit_abstract || is_interface;
-        if !is_interface {
+        if !is_interface && !is_trait {
             self.expect(&TokenKind::Class, "`class` after `abstract`")?;
         }
         let name_tok = self.expect_ident("class name")?;
@@ -683,24 +671,8 @@ impl Parser {
         }
         self.declared_types.push(name.to_ascii_lowercase());
         let name = self.declared_name(&name);
-        let mut type_params = Vec::new();
-        if self.eat(&TokenKind::Lt) {
-            loop {
-                let token = self.expect_ident("generic class type parameter")?;
-                let TokenKind::Ident(name) = token.kind else {
-                    unreachable!()
-                };
-                if self.type_params.contains(&name) {
-                    self.error(token.span, format!("duplicate type parameter `{name}`"));
-                }
-                self.type_params.push(name.clone());
-                type_params.push((name, token.span));
-                if !self.eat(&TokenKind::Comma) {
-                    break;
-                }
-            }
-            self.expect_type_close()?;
-        }
+        let (type_params, bounds) = self.parse_type_parameters()?;
+
         let mut extends = None;
         let mut interfaces = Vec::new();
         if is_interface {
@@ -715,7 +687,13 @@ impl Parser {
         }
         self.expect(&TokenKind::LBrace, "`{` after class header")?;
         let mut members = Vec::new();
+        let mut trait_uses = Vec::new();
         while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
+            if self.eat(&TokenKind::Use) {
+                trait_uses.extend(self.parse_interface_names()?);
+                self.expect(&TokenKind::Semicolon, "`;` after trait use")?;
+                continue;
+            }
             let before = self.pos;
             match self.parse_class_member(is_interface) {
                 Ok(m) => members.push(m),
@@ -727,7 +705,10 @@ impl Parser {
         }
         let close = self.expect(&TokenKind::RBrace, "`}` after class body")?;
         Ok(ClassDecl {
+            is_trait,
+            trait_uses,
             type_params,
+            bounds,
             is_interface,
             interfaces,
             is_abstract,
@@ -874,27 +855,7 @@ impl Parser {
         };
         let name_span = name_tok.span;
 
-        let mut type_params = Vec::new();
-        if self.eat(&TokenKind::Lt) {
-            loop {
-                let token = self.expect_ident("method type parameter")?;
-                let TokenKind::Ident(name) = token.kind else {
-                    unreachable!()
-                };
-                if self.type_params.contains(&name) {
-                    self.error(
-                        token.span,
-                        format!("duplicate or shadowed type parameter `{name}`"),
-                    );
-                }
-                self.type_params.push(name.clone());
-                type_params.push((name, token.span));
-                if !self.eat(&TokenKind::Comma) {
-                    break;
-                }
-            }
-            self.expect_type_close()?;
-        }
+        let (type_params, bounds) = self.parse_type_parameters()?;
 
         self.expect(&TokenKind::LParen, "`(` after method name")?;
         let mut params = Vec::new();
@@ -939,6 +900,7 @@ impl Parser {
         let end = self.peek().span;
         Ok(MethodDecl {
             type_params,
+            bounds,
             is_static,
             is_abstract,
             visibility,
@@ -995,7 +957,7 @@ impl Parser {
             TokenKind::Ident(_) | TokenKind::Backslash | TokenKind::Namespace
         ) {
             let (name, span) = self.parse_name()?;
-            if self.type_params.contains(&name) {
+            if self.type_params.contains(&name) || self.future_type_params.contains(&name) {
                 return Ok(TypeRef::Param(name, span));
             }
             let name = self.resolve_name(&name, false).0;
@@ -1046,6 +1008,70 @@ impl Parser {
             self.expect_type_close()?;
         }
         Ok(arguments)
+    }
+
+    fn parse_type_parameters(
+        &mut self,
+    ) -> Result<(Vec<(String, Span)>, Vec<(String, Vec<TypeRef>)>), ()> {
+        let previous = std::mem::take(&mut self.future_type_params);
+        if self.at(&TokenKind::Lt) {
+            let mut depth = 1i32;
+            let mut parameter = true;
+            for token in self.toks.iter().skip(self.pos + 1) {
+                match &token.kind {
+                    TokenKind::Ident(name) if depth == 1 && parameter => {
+                        self.future_type_params.push(name.clone());
+                        parameter = false;
+                    }
+                    TokenKind::Lt => depth += 1,
+                    TokenKind::Gt | TokenKind::GtEq => depth -= 1,
+                    TokenKind::Shr | TokenKind::ShrEq => depth -= 2,
+                    TokenKind::Comma if depth == 1 => parameter = true,
+                    _ => {}
+                }
+                if depth <= 0 {
+                    break;
+                }
+            }
+        }
+        let result = self.parse_type_parameters_inner();
+        self.future_type_params = previous;
+        result
+    }
+
+    fn parse_type_parameters_inner(
+        &mut self,
+    ) -> Result<(Vec<(String, Span)>, Vec<(String, Vec<TypeRef>)>), ()> {
+        let mut parameters = Vec::new();
+        let mut bounds = Vec::new();
+        if self.eat(&TokenKind::Lt) {
+            loop {
+                let token = self.expect_ident("type parameter")?;
+                let TokenKind::Ident(name) = token.kind else {
+                    unreachable!()
+                };
+                if self.type_params.contains(&name) {
+                    self.error(
+                        token.span,
+                        format!("duplicate or shadowed type parameter `{name}`"),
+                    );
+                }
+                self.type_params.push(name.clone());
+                parameters.push((name.clone(), token.span));
+                if self.eat(&TokenKind::Colon) {
+                    let mut requirements = vec![self.parse_type()?];
+                    while self.eat(&TokenKind::Amp) {
+                        requirements.push(self.parse_type()?);
+                    }
+                    bounds.push((name, requirements));
+                }
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect_type_close()?;
+        }
+        Ok((parameters, bounds))
     }
 
     // `<` after an instanceof target or property can begin a comparison.
@@ -2027,6 +2053,36 @@ mod tests {
         assert!(
             matches!(&values[0], Expr::StaticCall {type_args, method_type_args, ..} if type_args == &[TypeRef::Int] && method_type_args == &[TypeRef::String])
         );
+    }
+
+    #[test]
+    fn generic_bounds_scope_over_the_full_parameter_list() {
+        let p = ok("<?php namespace N; function f<T: Reader<U> & Named, U>(T $v) {return $v;}");
+        let Stmt::FnDecl(function) = &p.items[0] else {
+            panic!("expected function")
+        };
+        assert_eq!(function.bounds.len(), 1);
+        assert!(
+            matches!(&function.bounds[0].1[0], TypeRef::Applied(name, args, _) if name == "N\\Reader" && matches!(&args[0], TypeRef::Param(name, _) if name == "U"))
+        );
+        assert!(function.ret.is_none());
+    }
+
+    #[test]
+    fn trait_members_and_class_generic_scopes_parse_independently() {
+        let p = ok("<?php trait Identity {public function id<U>(U $v) {return $v;}} class Box<T> {use Identity; public function get(): T {return $this->value;}}");
+        let Stmt::ClassDecl(trait_decl) = &p.items[0] else {
+            panic!("expected trait")
+        };
+        assert!(trait_decl.is_trait);
+        let Stmt::ClassDecl(class) = &p.items[1] else {
+            panic!("expected class")
+        };
+        assert_eq!(class.trait_uses[0].name, "Identity");
+        let ClassMember::Method(method) = &class.members[0] else {
+            panic!("expected method")
+        };
+        assert!(matches!(&method.ret, Some(TypeRef::Param(name, _)) if name == "T"));
     }
 
     #[test]

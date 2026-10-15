@@ -404,19 +404,14 @@ fn generic_invalid_programs_fail_with_diagnostics() {
             "E0201",
         ),
         (
-            "return_required",
-            "function f<T>(T $x) {return $x;}",
-            "E0204",
-        ),
-        (
             "out_of_scope",
             "function f<T>(T $x): T {return $x;} function g(T $x): int {return 1;}",
             "E0205",
         ),
         (
-            "constraints_pending",
+            "unknown_constraint",
             "function f<T: Countable>(T $x): T {return $x;}",
-            "E0100",
+            "E0205",
         ),
     ];
     for (name, source, code) in cases {
@@ -987,6 +982,434 @@ fn generic_method_polymorphic_recursion_is_bounded() {
     let r = run_ok(&["check", f.to_str().unwrap()]);
     assert_eq!(r.code, 1, "{}", r.stderr);
     assert!(r.stderr.contains("E0283"), "{}", r.stderr);
+}
+
+#[test]
+fn generic_bounds_run_for_functions_classes_and_methods() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "generic_bounds",
+        include_str!("../../../examples/constraints.php"),
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "named:item:named:item\nitem\n");
+}
+
+#[test]
+fn generic_bounds_support_dependent_interfaces_and_module_aliases() {
+    if !have_cc() {
+        return;
+    }
+    let module = temp_php(
+        "bounds_module",
+        r#"<?php
+        namespace Contracts;
+        interface Reader<T> {public function get(): T;}
+        class IntReader implements Reader<int> {public function get(): int {return 42;}}
+    "#,
+    );
+    let source = format!(
+        r#"<?php
+        namespace App;
+        require '{}';
+        use Contracts\Reader as Readable;
+        use Contracts\IntReader;
+        function read<T,U: Readable<T>>(U $reader) {{ return $reader->get(); }}
+        function forward<U: Readable<T>,T>(U $reader) {{return $reader->get();}}
+        function subtype<A,B:A>(A $a,B $b) {{return $b->get();}}
+        class Holder<T,U: Readable<T>> {{
+            private U $reader;
+            public function __construct(U $reader) {{$this->reader = $reader;}}
+            public function get() {{return $this->reader->get();}}
+        }}
+        echo read<int,IntReader>(new IntReader()), ':', (new Holder<int,IntReader>(new IntReader()))->get(), ':', forward<IntReader,int>(new IntReader()), ':', subtype(new IntReader(),new IntReader()), "\n";
+    "#,
+        module.display()
+    );
+    let f = temp_php("dependent_bounds", &source);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "42:42:42:42\n");
+}
+
+#[test]
+fn generic_bounds_fail_before_native_generation() {
+    let cases = [
+        ("scalar", "interface I {} function f<T:I>(T $x): T {return $x;} f(1);", "E0286"),
+        ("wrong_object", "interface I {} class C {} function f<T:I>(T $x): T {return $x;} f(new C());", "E0286"),
+        ("intersection", "interface I {} interface J {} class C implements I {} function f<T:I & J>(T $x): T {return $x;} f(new C());", "E0286"),
+        ("class_bound", "interface I {} class C<T:I> {} new C<int>();", "E0286"),
+        ("method_bound", "interface I {} class C {public function f<T:I>(T $v): T {return $v;}} (new C())->f(1);", "E0286"),
+        ("invalid_bound", "function f<T:int>(T $v): T {return $v;}", "E0286"),
+        ("unknown_bound", "function f<T:Missing>(T $v): T {return $v;}", "E0205"),
+        ("wrong_generic_bound", "interface I<T> {} class C implements I<int> {} function f<T:I<string>>(T $v): T {return $v;} f(new C());", "E0286"),
+        ("override_strengthening", "interface I {} class B {public function f<T>(T $v): T {return $v;}} class C extends B {public function f<U:I>(U $v): U {return $v;}}", "E0282"),
+        ("interface_weakening", "interface I {} interface J {public function f<T:I>(T $v): T;} class C implements J {public function f<U>(U $v): U {return $v;}}", "E0282"),
+    ];
+    for (name, source, code) in cases {
+        let f = temp_php(&format!("bound_error_{name}"), &format!("<?php {source}"));
+        let r = run_ok(&["emit-llvm", f.to_str().unwrap()]);
+        assert_eq!(r.code, 1, "{name}: {}", r.stderr);
+        assert!(
+            r.stderr.contains(code),
+            "{name}: expected {code}: {}",
+            r.stderr
+        );
+        assert!(r.stdout.is_empty(), "{name}: invalid bounds emitted LLVM");
+    }
+}
+
+#[test]
+fn trait_composition_and_precedence_match_php() {
+    assert_matches_php(
+        "trait_example",
+        include_str!("../../../examples/traits.php"),
+    );
+    assert_matches_php(
+        "trait_precedence",
+        r#"<?php
+        trait Label {
+            private string $label = 'trait';
+            public function text(): string {return $this->label;}
+            public function method(): string {return 'trait';}
+        }
+        trait Other {public function method(): string {return 'other';}}
+        class ParentItem {public function method(): string {return 'parent';}}
+        class Item extends ParentItem {use Label;}
+        class Own extends ParentItem {use Label, Other; public function method(): string {return 'own';}}
+        echo (new Item())->method(), ':', (new Item())->text(), ':', (new Own())->method(), "\n";
+    "#,
+    );
+}
+
+#[test]
+fn trait_generic_methods_bounds_and_return_inference_compose() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "trait_generics",
+        r#"<?php
+        interface Printable {public function text(): string;}
+        trait Identity {
+            public function identity<U: Printable>(U $value) {return $value;}
+            public function fluent() {return $this;}
+        }
+        class Box<T> implements Printable {
+            use Identity;
+            private T $value;
+            public function __construct(T $value) {$this->value = $value;}
+            public function text(): string {return strval($this->value);}
+        }
+        $box = new Box<int>(42);
+        echo $box->fluent()->identity(new Box<string>('hello'))->text(), ':', $box->text(), "\n";
+    "#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "hello:42\n");
+}
+
+#[test]
+fn traits_resolve_namespace_aliases_in_modules() {
+    if !have_cc() {
+        return;
+    }
+    let module = temp_php(
+        "trait_module",
+        "<?php namespace Library; trait Label {public function text(): string {return 'module';}}",
+    );
+    let source = format!(
+        r#"<?php namespace App; require '{}'; use Library\Label as Named; class Item {{use Named;}} echo (new Item())->text(), "\n";"#,
+        module.display()
+    );
+    let f = temp_php("trait_module_entry", &source);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "module\n");
+}
+
+#[test]
+fn trait_conflicts_and_unsupported_adaptations_fail_loudly() {
+    let cases = [
+        ("missing", "class C {use Missing;}", "E0285"),
+        ("not_trait", "class A {} class C {use A;}", "E0285"),
+        ("cycle", "trait A {use B;} trait B {use A;}", "E0285"),
+        ("conflict", "trait A {public function f(): int {return 1;}} trait B {public function f(): int {return 2;}} class C {use A,B;}", "E0285"),
+        ("properties", "trait A {public int $x=1;} class C {use A; public int $x=1;}", "E0285"),
+        ("abstract", "trait A {abstract public function f(): int;}", "E0285"),
+        ("interface", "trait A {} interface I {use A;}", "E0285"),
+        ("generic_trait", "trait A<T> {}", "E0285"),
+        ("trait_argument", "trait A {} class C {use A<int>;}", "E0285"),
+        ("adaptation", "trait A {} class C {use A {f as g;}}", "E0100"),
+        ("instantiate", "trait A {} new A();", "E0205"),
+    ];
+    for (name, source, code) in cases {
+        let f = temp_php(&format!("trait_error_{name}"), &format!("<?php {source}"));
+        let r = run_ok(&["check", f.to_str().unwrap()]);
+        assert_eq!(r.code, 1, "{name}: {}", r.stderr);
+        assert!(
+            r.stderr.contains(code),
+            "{name}: expected {code}: {}",
+            r.stderr
+        );
+    }
+    let mut source = "<?php trait T0 {}".to_string();
+    for n in 1..70 {
+        source.push_str(&format!("trait T{n} {{use T{};}}", n - 1));
+    }
+    source.push_str("class C {use T69;}");
+    let f = temp_php("trait_expansion_limit", &source);
+    let r = run_ok(&["check", f.to_str().unwrap()]);
+    assert_eq!(r.code, 1, "{}", r.stderr);
+    assert!(
+        r.stderr.contains("E0285") && r.stderr.contains("limit"),
+        "{}",
+        r.stderr
+    );
+}
+
+#[test]
+fn whole_function_return_inference_runs_generic_and_recursive_code() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "return_inference",
+        include_str!("../../../examples/inference.php"),
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "42:1:2.5:21\nhello:7\nmethod\n");
+}
+
+#[test]
+fn return_inference_across_mutual_calls_and_methods_matches_php() {
+    assert_matches_php(
+        "inferred_returns_php",
+        r#"<?php
+        function even(int $n) {if ($n == 0) {return true;} return odd($n-1);}
+        function odd(int $n) {if ($n == 0) {return false;} return even($n-1);}
+        function forward(int $n) {return later($n);}
+        function later(int $n) {return $n * 2;}
+        function logValue(string $v) {echo $v;}
+        class C {
+            public function run(int $n) {return $this->next($n);}
+            private function next(int $n) {return forward($n);}
+            public function __toString() {return 'object';}
+        }
+        echo even(4), ':', odd(4), ':', (new C())->run(21), ':', new C(), "\n";
+        logValue('void'); echo "\n";
+    "#,
+    );
+}
+
+#[test]
+fn return_inference_preserves_arrays_mixed_values_and_common_bases() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "inferred_values",
+        r#"<?php
+        function values(bool $empty) {if ($empty) {return [];} return [[1]];}
+        function nullable(bool $empty) {if ($empty) {return null;} return 7;}
+        class Base {public function name(): string {return 'base';}}
+        class Left extends Base {public function name(): string {return 'left';}}
+        class Right extends Base {public function name(): string {return 'right';}}
+        function object(bool $left) {if ($left) {return new Left();} return new Right();}
+        $a = values(false); $b = $a; $row = $b[0]; $row[0] = 99; $b[0] = $row;
+        echo $a[0][0], ':', $b[0][0], ':', count(values(true)), "\n";
+        echo nullable(false), ':', is_null(nullable(true)), ':', object(false)->name(), "\n";
+    "#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "1:99:0\n7:1:right\n");
+}
+
+#[test]
+fn inferred_method_returns_obey_abstract_and_generic_contracts() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "inferred_contracts",
+        r#"<?php
+        interface Contract {public function value(): int; public function id<T>(T $v): T;}
+        class C implements Contract {
+            public function value() {return 42;}
+            public function id<U>(U $v) {return $v;}
+        }
+        function run(Contract $c) {return $c->id($c->value());}
+        echo run(new C()), "\n";
+    "#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "42\n");
+}
+
+#[test]
+fn inferred_covariant_returns_wait_for_callee_types_to_settle() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "inferred_delayed_covariance",
+        r#"<?php
+        class Root {}
+        class Left extends Root {}
+        class Right extends Root {}
+        class Base {
+            public function value(bool $left) {if ($left) {return new Left();} return later();}
+        }
+        class Child extends Base {public function value(bool $left) {return new Right();}}
+        function later() {return new Right();}
+        function throughBase(Base $base) {return $base->value(false);}
+        echo (throughBase(new Child()) instanceof Right), "\n";
+    "#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "1\n");
+}
+
+#[test]
+fn inferred_widening_discards_obsolete_generic_class_demands() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "inferred_stale_specializations",
+        r#"<?php
+        class Root {}
+        class Child extends Root {}
+        class Box<T> {public function create(): T {return new Root();}}
+        function chosen(bool $child) {if ($child) {return new Child();} return root();}
+        function root() {return new Root();}
+        function box<T>(T $unused) {return new Box<T>();}
+        function create() {return box(chosen(false))->create();}
+        echo (create() instanceof Root), "\n";
+    "#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "1\n");
+}
+
+#[test]
+fn inferred_native_signatures_are_concrete() {
+    let f = temp_php(
+        "inferred_ir",
+        r#"<?php
+        function integer(int $n) {return $n * 2;}
+        function number(bool $b) {if ($b) {return 1;} return 2.5;}
+        function procedure() {echo 'ok';}
+        function overwrite() {$value = overwrite(); $value = 1; return $value;}
+        echo integer(2), number(false); procedure();
+    "#,
+    );
+    let r = run_ok(&["emit-ir", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(
+        r.stdout.contains("func pxr$fn$integer(%v0: int) -> int"),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("func pxr$fn$number(%v0: bool) -> float"),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("func pxr$fn$procedure() -> void"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stdout.contains("unresolved"), "{}", r.stdout);
+}
+
+#[test]
+fn ambiguous_or_invalid_return_inference_never_emits_llvm() {
+    let cases = [
+        ("cycle", "function f() {return f();} f();", "E0284"),
+        ("mutual_cycle", "function f() {return g();} function g() {return f();} f();", "E0284"),
+        ("growing", "function f() {return [f()];} f();", "E0284"),
+        ("mixed_returns", "function f(bool $b) {if ($b) {return 1;} return 's';} f(true);", "E0284"),
+        ("bare_and_value", "function f(bool $b) {if ($b) {return;} return 1;} f(true);", "E0284"),
+        ("fallthrough", "function f(bool $b) {if ($b) {return 1;}} f(true);", "E0206"),
+        ("array_widen", "function f(bool $b) {if ($b) {return [1];} return [2.5];} f(true);", "E0284"),
+        ("void_value", "function f() {} $x = f();", "E0211"),
+        ("bad_parameter", "function f(int $x) {return $x;} f('s');", "E0231"),
+        ("contract", "interface I {public function f(): int;} class C implements I {public function f() {return 's';}}", "E0208"),
+        ("abstract", "interface I {public function f();}", "E0204"),
+        ("numeric_override", "class B {public function f() {return 2.5;}} class C extends B {public function f() {return 1;}}", "E0208"),
+        ("generic_body", "function f<T>(T $v) {return ~$v;} f('s');", "E0221"),
+    ];
+    for (name, source, code) in cases {
+        let f = temp_php(
+            &format!("inference_error_{name}"),
+            &format!("<?php {source}"),
+        );
+        let r = run_ok(&["emit-llvm", f.to_str().unwrap()]);
+        assert_eq!(r.code, 1, "{name}: {}", r.stderr);
+        assert!(
+            r.stderr.contains(code),
+            "{name}: expected {code}: {}",
+            r.stderr
+        );
+        assert!(
+            r.stdout.is_empty(),
+            "{name}: emitted LLVM with incomplete types"
+        );
+    }
+}
+
+#[test]
+fn m5_acceptance_builds_optimized_without_php() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "m5_acceptance",
+        r#"<?php
+        interface Named {public function name(): string;}
+        trait Identity {public function identity<T: Named>(T $value) {return $value;}}
+        class Item implements Named {public function name(): string {return 'native';}}
+        class Box<T: Named> {
+            use Identity;
+            private T $value;
+            public function __construct(T $value) {$this->value = $value;}
+            public function get() {return $this->identity($this->value);}
+        }
+        function box<T: Named>(T $value) {return new Box<T>($value);}
+        echo box(new Item())->get()->name(), "\n";
+    "#,
+    );
+    let binary = f.with_extension("bin");
+    let r = run_ok(&[
+        "build",
+        f.to_str().unwrap(),
+        "--opt",
+        "3",
+        "-o",
+        binary.to_str().unwrap(),
+    ]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let output = Command::new(&binary)
+        .env("PXR_PHP", "/missing/php-executable")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"native\n");
 }
 
 #[test]

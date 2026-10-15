@@ -559,10 +559,10 @@ using `mixed`.
 **Acceptance achieved.** All M4 deliverables above run end to end. M4 covers an
 explicit migration boundary, not every PHP feature. Compiled union/nullable
 annotations, property/element guard caching, and more precise loop analysis
-remain outside this milestone. **In progress:** M5 — generics and inference; async
+remain outside this milestone. M5 generics and inference are delivered below; async
 implementation remains sequenced after M5/M6 in M7.
 
-## 🚧 M5 — Generics & inference
+## ✅ M5 — Generics & inference
 
 **Delivered (M5.1: generic functions).**
 
@@ -615,8 +615,45 @@ PXR extension in `.php` files and does not parse in PHP.
 * Nine additional CLI tests and one parser regression: 125 CLI tests plus
   45 unit tests (170 total). See `examples/generic_methods.php`.
 
-**Remaining.** Constraints/traits and whole-function return-type inference.
-M5 is not complete.
+**Delivered (M5.4: bounds and native traits).**
+
+* `<T: Printable & Named>` bounds on functions, classes, and independent methods,
+  checked for explicit and inferred concrete arguments. Nominal class/interface
+  ancestry supplies capability contracts; generic/dependent bounds and forward
+  parameter references are supported. Overrides preserve bound sets.
+* Native PHP-style trait composition for typed properties/methods: nested use,
+  namespace/module aliases, private state, consuming-class static storage,
+  class/trait/parent precedence, and generic methods with lexical parameter scope.
+  Conflicts/cycles and unsupported adaptations fail explicitly.
+* Trait bodies use consuming-class checks. Advanced trait adaptations, abstract
+  trait requirements, duplicate trait properties, and generic trait declarations
+  remain outside this native subset; interfaces supply abstract contracts.
+
+**Delivered (M5.5: whole-function return inference).**
+
+* Omitted function/concrete method annotations infer from all typed return paths,
+  across forward calls, direct/mutual recursion, generic function/method
+  specializations, class construction, and trait methods. Parameters and
+  abstract/interface result contracts retain required annotations.
+* Integer/float results widen safely; mixed boundaries, empty arrays, and common
+  class ancestors retain their existing representations and value semantics.
+  Incompatible paths, missing value returns, ungrounded cycles, and growing
+  recursive result types fail with diagnostics. No unresolved type reaches IR.
+* Inference and specialization settle together. Provisional specializations are
+  discarded when result types change; inheritance contracts are checked against
+  final results, including delayed covariant returns. Expansion is bounded.
+* Sixteen additional CLI tests and two parser tests cover bounds, traits,
+  inference, rejected programs, native signatures, delayed widening, and an
+  optimized combined acceptance program running without PHP. The suite has
+  **141 CLI tests plus 47 unit tests (188 total)**.
+
+**Acceptance achieved.** Generic functions/types/methods, native specialization,
+nominal constraints and trait composition, and whole-function return inference
+run end to end. See [`GENERICS.md`](GENERICS.md), [`TRAITS.md`](TRAITS.md), and
+[`INFERENCE.md`](INFERENCE.md). Explicit annotations remain necessary where
+inference cannot establish one valid result. Default/partial type arguments and
+constructor type-argument inference are further extensions, not M5 deliverables.
+**Next:** M6 — ownership and memory safety. Async remains M7 after M6.
 
 ## ⛔ M6 — Ownership & memory safety
 

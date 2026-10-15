@@ -1,7 +1,8 @@
 # Generics
 
 M5.1 adds native generic functions; M5.2 adds generic classes and interfaces;
-M5.3 adds independent generic methods.
+M5.3 adds independent generic methods, M5.4 adds bounds/traits, and M5.5 adds
+whole-function return inference. M5 is complete.
 Files keep the `.php` extension, but generic
 syntax is a PXR extension: these files must be compiled with `pxr`, and do not
 parse in the PHP interpreter.
@@ -21,7 +22,7 @@ echo first<string>([], '');   // explicit element type for an empty array
 ```
 
 Type parameters are case-sensitive identifiers scoped to their function. They
-can appear in parameter types, the required return annotation, nested `array<T>`
+can appear in parameter types, an optional return annotation, nested `array<T>`
 types, local annotations (`$copy: T = $value;`), and type arguments to other
 generic functions. Several parameters are supported, such as
 `function second<A, B>(A $a, B $b): B { return $b; }`. Calls follow ordinary
@@ -69,8 +70,8 @@ function and 256 in one program; exceeding either emits `E0283`.
 
 Generic function signatures are checked even when unused. Bodies are checked when
 instantiated, and unused templates emit no native function. This is a template
-model: operations must be valid for each concrete instantiation; declared
-constraints are not implemented yet.
+model: operations must be valid for each concrete instantiation. Declared bounds
+are checked before accepting an instantiation.
 
 ## Generic classes and interfaces
 
@@ -150,8 +151,10 @@ generic class/interface patterns. Namespace aliases and native declaration
 modules work as for ordinary methods.
 
 Interfaces and abstract classes can declare generic methods. Overrides must
-preserve the number and positions of type parameters and the signature shape,
-including the return annotation; parameter names can differ (`<U>` and `<V>`).
+preserve the number and positions of type parameters and the signature shape;
+parameter names can differ (`<U>` and `<V>`). Written return annotations preserve
+the contract's shape; omitted implementation returns are checked after concrete
+inference against the interface/base result.
 Calls through base classes/interfaces specialize potential implementations and
 use the existing concrete virtual dispatch. Newly discovered classes acquire
 previously requested specializations before the program is accepted. Qualified
@@ -164,14 +167,49 @@ declarations per program, and 16,384 bytes per displayed specialization
 (`E0283`); virtual/interface calls can materialize multiple implementations.
 The generic call-checking budget also applies.
 
-Method type parameters cannot shadow class parameters. Constructors and magic
+Directly declared method parameters cannot shadow class parameters; composed
+trait methods retain their original lexical scope. Constructors and magic
 methods cannot declare independent type parameters (`E0282`), though their
 signatures may use class parameters as before.
 
-## Remaining M5 work
+## Bounds and trait contracts
 
-Constraints/traits, omitted return annotations, partial type
-argument lists, default type arguments, and constructor type-argument inference
+```php
+interface Printable { public function text(): string; }
+interface Named { public function name(): string; }
+function describe<T: Printable & Named>(T $value) {
+    return $value->name() . ':' . $value->text();
+}
+class Holder<T: Printable> { /* typed members using T */ }
+```
+
+Bounds apply to functions, classes, and independent methods. A type argument
+must satisfy every class/interface bound by nominal ancestry. Method-name
+coincidence is not a substitute for implementing an interface. Scalar, array,
+and mixed arguments do not satisfy object bounds without a proven narrowing.
+Explicit and inferred arguments receive the same checks (`E0286`).
+
+Bounds can contain generic interfaces and other type parameters, including
+forward references: `<U: Reader<T>, T>` or `<A, B: A>`. Such dependent bounds are
+resolved with the complete concrete binding set. Bounds do not themselves infer
+missing arguments: a parameter used only inside a bound may need an explicit
+type-argument list. Primitive bounds such as `<T: int>` are rejected.
+
+Overrides and interface implementations preserve their generic bound sets up
+to parameter renaming and intersection order; changing those contracts fails
+with `E0282`. Native code-sharing traits are documented in [`TRAITS.md`](TRAITS.md).
+Interfaces are the capability/trait contracts for bounds; mixin trait names are
+not value types or bounds. See [`../examples/constraints.php`](../examples/constraints.php).
+
+## Inferred returns and further extensions
+
+Function and concrete method return annotations may be omitted, including in
+generic templates. Results are inferred per specialization, through recursive
+calls and class construction. Abstract/interface contracts still require an
+annotation. Ambiguous or ungrounded cycles fail with `E0284`; see
+[`INFERENCE.md`](INFERENCE.md) for joining rules and limits.
+
+Partial type-argument lists, default type arguments, and constructor type-argument inference
 remain unsupported. They produce diagnostics. Async remains planned for M7
 after the ownership work in M6.
 

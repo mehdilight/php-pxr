@@ -41,8 +41,10 @@ Scalar widening does not widen array elements: `array<int>` cannot be used as
 
 ```
 program   := topstmt*
-topstmt   := class_decl | fn | stmt
-class_decl:= 'class' NAME type_params? ('extends' class_ref)? ('implements' class_refs)? '{' member* '}'
+topstmt   := class_decl | trait_decl | fn | stmt
+class_decl:= 'class' NAME type_params? ('extends' class_ref)? ('implements' class_refs)? '{' (trait_use | member)* '}'
+trait_decl:= 'trait' NAME '{' (trait_use | member)* '}'
+trait_use := 'use' class_refs ';'
 class_ref := NAME type_args?
 class_refs := class_ref (',' class_ref)*
 member    := prop_decl | method_decl
@@ -50,7 +52,8 @@ prop_decl := visibility type VARIABLE ('=' expr)? ';'
 method_decl := visibility 'function' NAME type_params? '(' params? ')' (':' type)? block
 visibility:= 'public' | 'protected' | 'private'
 fn        := 'function' NAME type_params? '(' params? ')' (':' type)? block
-type_params := '<' NAME (',' NAME)* '>'
+type_params := '<' type_param (',' type_param)* '>'
+type_param := NAME (':' type ('&' type)*)?
 type_args := '<' type (',' type)* '>'
 params    := param (',' param)*
 param     := type VARIABLE
@@ -133,7 +136,10 @@ deliberately does **not** allow assignment expressions (so `$a = $b = 1` and
 
   This is valid PHP 7+ syntax, which is the point: typed modern PHP is already
   most of the way to a PXR signature.
-* A return type is **required** (`: void` for procedures).
+* Omitted returns are inferred from the whole function/concrete method body,
+  including recursive calls and generic instantiations. Explicit annotations
+  remain supported. Abstract/interface signatures require return annotations;
+  constructors retain implicit void. See [`INFERENCE.md`](INFERENCE.md).
 * Function names are **case‑insensitive** (like PHP). Variables are
   **case‑sensitive** (like PHP).
 * Function declarations are hoisted, so functions may call functions declared
@@ -151,8 +157,9 @@ deliberately does **not** allow assignment expressions (so `$a = $b = 1` and
   must be explicit at construction. Methods may declare independent parameters
   (`function map<U>(U $value): U`) with explicit/inferred instance/static calls,
   interface/abstract contracts, and virtual dispatch. Overrides preserve signature
-  shape up to parameter renaming. Constraints and return-type inference remain
-  unsupported. See [`GENERICS.md`](GENERICS.md).
+  shape and bounds up to parameter renaming. Nominal bounds such as
+  `<T: Printable & Named>` apply to functions, classes, and methods. Return
+  annotations can be inferred per instantiation. See [`GENERICS.md`](GENERICS.md).
 
 The remaining top‑level statements (everything that is not a function
 declaration) become the program entry point.
@@ -346,7 +353,7 @@ are `W020x`.
 | `E0201` | Duplicate function definition or parameter |
 | `E0202` | Parameter needs an explicit type |
 | `E0203` | Parameter cannot be `void` |
-| `E0204` | Function needs an explicit return type |
+| `E0204` | Abstract/interface signature needs an explicit return type |
 | `E0205` | Unknown named type |
 | `E0206` | Function must return on all paths |
 | `E0207` | Nested function declarations unsupported |
@@ -405,6 +412,9 @@ are `W020x`.
 | `E0281` | Missing or conflicting generic inference |
 | `E0282` | Incompatible generic method contract or generic constructor/magic method |
 | `E0283` | Generic function, class, or method expansion limit exceeded |
+| `E0284` | Ambiguous, unresolved, or nonconvergent return inference |
+| `E0285` | Invalid/conflicting/unsupported trait composition |
+| `E0286` | Invalid or unsatisfied generic bound |
 | `W0202` | `return` with a value at top level is ignored |
 
 ## Classes, Inheritance & Polymorphism

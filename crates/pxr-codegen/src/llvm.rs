@@ -142,6 +142,7 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
 
 pub fn llty(ty: &Ty) -> &'static str {
     match ty {
+        Ty::Infer => unreachable!("return inference must finish before LLVM generation"),
         Ty::Void => "void",
         Ty::Bool => "i1",
         Ty::Int => "i64",

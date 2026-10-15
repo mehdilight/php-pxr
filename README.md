@@ -17,13 +17,13 @@ The same `main.php` can still run under PHP for comparison. Native programs link
 only the small PXR runtime; explicitly marked legacy boundaries use a PHP CLI
 worker when they execute.
 
-> **Project status: milestones 1–4 complete.**
+> **Project status: milestones 1–5 complete.**
 > M4 adds mixed scalar/null/array/object values, guard narrowing, dynamic
 > operators, runtime PHP include/call boundaries, and a migration report.
 > `examples/migration/main.php` runs a typed native entry point with untyped PHP.
-> M5 is in progress: generic functions, classes, and interfaces now support
-> native specialization, including independent generic methods. Constraints and
-> return inference follow.
+> M5 adds native specialization for generic functions, classes, interfaces, and
+> independent methods; nominal bounds, trait composition, and return inference.
+> Next is M6: ownership and memory safety. Async remains sequenced for M7.
 > See [`docs/GENERICS.md`](docs/GENERICS.md), [`docs/MILESTONES.md`](docs/MILESTONES.md),
 > [`docs/MIXED.md`](docs/MIXED.md), and [`docs/INTEROP.md`](docs/INTEROP.md).
 
@@ -146,7 +146,8 @@ Concrete code receives static diagnostics; mixed operations check runtime tags,
 and marked legacy files run in PHP. The boundary and differences are documented in
 [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md). Highlights:
 
-* Parameters and return types are **required** (PXR is statically typed).
+* Parameters require annotations; function/concrete method returns can be inferred.
+  Abstract/interface contracts still require return annotations.
 * Using an undefined variable is an **error**, not a warning + `null`.
 * Concrete integer overflow wraps; mixed arithmetic promotes to float.
 * Null uses mixed storage; concrete types remain non-nullable.
@@ -199,7 +200,7 @@ automatically when no C compiler is available.
 Tracked honestly in [`docs/ROADMAP.md`](docs/ROADMAP.md). The larger items:
 keyed `foreach`, `echo` of arrays, nested array assignment, nullable
 annotations, overflow promotion for concrete `int` arithmetic, late static binding (`static::`),
-generic constraints and return-type inference,
+advanced trait adaptations and generic trait mixins,
 ownership & borrowing, the complex string‑interpolation forms (`"$a[0]"`,
 `"{$expr}"`, `"${name}"`, `"$obj->p"`; the simple `"$name"` / `"{$name}"` work),
 native exceptions, C interop (`extern`), async/await and concurrency

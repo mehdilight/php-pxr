@@ -61,8 +61,8 @@ mechanism and the ordering of simultaneous child failures remain design work.
 
 ## Dependencies and implementation order
 
-1. Complete the current class/module milestone (M3) and follow the existing
-   roadmap through typed task support (M5) and ownership/lifetime rules (M6).
+1. M1–M5, including generics and inference, are complete. Implement the
+   ownership/lifetime rules in M6 before beginning the async runtime.
    General generics and ownership are project sequencing choices; basic async
    execution alone does not inherently require a complete generics system.
 2. Specify structured errors and resource cleanup, cancellation propagation,
