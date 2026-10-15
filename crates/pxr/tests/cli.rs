@@ -2023,3 +2023,168 @@ fn module_diagnostics_name_the_dependency_and_show_its_source() {
     assert_ne!(r.code, 0);
     assert!(r.stderr.contains("cyclic"), "{}", r.stderr);
 }
+
+#[test]
+fn mixed_scalars_parameters_returns_and_properties_match_php() {
+    if !have_cc() {
+        return;
+    }
+    let src = include_str!("../../../examples/mixed.php");
+    let f = temp_php("mixed_scalars", src);
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "int:42\nfloat:3.5\nbool:1\nstring:hello\nboxed\nfalse\n9\nint:1\nstring:two\nbool:\ndifferent\nmatched\n");
+    assert_matches_php("mixed_scalars_php", src);
+}
+
+#[test]
+fn mixed_predicates_and_strict_comparison_match_php() {
+    assert_matches_php(
+        "mixed_predicates",
+        r#"<?php
+function boxValue(mixed $value): mixed { return $value; }
+function tags(mixed $value): void {
+    echo is_int($value) . is_float($value) . is_bool($value) . is_string($value) . ":";
+    echo is_scalar($value) . is_array($value) . is_object($value) . is_null($value) . "\n";
+}
+tags(1); tags(1.5); tags(true); tags("a\0b");
+class Plain {}
+echo is_array([1]) . is_object(new Plain()) . is_scalar("x") . "\n";
+echo (boxValue(1) === 1 ? "yes" : "no") . "\n";
+echo (1 === boxValue(1) ? "yes" : "no") . "\n";
+echo (boxValue(1) !== boxValue(1.0) ? "yes" : "no") . "\n";
+echo (boxValue("a\0b") === boxValue("a\0b") ? "yes" : "no") . "\n";
+echo (boxValue(-0.0) === boxValue(0.0) ? "yes" : "no") . "\n";
+"#,
+    );
+}
+
+#[test]
+fn mixed_conversions_truthiness_and_control_flow_match_php() {
+    assert_matches_php(
+        "mixed_control",
+        r#"<?php
+function boxValue(mixed $value): mixed { return $value; }
+function selected(bool $flag, mixed $value): mixed { return $flag ? $value : "fallback"; }
+echo selected(true, 1) . ":" . selected(false, 1) . "\n";
+echo intval(boxValue(3.9)) . ":" . floatval(boxValue("2.5")) . ":" . strval(boxValue(false)) . "\n";
+echo intval(boxValue(1e20)) . ":" . intval(boxValue(-1e20)) . "\n";
+echo intval(boxValue(1e100)) . ":" . intval(boxValue(-1.9)) . "\n";
+echo intval(boxValue(9223372036854775808.0)) . ":" . intval(boxValue(-9223372036854775808.0)) . "\n";
+echo (boxValue("0") ? "yes" : "no") . ":" . (boxValue("\0") ? "yes" : "no") . "\n";
+echo (!boxValue(false) && boxValue(1) ? "yes" : "no") . "\n";
+echo (boxValue(false) || boxValue("yes") ? "yes" : "no") . "\n";
+echo match (boxValue(1)) { "1" => "string", 1.0 => "float", 1 => "int", default => "other" } . "\n";
+class Defaults { public mixed $value = "default"; public float $wide = 2; }
+$d = new Defaults(); echo $d->value . ":" . $d->wide . "\n";
+class WideConstructor {
+    public mixed $value = 0;
+    public function __construct(mixed $value) { $this->value = $value; }
+}
+$w = new WideConstructor(4.5); echo $w->value . "\n";
+function widened(): float { return 3; }
+echo widened() . "\n";
+"#,
+    );
+}
+
+#[test]
+fn mixed_opt_in_assignments_and_array_storage_work() {
+    if !have_cc() {
+        return;
+    }
+    let f = temp_php(
+        "mixed_opt_in",
+        r#"<?php
+function boxValue(mixed $value): mixed { return $value; }
+$value: mixed = 1;
+$old = $value;
+$value = "next";
+echo $old . ":" . $value . "\n";
+$value .= "!";
+echo $value . "\n";
+$values: array<mixed> = [boxValue(1), boxValue("two")];
+$values[] = true;
+$copy = $values;
+$copy[0] = "changed";
+$copy[0] .= "!";
+foreach ($values as $v) { echo strval($v) . "|"; }
+echo "\n" . $copy[0] . "\n";
+echo ($values[99] ?? "missing") . "\n";
+$value = true ? boxValue(2) : 3;
+echo $value . "\n";
+"#,
+    );
+    let r = run_ok(&["run", f.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, "1:next\nnext!\n1|two|1|\nchanged!\nmissing\n2\n");
+}
+
+#[test]
+fn unsupported_mixed_operations_are_rejected() {
+    let cases = [
+        (
+            "arithmetic",
+            "function f(mixed $v): mixed { return $v + 1; }",
+            "E0274",
+        ),
+        (
+            "loose_compare",
+            "function f(mixed $v): bool { return $v == 1; }",
+            "E0274",
+        ),
+        (
+            "ordering",
+            "function f(mixed $v): bool { return $v < 1; }",
+            "E0274",
+        ),
+        (
+            "implicit_unbox",
+            "function f(mixed $v): int { return $v; }",
+            "E0215",
+        ),
+        (
+            "no_narrowing_yet",
+            "function f(mixed $v): int { if (is_int($v)) { return $v + 1; } return 0; }",
+            "E0274",
+        ),
+        (
+            "array_box",
+            "function f(mixed $v): void {} f([1]);",
+            "E0231",
+        ),
+        (
+            "object_box",
+            "class C {} function f(mixed $v): void {} f(new C());",
+            "E0231",
+        ),
+        (
+            "whole_array_conversion",
+            "$a: array<mixed> = [1, 2];",
+            "E0212",
+        ),
+        (
+            "array_property_default",
+            "class C { public mixed $value = [1]; }",
+            "E0274",
+        ),
+        ("null", "function f(): mixed { return null; }", "E0209"),
+        (
+            "builtin",
+            "function f(mixed $v): int { return strlen($v); }",
+            "E0234",
+        ),
+        ("predicate_arity", "is_int();", "E0233"),
+        (
+            "predicate_void",
+            "function f(): void {} is_int(f());",
+            "E0234",
+        ),
+    ];
+    for (name, source, code) in cases {
+        let f = temp_php(&format!("mixed_invalid_{name}"), source);
+        let r = run_ok(&["check", f.to_str().unwrap()]);
+        assert_ne!(r.code, 0, "accepted {name}");
+        assert!(r.stderr.contains(code), "{name}: {}", r.stderr);
+    }
+}

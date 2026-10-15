@@ -253,6 +253,7 @@ pub struct MethodDecl {
 /// A syntactic type reference, before resolution.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeRef {
+    Mixed,
     Int,
     Float,
     String,

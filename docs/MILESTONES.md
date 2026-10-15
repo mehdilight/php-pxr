@@ -445,7 +445,7 @@ member limits from M3.5 remain. See [`MODULES.md`](MODULES.md).
 
 **Next:** M4 — gradual migration (`mixed`, narrowing, and dynamic PHP interop).
 
-## ⛔ M4 — Gradual migration
+## 🚧 M4 — Gradual migration
 
 * An opt‑in dynamic `mixed` type with runtime tags, and `is_*` narrowing.
 * `include`/`require` for unmigrated PHP files (interop layer).
@@ -453,6 +453,36 @@ member limits from M3.5 remain. See [`MODULES.md`](MODULES.md).
 
 **Acceptance.** A real (small) PHP project runs compiled, with the untyped parts
 using `mixed`.
+
+**Delivered (M4.1: tagged scalar mixed values slice).**
+
+* Opt-in `mixed` annotations on parameters, returns, local variables, and
+  properties. `int`, `float`, `bool`, and `string` values are automatically boxed
+  at mixed boundaries; inferred concrete variables retain their existing types.
+* Arena-allocated immutable `{ tag, bits }` scalar boxes, represented as a `ptr`
+  in LLVM. Assignments, arguments, returns, constructors, property defaults, and
+  compound concatenation preserve the destination representation.
+* `is_int`, `is_float`, `is_bool`, `is_string`, `is_scalar`, `is_array`,
+  `is_object`, and `is_null` predicates. Checks evaluate their arguments even
+  when the result is known statically. Predicates do not yet narrow types.
+* Explicit `intval`/`floatval`/`strval`/`boolval` conversions, printing,
+  concatenation/interpolation, truthiness, strict `===`/`!==`, `match`, and
+  branches combining mixed expressions with concrete scalar results.
+* Homogeneous `array<mixed>` storage for explicitly boxed scalar elements, with
+  array copying, append/index assignment, and existing array transforms. Whole
+  arrays are not implicitly reboxed from `array<T>` to `array<mixed>`.
+* Unsupported arithmetic, ordering, and loose comparisons on mixed values are
+  loud `E0274` errors; boxing arrays, objects, and null remains unsupported.
+  Typed builtins continue to require concrete arguments except the conversions
+  and predicates listed above.
+* Five new CLI tests cover PHP output comparisons, scalar tags and conversions,
+  strict comparisons, control flow, constructors/properties, opt-in reassignment,
+  mixed array storage, and invalid programs — 80 CLI tests total.
+  Example: `examples/mixed.php`. Details: [`MIXED.md`](MIXED.md).
+
+**Next:** M4.2 — sound flow narrowing after `is_*` guards, including assignment
+invalidation and control-flow joins. Broader boxed values, migration reporting,
+and runtime PHP interop follow; M4 is not complete.
 
 ## ⛔ M5 — Generics & inference
 

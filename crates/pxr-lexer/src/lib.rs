@@ -84,6 +84,7 @@ pub enum TokenKind {
     KwString,
     KwBool,
     KwVoid,
+    KwMixed,
     KwArray,
 
     // Punctuation.
@@ -210,6 +211,7 @@ impl TokenKind {
             TokenKind::KwString => "string",
             TokenKind::KwBool => "bool",
             TokenKind::KwVoid => "void",
+            TokenKind::KwMixed => "mixed",
             TokenKind::KwArray => "array",
             TokenKind::LParen => "(",
             TokenKind::RParen => ")",
@@ -1036,6 +1038,7 @@ fn keyword(word: &str) -> Option<TokenKind> {
         "string" => TokenKind::KwString,
         "bool" => TokenKind::KwBool,
         "void" => TokenKind::KwVoid,
+        "mixed" => TokenKind::KwMixed,
         "array" => TokenKind::KwArray,
         _ => return None,
     })

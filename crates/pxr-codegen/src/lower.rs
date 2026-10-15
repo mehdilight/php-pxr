@@ -184,6 +184,7 @@ impl Lowerer {
             Ty::Float => Literal::Float(0.0),
             Ty::Bool => Literal::Bool(false),
             Ty::String => Literal::Str(Vec::new()),
+            Ty::Mixed => Literal::Null,
             _ => Literal::Str(Vec::new()),
         };
         self.emit_prelude(Inst::Const { dst, lit });
@@ -251,8 +252,9 @@ impl Lowerer {
                 let v = self.lower_expr(value);
                 let vt = value.ty();
                 let result = self.lower_bin_expr(*op, &cur_ty, cur, &vt, v);
-                // `result` is well typed for the operator; store it back.
-                self.lower_store(target, result.1, result.0);
+                // Coerce the operator result to the destination representation.
+                let value = self.cast(result.0, &result.1, ty);
+                self.lower_store(target, ty.clone(), value);
             }
             TStmt::IncDec { target, ty, delta } => {
                 let (cur, cur_ty) = self.lower_load(target, ty.clone());
@@ -298,7 +300,11 @@ impl Lowerer {
             TStmt::Break(level) => self.lower_jump(false, *level),
             TStmt::Continue(level) => self.lower_jump(true, *level),
             TStmt::Return { value, ret } => {
-                let v = value.as_ref().map(|e| self.lower_expr(e));
+                let v = value.as_ref().map(|e| {
+                    let value = self.lower_expr(e);
+                    let value = self.cast(value, &e.ty(), ret);
+                    self.maybe_copy_array(value, ret)
+                });
                 self.terminator(Inst::Ret {
                     ty: ret.clone(),
                     src: v,
@@ -393,6 +399,10 @@ impl Lowerer {
 
     fn lower_expr(&mut self, e: &TExpr) -> Value {
         match e {
+            TExpr::Coerce { expr, ty } => {
+                let v = self.lower_expr(expr);
+                self.cast(v, &expr.ty(), ty)
+            }
             TExpr::Int(v) => self.emit_const(Literal::Int(*v)),
             TExpr::Float(v) => self.emit_const(Literal::Float(*v)),
             TExpr::Str(s) => self.emit_const(Literal::Str(s.clone())),
@@ -547,6 +557,27 @@ impl Lowerer {
         if from == to {
             return v;
         }
+        if *to == Ty::Mixed && from.is_scalar() {
+            let tag = self.emit_const(Literal::Int(Self::tag_of(from)));
+            let bits = self.encode_bits(v, from);
+            return self.rt_call("pxr_mixed_box", vec![tag, bits], Ty::Mixed);
+        }
+        if *from == Ty::Mixed {
+            let function = match to {
+                Ty::Int => "pxr_mixed_i64",
+                Ty::Float => "pxr_mixed_f64",
+                Ty::String => "pxr_mixed_str",
+                Ty::Bool => "pxr_mixed_bool",
+                _ => panic!("unsupported mixed conversion to {to}"),
+            };
+            let result_ty = if *to == Ty::Bool { Ty::Int } else { to.clone() };
+            let result = self.rt_call(function, vec![v], result_ty);
+            return if *to == Ty::Bool {
+                self.cast(result, &Ty::Int, &Ty::Bool)
+            } else {
+                result
+            };
+        }
         let (op, ok) = cast_op(from, to);
         if !ok {
             // Semantic analysis should have rejected this; returning the value
@@ -665,8 +696,7 @@ impl Lowerer {
                     let (a, b, ty) = self.unify_numeric(a, lhs_ty, b, rhs_ty);
                     return self.bin(iop, a, &ty, b, &ty, &Ty::Bool);
                 }
-                let ty = lhs_ty.clone();
-                self.bin(iop, a, &ty, b, &ty, &Ty::Bool)
+                self.bin(iop, a, lhs_ty, b, rhs_ty, &Ty::Bool)
             }
             B::Lt | B::LtEq | B::Gt | B::GtEq => {
                 let iop = match op {
@@ -819,6 +849,9 @@ impl Lowerer {
     fn common_of(&self, a: &Ty, b: &Ty) -> Ty {
         if a == b {
             return a.clone();
+        }
+        if (*a == Ty::Mixed && b.is_scalar()) || (*b == Ty::Mixed && a.is_scalar()) {
+            return Ty::Mixed;
         }
         if a.is_numeric() && b.is_numeric() {
             return if *a == Ty::Float || *b == Ty::Float {
@@ -984,6 +1017,24 @@ impl Lowerer {
     }
 
     fn bin(&mut self, op: IBinOp, a: Value, at: &Ty, b: Value, bt: &Ty, rt: &Ty) -> Value {
+        if (*at == Ty::Mixed || *bt == Ty::Mixed) && matches!(op, IBinOp::Eq | IBinOp::NotEq) {
+            let a = self.cast(a, at, &Ty::Mixed);
+            let b = self.cast(b, bt, &Ty::Mixed);
+            let result = self.rt_call("pxr_mixed_identical", vec![a, b], Ty::Int);
+            let zero = self.emit_const(Literal::Int(0));
+            return self.bin(
+                if op == IBinOp::Eq {
+                    IBinOp::NotEq
+                } else {
+                    IBinOp::Eq
+                },
+                result,
+                &Ty::Int,
+                zero,
+                &Ty::Int,
+                &Ty::Bool,
+            );
+        }
         let dst = self.fresh();
         self.emit(Inst::Bin {
             dst,
@@ -1085,6 +1136,7 @@ impl Lowerer {
             Ty::String => 4,
             Ty::Array(_) => 5,
             Ty::Named(_) => 6,
+            Ty::Mixed => 7,
             _ => 0,
         }
     }
@@ -1784,8 +1836,34 @@ impl Lowerer {
     ) -> Value {
         use Builtin::*;
         match kind {
+            Boolval => self.to_bool(a[0], &arg_tys[0]),
+            IsInt | IsFloat | IsBool | IsString | IsArray | IsObject | IsNull | IsScalar => {
+                let tag = match kind {
+                    IsInt => 1,
+                    IsFloat => 2,
+                    IsBool => 3,
+                    IsString => 4,
+                    IsArray => 5,
+                    IsObject => 6,
+                    IsNull => 0,
+                    IsScalar => -1,
+                    _ => unreachable!(),
+                };
+                if arg_tys[0] == Ty::Mixed {
+                    let tag = self.emit_const(Literal::Int(tag));
+                    let result = self.rt_call("pxr_mixed_is", vec![a[0], tag], Ty::Int);
+                    self.to_bool(result, &Ty::Int)
+                } else {
+                    self.emit_const(Literal::Bool(if tag == -1 {
+                        arg_tys[0].is_scalar()
+                    } else {
+                        Self::tag_of(&arg_tys[0]) == tag
+                    }))
+                }
+            }
             Strlen => self.rt_call("pxr_strlen", vec![a[0]], Ty::Int),
             Intval => match arg_tys[0] {
+                Ty::Mixed => self.cast(a[0], &Ty::Mixed, &Ty::Int),
                 Ty::Int => a[0],
                 Ty::Float => self.cast(a[0], &Ty::Float, &Ty::Int),
                 Ty::Bool => self.cast(a[0], &Ty::Bool, &Ty::Int),
@@ -1793,6 +1871,7 @@ impl Lowerer {
                 _ => a[0],
             },
             Floatval => match arg_tys[0] {
+                Ty::Mixed => self.cast(a[0], &Ty::Mixed, &Ty::Float),
                 Ty::Float => a[0],
                 Ty::Int => self.cast(a[0], &Ty::Int, &Ty::Float),
                 Ty::Bool => self.cast(a[0], &Ty::Bool, &Ty::Float),
@@ -1800,6 +1879,7 @@ impl Lowerer {
                 _ => a[0],
             },
             Strval => match arg_tys[0] {
+                Ty::Mixed => self.cast(a[0], &Ty::Mixed, &Ty::String),
                 Ty::String => a[0],
                 Ty::Int => self.cast(a[0], &Ty::Int, &Ty::String),
                 Ty::Float => self.cast(a[0], &Ty::Float, &Ty::String),

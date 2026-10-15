@@ -2100,3 +2100,77 @@ void pxr_object_set_bits(void *p, long long prop_idx, long long tag, long long b
 }
 
 
+
+/* M4.1: immutable tagged scalar boxes. Container/object boxing follows later. */
+typedef struct { int64_t tag; int64_t bits; } pxr_mixed;
+
+static const pxr_mixed *pxr_mixed_checked(const void *p) {
+    const pxr_mixed *value = p;
+    if (!value || value->tag < 1 || value->tag > 4) {
+        fprintf(stderr, "Fatal error: Uncaught Error: invalid or uninitialized mixed value\n");
+        exit(255);
+    }
+    return value;
+}
+
+void *pxr_mixed_box(long long tag, long long bits) {
+    pxr_mixed *value = pxr_arena_alloc(sizeof(pxr_mixed));
+    value->tag = tag; value->bits = bits;
+    return value;
+}
+
+long long pxr_mixed_is(const void *p, long long tag) {
+    const pxr_mixed *value = pxr_mixed_checked(p);
+    return tag == -1 ? 1 : value->tag == tag;
+}
+
+static long long pxr_mixed_float_to_int(double value) {
+    /* Truncate IEEE-754 magnitude modulo 2^64, avoiding undefined out-of-range
+     * floating-to-integer casts and any additional libm linkage. */
+    uint64_t raw;
+    memcpy(&raw, &value, sizeof(raw));
+    int exponent = (int)((raw >> 52) & 0x7ff) - 1023;
+    if (exponent < 0 || exponent >= 116) return 0; /* includes INF and NaN */
+    uint64_t magnitude = (raw & UINT64_C(0xfffffffffffff)) | (UINT64_C(1) << 52);
+    magnitude = exponent <= 52 ? magnitude >> (52 - exponent) : magnitude << (exponent - 52);
+    if (raw >> 63) magnitude = UINT64_C(0) - magnitude;
+    int64_t result;
+    memcpy(&result, &magnitude, sizeof(result));
+    return result;
+}
+
+long long pxr_mixed_i64(const void *p) {
+    const pxr_mixed *value = pxr_mixed_checked(p);
+    if (value->tag == 2) return pxr_mixed_float_to_int(pxr_bits_to_double(value->bits));
+    if (value->tag == 4) return pxr_str_to_i64((const pxr_str *)(intptr_t)value->bits);
+    return value->bits;
+}
+
+double pxr_mixed_f64(const void *p) {
+    const pxr_mixed *value = pxr_mixed_checked(p);
+    if (value->tag == 2) return pxr_bits_to_double(value->bits);
+    if (value->tag == 4) return pxr_str_to_f64((const pxr_str *)(intptr_t)value->bits);
+    return (double)value->bits;
+}
+
+long long pxr_mixed_bool(const void *p) {
+    const pxr_mixed *value = pxr_mixed_checked(p);
+    if (value->tag == 2) return pxr_truthy_f64(pxr_bits_to_double(value->bits));
+    if (value->tag == 4) return pxr_truthy_str((const pxr_str *)(intptr_t)value->bits);
+    return value->bits != 0;
+}
+
+pxr_str *pxr_mixed_str(const void *p) {
+    const pxr_mixed *value = pxr_mixed_checked(p);
+    return pxr_val_to_str(value->tag, value->bits);
+}
+
+void pxr_mixed_print(const void *p) { pxr_print_str(pxr_mixed_str(p)); }
+
+long long pxr_mixed_identical(const void *a, const void *b) {
+    const pxr_mixed *left = pxr_mixed_checked(a), *right = pxr_mixed_checked(b);
+    if (left->tag != right->tag) return 0;
+    if (left->tag == 4) return pxr_str_eq((const pxr_str *)(intptr_t)left->bits, (const pxr_str *)(intptr_t)right->bits);
+    if (left->tag == 2) return pxr_bits_to_double(left->bits) == pxr_bits_to_double(right->bits);
+    return left->bits == right->bits;
+}

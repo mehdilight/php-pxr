@@ -857,6 +857,7 @@ impl Parser {
                 | TokenKind::KwString
                 | TokenKind::KwBool
                 | TokenKind::KwVoid
+                | TokenKind::KwMixed
                 | TokenKind::KwArray
                 | TokenKind::Ident(_)
                 | TokenKind::Backslash
@@ -888,6 +889,7 @@ impl Parser {
             TokenKind::KwString => TypeRef::String,
             TokenKind::KwBool => TypeRef::Bool,
             TokenKind::KwVoid => TypeRef::Void,
+            TokenKind::KwMixed => TypeRef::Mixed,
             TokenKind::Ident(name) => TypeRef::Named(name),
             other => {
                 self.error(

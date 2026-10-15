@@ -1,11 +1,12 @@
-# The PXR Language (milestones 0–1)
+# The PXR Language
 
 This is the precise description of the language the current compiler accepts.
 It is written to match the implementation and the test suite — if this document
 and the compiler disagree, that is a bug.
 
-PXR is **statically typed**. There is no `mixed` yet; every value has exactly one
-type known at compile time (scalars, or a homogeneous array).
+PXR is **statically typed**, with opt-in scalar `mixed` values for gradual
+migration. Concrete types retain their existing checks; `mixed` values carry a
+runtime scalar tag and require explicit conversion for typed-only operations.
 
 ## Source encoding
 
@@ -23,14 +24,16 @@ type known at compile time (scalars, or a homogeneous array).
 | --- | --- | --- |
 | `int` | 64‑bit signed integer | `i64` |
 | `float` | IEEE‑754 double | `double` |
-| `string` | immutable byte/UTF‑8 string | `const char *` |
+| `string` | immutable byte string | `pxr_str *` |
+| `mixed` | opt-in tagged scalar (`int`, `float`, `bool`, `string`) | opaque `ptr` |
 | `bool` | boolean | `i1` |
 | `void` | no value (return types only) | — |
 | `array<T>` | ordered map with values of type `T` (`int`/`string` keys) | opaque `ptr` |
 | `ClassName` | reference to class instance (`Ty::Named`) | opaque `ptr` |
 
-The only implicit coercion is the lossless widening **`int` → `float`**. All other
-mismatches are compile errors.
+Concrete scalar coercion widens **`int` → `float`**. Scalars can also be boxed
+implicitly when the destination is `mixed`; mixed values are not implicitly
+converted back to concrete types. Other mismatches are compile errors.
 
 ## A quick tour of the supported subset (verbatim from the grammar)
 
@@ -374,6 +377,7 @@ are `W020x`.
 | `E0270` | Invalid class/interface inheritance edge, duplicate supertype, or non-public interface method |
 | `E0271` | Static-member misuse, static/instance modifier mismatch, or unsupported static form |
 | `E0273` | Invalid/unresolved compile-time module dependency or missing file context |
+| `E0274` | Unsupported mixed operation or mixed property default |
 | `W0202` | `return` with a value at top level is ignored |
 
 ## Classes, Inheritance & Polymorphism
@@ -458,3 +462,21 @@ are deduplicated by canonical path. Non-once cycles and dynamic paths are errors
 See [`MODULES.md`](MODULES.md) for examples and the distinction from runtime PHP
 inclusion. `tokens` and `ast` inspect only the requested file; semantic/build
 commands resolve its full dependency graph.
+
+## Scalar mixed values (M4.1)
+
+`function identity(mixed $value): mixed { return $value; }` accepts boxed scalar
+values. Local variables can opt in with `$value: mixed = 1;`; a value inferred
+as `mixed` also remains mixed when subsequently assigned another scalar.
+
+Predicates: `is_int`, `is_float`, `is_bool`, `is_string`, `is_scalar`, `is_array`,
+`is_object`, and `is_null`. Conversion: `intval`, `floatval`, `strval`, `boolval`.
+Mixed values support echo/print, concatenation, interpolation, boolean contexts,
+strict comparisons, `match` against scalar conditions, and scalar/mixed branch
+results. Direct arithmetic, ordering, loose comparisons, and implicit unboxing
+are rejected. Guards do not yet narrow types; convert explicitly inside guards.
+
+Only scalar boxing is implemented. Null, arrays, and objects cannot yet become
+mixed values. Arrays can store boxed scalars as `array<mixed>`; use explicitly
+boxed elements rather than converting an entire concrete array. See
+[`MIXED.md`](MIXED.md) for examples and remaining limits.

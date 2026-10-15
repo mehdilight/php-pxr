@@ -4,8 +4,7 @@
 //! generator so that every stage agrees on the same representation.
 //!
 //! PXR starts from a small, *statically typed* core that mirrors the
-//! scalar types of PHP. Dynamic / `mixed` values are a deliberate roadmap
-//! item rather than something the current milestone pretends to support.
+//! scalar types of PHP. Opt-in `mixed` values use tagged scalar boxes.
 
 use std::fmt;
 
@@ -18,6 +17,8 @@ pub enum Ty {
     Int,
     Float,
     String,
+    /// Opt-in tagged scalar value (M4.1).
+    Mixed,
     /// The type of the `null` literal. Currently not fully implemented.
     Null,
     /// An array with a statically-known value type and dynamically-typed
@@ -63,6 +64,7 @@ impl Ty {
             return true;
         }
         match (self, to) {
+            (from, Ty::Mixed) if from.is_scalar() => true,
             (Ty::Int, Ty::Float) => true,
             // An empty array literal (element type `null`) is assignable to any
             // array type; the element type is refined at the assignment site.
@@ -78,6 +80,7 @@ impl Ty {
             Ty::Int => "int",
             Ty::Float => "float",
             Ty::String => "string",
+            Ty::Mixed => "mixed",
             Ty::Null => "null",
             Ty::Array(_) => "array",
             Ty::Named(n) => n.as_str(),

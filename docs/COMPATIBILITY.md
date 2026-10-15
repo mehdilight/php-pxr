@@ -67,7 +67,7 @@ behavioural divergence.
 | --- | --- |
 | Untyped parameters / missing return type | **Error** `E0202`, `E0204` — PXR requires types |
 | Bare `array` type hint | **Error** — write the element type, `array<T>` (a PXR extension) |
-| A variable changing type (`$x = 1; $x = "s";`) | **Error** — a variable has one static type |
+| A concrete variable changing type (`$x = 1; $x = "s";`) | **Error** — opt into scalar `mixed` to allow scalar type changes |
 | Complex interpolation: `"$a[0]"`, `"$a[$k]"`, `"{$a[0]}"`, `"$obj->p"`, `"${name}"` | **Error** `E0008` — simple `"$name"` / `"{$name}"` work; write these as a concatenation instead |
 | `null`, nullable types | **Error** `E0209` |
 | Assignment as an expression (`$a = $b = 1`, `f($x++)`) | **Error** — `++`/`--`/`=` are statement‑only |
@@ -261,6 +261,20 @@ resolve from the containing file, independent of the process working directory o
 PHP `include_path`. Use `__DIR__ . "/file.php"` for an unambiguous shared PHP/PXR
 path. Missing files and unsupported dependency forms fail compilation (`E0273`).
 This is a static module resolver; runtime inclusion of untyped PHP remains M4.
+
+**Scalar mixed values.** `mixed` annotations accept scalar values (`int`, `float`,
+`bool`, `string`) using runtime tags. Printing, truthiness, conversions,
+concatenation, strict comparisons, and scalar `match` cases are supported. Type
+predicates work on boxed scalars and concrete values, but do not yet narrow
+static types. Concrete variables still cannot change type unless opted into
+`mixed`. Typed-only operations require explicit scalar conversion.
+
+This is an initial subset of PHP's broader `mixed`: null, arrays, and objects
+cannot yet be boxed. Mixed arithmetic, ordering, and loose comparisons fail at
+compile time (`E0274`). Mixed parameters and returns still require explicit
+annotations. Existing scalar numeric conversion semantics are reused; broader
+PHP coercion fidelity and flow narrowing remain future work. See
+[`MIXED.md`](MIXED.md).
 
 **Fail loud, never silent.** Features not yet implemented (such as
 `null`, keyed `foreach`, nested array assignment, complex interpolation forms)

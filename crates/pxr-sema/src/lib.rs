@@ -29,6 +29,16 @@ pub use pxr_ast::{BinOp as TBinOp, UnOp as TUnOp};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Builtin {
+    IsInt,
+    IsFloat,
+    IsBool,
+    IsString,
+    IsArray,
+    IsObject,
+    IsNull,
+    IsScalar,
+    Boolval,
+
     Strlen,
     Intval,
     Floatval,
@@ -101,6 +111,16 @@ pub enum Builtin {
 impl Builtin {
     fn from_name(name: &str) -> Option<Builtin> {
         Some(match name {
+            "is_int" => Builtin::IsInt,
+            "is_float" => Builtin::IsFloat,
+            "is_bool" => Builtin::IsBool,
+            "is_string" => Builtin::IsString,
+            "is_array" => Builtin::IsArray,
+            "is_object" => Builtin::IsObject,
+            "is_null" => Builtin::IsNull,
+            "is_scalar" => Builtin::IsScalar,
+            "boolval" => Builtin::Boolval,
+
             "strlen" => Builtin::Strlen,
             "intval" => Builtin::Intval,
             "floatval" => Builtin::Floatval,
@@ -150,6 +170,15 @@ impl Builtin {
 
     pub fn name(self) -> &'static str {
         match self {
+            Builtin::IsInt => "is_int",
+            Builtin::IsFloat => "is_float",
+            Builtin::IsBool => "is_bool",
+            Builtin::IsString => "is_string",
+            Builtin::IsArray => "is_array",
+            Builtin::IsObject => "is_object",
+            Builtin::IsNull => "is_null",
+            Builtin::IsScalar => "is_scalar",
+            Builtin::Boolval => "boolval",
             Builtin::Strlen => "strlen",
             Builtin::Intval => "intval",
             Builtin::Floatval => "floatval",
@@ -215,6 +244,10 @@ pub enum Callee {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TExpr {
+    Coerce {
+        expr: Box<TExpr>,
+        ty: Ty,
+    },
     Int(i64),
     Float(f64),
     /// Raw byte-string literal (PHP strings are byte strings).
@@ -308,6 +341,7 @@ pub struct TArm {
 impl TExpr {
     pub fn ty(&self) -> Ty {
         match self {
+            TExpr::Coerce { ty, .. } => ty.clone(),
             TExpr::Int(_) => Ty::Int,
             TExpr::Float(_) => Ty::Float,
             TExpr::Str(_) => Ty::String,
@@ -603,8 +637,13 @@ impl Analyzer {
             return true;
         }
         match (from, to) {
+            (from, Ty::Mixed) if from.is_scalar() => true,
             (Ty::Int, Ty::Float) => true,
-            (Ty::Array(e), Ty::Array(t)) => matches!(**e, Ty::Null) || self.is_assignable(e, t),
+            (Ty::Array(e), Ty::Array(t)) => {
+                matches!(**e, Ty::Null)
+                    || e == t
+                    || (!contains_mixed(e) && !contains_mixed(t) && self.is_assignable(e, t))
+            }
             (Ty::Named(child), Ty::Named(parent)) => self.is_subclass_of(child, parent),
             _ => false,
         }
@@ -1115,6 +1154,22 @@ impl Analyzer {
                                 }
                             }
                         };
+                        if ty == Ty::Mixed {
+                            if let Some(default) = &p.default {
+                                if !static_initializer(default) {
+                                    self.diags.emit(Diagnostic::error("mixed property defaults require constant scalar expressions")
+                                        .with_code("E0274").with_span(p.name_span));
+                                } else {
+                                    let mut context = FnCtx::new(Ty::Void, false);
+                                    if let Some(value) = self.infer(default, &mut context) {
+                                        if !value.ty().is_scalar() {
+                                            self.diags.emit(Diagnostic::error("only scalar values can be boxed as mixed in this slice")
+                                                .with_code("E0274").with_span(p.name_span));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if ty == Ty::Void {
                             self.diags.emit(
                                 Diagnostic::error("a property cannot have type `void`")
@@ -1560,6 +1615,7 @@ impl Analyzer {
 
     fn resolve_type(&mut self, t: &ast::TypeRef) -> Ty {
         match t {
+            ast::TypeRef::Mixed => Ty::Mixed,
             ast::TypeRef::Int => Ty::Int,
             ast::TypeRef::Float => Ty::Float,
             ast::TypeRef::String => Ty::String,
@@ -3104,8 +3160,11 @@ impl Analyzer {
                             );
                             return None;
                         }
-                        actual_tys.push(aty);
-                        typed_args.push(t_arg);
+                        actual_tys.push(formal_ty.clone());
+                        typed_args.push(TExpr::Coerce {
+                            expr: Box::new(t_arg),
+                            ty: formal_ty.clone(),
+                        });
                     }
                     Some((ctor.mangled.clone(), typed_args, actual_tys))
                 } else {
@@ -3143,7 +3202,13 @@ impl Analyzer {
                                     .with_span(def_expr.span()),
                                 );
                             } else {
-                                prop_defaults.push((idx as u32, t_def));
+                                prop_defaults.push((
+                                    idx as u32,
+                                    TExpr::Coerce {
+                                        expr: Box::new(t_def),
+                                        ty: p.ty.clone(),
+                                    },
+                                ));
                             }
                         }
                     }
@@ -3462,6 +3527,21 @@ impl Analyzer {
     /// Validate the operands of a binary operator and compute its result type.
     /// Shared by expression inference and compound assignment.
     fn binary_type(&mut self, op: ABinOp, l: &Ty, r: &Ty, span: Span) -> Option<Ty> {
+        if (*l == Ty::Mixed || *r == Ty::Mixed)
+            && !matches!(
+                op,
+                ABinOp::Concat
+                    | ABinOp::Identical
+                    | ABinOp::NotIdentical
+                    | ABinOp::And
+                    | ABinOp::Or
+                    | ABinOp::NullCoalesce
+            )
+        {
+            self.diags.emit(Diagnostic::error("mixed arithmetic, ordering, and loose comparison require explicit scalar conversion in this slice")
+                .with_code("E0274").with_span(span));
+            return None;
+        }
         match op {
             ABinOp::Add | ABinOp::Sub | ABinOp::Mul => {
                 if !l.is_numeric() || !r.is_numeric() {
@@ -3502,7 +3582,7 @@ impl Analyzer {
             }
             ABinOp::Concat => {
                 for t in [l, r] {
-                    if !matches!(t, Ty::String | Ty::Int | Ty::Float | Ty::Bool) {
+                    if !matches!(t, Ty::String | Ty::Int | Ty::Float | Ty::Bool | Ty::Mixed) {
                         self.diags.emit(
                             Diagnostic::error(format!(
                                 "`.` cannot concatenate a value of type `{t}`"
@@ -3531,7 +3611,9 @@ impl Analyzer {
                 Some(Ty::Bool)
             }
             ABinOp::Identical | ABinOp::NotIdentical => {
-                let ok = l == r && l.is_scalar();
+                let mixed = (*l == Ty::Mixed && (*r == Ty::Mixed || r.is_scalar()))
+                    || (*r == Ty::Mixed && l.is_scalar());
+                let ok = l == r && l.is_scalar() || mixed;
                 if !ok {
                     self.diags.emit(
                         Diagnostic::error(format!(
@@ -3617,6 +3699,7 @@ impl Analyzer {
         }
         match (a, b) {
             (Ty::Null, other) | (other, Ty::Null) => return Some(other.clone()),
+            (Ty::Mixed, other) | (other, Ty::Mixed) if other.is_scalar() => return Some(Ty::Mixed),
             (x, y) if x.is_numeric() && y.is_numeric() => return Some(numeric_result(x, y)),
             _ => {}
         }
@@ -3792,7 +3875,7 @@ impl Analyzer {
             for c in &arm.conds {
                 let ct = self.infer(c, ctx)?;
                 let cty = ct.ty();
-                if cty != st {
+                if cty != st && !(st == Ty::Mixed && cty.is_scalar()) {
                     self.diags.emit(
                         Diagnostic::error(format!(
                             "match arm condition has type `{cty}` but the subject is `{st}`; `match` uses strict `===` comparison"
@@ -3977,6 +4060,27 @@ impl Analyzer {
         let n = args.len();
 
         let ret = match kind {
+            Builtin::IsInt
+            | Builtin::IsFloat
+            | Builtin::IsBool
+            | Builtin::IsString
+            | Builtin::IsArray
+            | Builtin::IsObject
+            | Builtin::IsNull
+            | Builtin::IsScalar
+            | Builtin::Boolval => {
+                if n != 1 {
+                    return self.builtin_arity_err(name, 1, 1, n, span);
+                }
+                if atys[0] == Ty::Void {
+                    return self.builtin_ty_err(name, "a value", &atys[0], span);
+                }
+                if kind == Builtin::Boolval && !atys[0].is_scalar() && atys[0] != Ty::Mixed {
+                    return self.builtin_ty_err(name, "a scalar or mixed value", &atys[0], span);
+                }
+                Ty::Bool
+            }
+
             Builtin::Strlen => {
                 if n != 1 {
                     return self.builtin_arity_err(name, 1, 1, n, span);
@@ -3990,7 +4094,7 @@ impl Analyzer {
                 if n != 1 {
                     return self.builtin_arity_err(name, 1, 1, n, span);
                 }
-                if !atys[0].is_scalar() {
+                if !atys[0].is_scalar() && atys[0] != Ty::Mixed {
                     return self.builtin_ty_err(name, "a scalar", &atys[0], args[0].span());
                 }
                 Ty::Int
@@ -3999,7 +4103,7 @@ impl Analyzer {
                 if n != 1 {
                     return self.builtin_arity_err(name, 1, 1, n, span);
                 }
-                if !atys[0].is_scalar() {
+                if !atys[0].is_scalar() && atys[0] != Ty::Mixed {
                     return self.builtin_ty_err(name, "a scalar", &atys[0], args[0].span());
                 }
                 Ty::Float
@@ -4008,7 +4112,7 @@ impl Analyzer {
                 if n != 1 {
                     return self.builtin_arity_err(name, 1, 1, n, span);
                 }
-                if !atys[0].is_scalar() {
+                if !atys[0].is_scalar() && atys[0] != Ty::Mixed {
                     return self.builtin_ty_err(name, "a scalar", &atys[0], args[0].span());
                 }
                 Ty::String
@@ -4435,7 +4539,7 @@ fn numeric_result(l: &Ty, r: &Ty) -> Ty {
 pub fn is_truthy(ty: &Ty) -> bool {
     matches!(
         ty,
-        Ty::Bool | Ty::Int | Ty::Float | Ty::String | Ty::Named(_)
+        Ty::Bool | Ty::Int | Ty::Float | Ty::String | Ty::Mixed | Ty::Named(_)
     )
 }
 
@@ -4663,6 +4767,14 @@ fn static_initializer(expr: &ast::Expr) -> bool {
         ast::Expr::ArrayLit { items, .. } => items.iter().all(|item| {
             item.key.as_ref().is_none_or(static_initializer) && static_initializer(&item.value)
         }),
+        _ => false,
+    }
+}
+
+fn contains_mixed(ty: &Ty) -> bool {
+    match ty {
+        Ty::Mixed => true,
+        Ty::Array(element) => contains_mixed(element),
         _ => false,
     }
 }

@@ -17,12 +17,12 @@ The same `main.php` can still be run by the traditional interpreter for
 comparison; PXR programs themselves run **without PHP**, linking only the small
 PXR runtime.
 
-> **Project status: milestone 3 complete — user types & modules.**
-> PXR supports classes, typed properties, constructors, visibility, inheritance,
-> polymorphic dispatch, abstract classes, interfaces, static members, namespaces,
-> imports, and compile-time modules via `require`/`require_once`. Dependencies are
-> declaration-only; runtime includes and dynamic PHP interop remain planned for
-> M4. See [`docs/MILESTONES.md`](docs/MILESTONES.md) and [`docs/MODULES.md`](docs/MODULES.md).
+> **Project status: milestone 4 in progress — gradual migration.**
+> Milestones 1–3 are complete. The first M4 slice adds opt-in scalar `mixed`
+> values, runtime type predicates, conversions, and strict comparisons. Flow
+> narrowing, container/object/null boxing, and runtime PHP interop remain planned.
+> Classes, namespaces, and declaration-only compile-time modules are available.
+> See [`docs/MILESTONES.md`](docs/MILESTONES.md) and [`docs/MIXED.md`](docs/MIXED.md).
 
 ---
 
@@ -112,6 +112,9 @@ migration path possible.
   single inheritance, dynamic dispatch, `parent::`, `instanceof`, and abstract
   classes and methods, interface contracts, calls through interface types, and
   static properties/methods via `Class::`, `self::`, and `parent::`.
+* **Gradual typing (M4.1)** — opt-in scalar `mixed` parameters, returns, variables,
+  and properties; `is_*` checks, scalar conversions, strict comparisons, and
+  arrays of explicitly boxed scalars.
 * **Modules** — braced and unbraced namespaces, qualified names, class/namespace
   aliases, `use function`, and compile-time `require`/`require_once` dependencies
   with diagnostics pointing to the originating file.
@@ -194,7 +197,7 @@ ownership & borrowing, the complex string‑interpolation forms (`"$a[0]"`,
 `"{$expr}"`, `"${name}"`, `"$obj->p"`; the simple `"$name"` / `"{$name}"` work),
 exceptions, runtime `include`/`require` interop, C interop (`extern`), async/await and concurrency
 (planned for M7; see [`docs/ASYNC.md`](docs/ASYNC.md)), and the
-`mixed`/dynamic escape hatch for gradual migration.
+full dynamic `mixed` support and flow narrowing for gradual migration.
 
 ## License
 

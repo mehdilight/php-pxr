@@ -4,9 +4,9 @@ The PXR runtime is the small library every compiled program links against. It is
 written in C (`runtime/pxr_rt.c`), embedded into the `pxr` binary at build time,
 compiled on demand with the system C compiler, and cached as an object file.
 
-Its purpose is the opposite of PHP's Zend engine: no interpreter, no bytecode, no
-refcounting GC, no dynamic dispatch — just enough support for the value
-operations the backend emits.
+The runtime provides the value operations emitted by the native backend,
+including strings, arrays, class membership, and boxed scalar conversions.
+Compiled programs do not need a PHP interpreter or bytecode engine.
 
 ## Value representation
 
@@ -18,6 +18,7 @@ operations the backend emits.
 | `string` | `pxr_str *` (length‑prefixed, NUL/binary‑safe) | `ptr` |
 | `array<T>` | opaque `void *` | `ptr` |
 | `ClassName` | `pxr_object *` | `ptr` |
+| `mixed` | `pxr_mixed *` (`int64_t tag, bits`) | `ptr` |
 
 `bool` is `i1` inside generated code and is passed to the runtime as an `i32`
 (0/1).
@@ -248,3 +249,18 @@ The runtime object is keyed by an FNV‑1a hash of its source and stored under
 `$HOME/.cache/pxr` and then the temp directory). The first build compiles it; later
 builds reuse it. If the cache directory is not writable, PXR compiles the runtime
 into the per‑build temporary directory instead.
+
+## Scalar mixed boxes (M4.1)
+
+`pxr_mixed_box(tag, bits)` creates an immutable arena-allocated scalar box. Tags
+1–4 identify `int`, `float`, `bool`, and `string`; float bits are preserved and
+strings remain length-aware byte strings. Mixed values themselves use storage
+tag 7 when placed in a property or array slot, whose payload is the box pointer.
+Copies can share scalar boxes because neither the tag nor the payload mutates.
+
+`pxr_mixed_is`, `pxr_mixed_i64`, `pxr_mixed_f64`, `pxr_mixed_bool`,
+`pxr_mixed_str`, and `pxr_mixed_print` implement predicates and conversions.
+`pxr_mixed_identical` compares tags first, then scalar values; strings compare
+by bytes and floating-point comparison preserves IEEE NaN and signed-zero rules.
+Invalid or uninitialized boxes terminate with an error. Array/object/null boxing
+and runtime PHP interop are not implemented in this slice.

@@ -19,8 +19,8 @@ Two commitments make this practical rather than a rewrite‑everything exercise:
    (`pxr build main.php`), so the same file can be run by PHP or compiled by PXR.
 2. **The migration is gradual.** Modern PHP is already mostly typed
    (`function f(int $x): string`). PXR accepts that syntax directly and adds
-   strictness; untranslatable code gets an explicit `mixed` escape hatch later
-   (M4) rather than being forbidden.
+   strictness; M4 is adding an explicit `mixed` escape hatch, starting with
+   scalar values and then flow narrowing and dynamic interop.
 
 ## Design principles
 
@@ -47,7 +47,7 @@ today     typed scalars, arrays, control flow, LLVM backend, tests, benchmarks
   ├─ M1  arrays, loops, switch/match, compound ops        ✅ done
   ├─ M2  owned strings + a real standard library          ✅ done
   ├─ M3  classes, namespaces, compile-time modules        ✅ done
-  ├─ M4  mixed/dynamic + include interop                  (gradual migration)
+  ├─ M4  scalar mixed; narrowing + interop next           🚧 in progress
   ├─ M5  generics + inference                             (zero-cost abstraction)
   ├─ M6  ownership & borrowing, no leaks                  (memory safety)
   ├─ M7  async/await + structured tasks, then threads     (I/O + parallelism)
