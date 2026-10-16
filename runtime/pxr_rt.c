@@ -50,7 +50,10 @@ static _Thread_local size_t pxr_heap_blocks = 0;
 static _Thread_local size_t pxr_heap_arrays = 0;
 static _Thread_local size_t pxr_heap_bytes = 0;
 static _Thread_local int pxr_heap_initialized = 0;
-static _Thread_local pxr_allocation *pxr_heap_index[4096];
+static _Thread_local struct {
+    pxr_allocation **buckets;
+    size_t capacity;
+} pxr_heap_index;
 enum { PXR_HEAP_RAW, PXR_HEAP_ARRAY, PXR_HEAP_OBJECT, PXR_HEAP_MIXED, PXR_HEAP_ARRAY_ENTRIES, PXR_HEAP_APPEND_STRING };
 static void pxr_array_release(void *pointer);
 static _Thread_local uint64_t pxr_heap_serial = 0;
@@ -67,10 +70,16 @@ static _Thread_local pxr_gc_guard *pxr_gc_guards = NULL;
 static _Thread_local int pxr_gc_external_pressure = 0;
 static _Thread_local size_t pxr_gc_collections = 0, pxr_heap_peak = 0;
 static size_t pxr_heap_bucket(const void *ptr) {
-    return ((uintptr_t)ptr >> 4) % 4096;
+    /* Mix aligned addresses: allocator size classes otherwise cluster into a
+     * small fraction of a power-of-two table. No header reads for literals. */
+    uint64_t key = (uint64_t)(uintptr_t)ptr >> 4;
+    key *= UINT64_C(0x9e3779b97f4a7c15);
+    key ^= key >> 32;
+    return (size_t)key & (pxr_heap_index.capacity - 1);
 }
 static pxr_allocation *pxr_heap_lookup(const void *ptr) {
-    for (pxr_allocation *b = pxr_heap_index[pxr_heap_bucket(ptr)]; b; b = b->h.hash_next)
+    if (!ptr || !pxr_heap_index.buckets) return NULL;
+    for (pxr_allocation *b = pxr_heap_index.buckets[pxr_heap_bucket(ptr)]; b; b = b->h.hash_next)
         if ((const void *)(b + 1) == ptr) return b;
     return NULL; /* literals/null are outside the managed heap */
 }
@@ -90,6 +99,23 @@ static size_t pxr_size_mul(size_t a, size_t b) {
     return a * b;
 }
 
+/* Index metadata lives outside the managed heap: rebuilding it must not add
+ * entries to itself or collect runtime temporaries. Resize only at allocation
+ * or after sweeping; a failed optional shrink leaves the old index intact. */
+static int pxr_heap_reindex(size_t capacity) {
+    assert(capacity >= 256 && !(capacity & (capacity - 1)));
+    pxr_allocation **buckets = calloc(1, pxr_size_mul(capacity, sizeof(*buckets)));
+    if (!buckets) return 0;
+    pxr_allocation **previous = pxr_heap_index.buckets;
+    pxr_heap_index.buckets = buckets; pxr_heap_index.capacity = capacity;
+    for (pxr_allocation *block = pxr_heap_head; block; block = block->h.next) {
+        size_t bucket = pxr_heap_bucket(block + 1);
+        block->h.hash_next = buckets[bucket]; buckets[bucket] = block;
+    }
+    free(previous);
+    return 1;
+}
+
 /* Terminal cleanup only: runtime roots must never be used after this call.
  * No graph traversal is needed, so cycles and shared object identity are safe. */
 static void pxr_heap_shutdown(void) {
@@ -104,7 +130,8 @@ static void pxr_heap_shutdown(void) {
     pxr_heap_blocks = 0;
     pxr_heap_arrays = 0;
     pxr_heap_bytes = 0;
-    memset(pxr_heap_index, 0, sizeof(pxr_heap_index));
+    free(pxr_heap_index.buckets);
+    pxr_heap_index.buckets = NULL; pxr_heap_index.capacity = 0;
 }
 
 static void *pxr_heap_alloc(size_t n) {
@@ -113,6 +140,10 @@ static void *pxr_heap_alloc(size_t n) {
     if (!pxr_heap_initialized) {
         if (!pxr_worker_thread && atexit(pxr_heap_shutdown) != 0) pxr_oom();
         pxr_heap_initialized = 1;
+    }
+    size_t capacity = pxr_heap_index.capacity;
+    if (!capacity || pxr_heap_blocks >= capacity - capacity / 4) {
+        if (!pxr_heap_reindex(capacity ? pxr_size_mul(capacity, 2) : 256)) pxr_oom();
     }
     pxr_allocation *block = malloc(total);
     if (!block) pxr_oom();
@@ -126,8 +157,8 @@ static void *pxr_heap_alloc(size_t n) {
     block->h.serial = ++pxr_heap_serial;
     block->h.gray = NULL;
     size_t bucket = pxr_heap_bucket(block + 1);
-    block->h.hash_next = pxr_heap_index[bucket];
-    pxr_heap_index[bucket] = block;
+    block->h.hash_next = pxr_heap_index.buckets[bucket];
+    pxr_heap_index.buckets[bucket] = block;
     if (pxr_heap_head) pxr_heap_head->h.prev = block;
     pxr_heap_head = block;
     pxr_heap_blocks++;
@@ -145,7 +176,7 @@ static void pxr_heap_free(void *ptr) {
     if (block->h.prev) block->h.prev->h.next = block->h.next;
     else pxr_heap_head = block->h.next;
     if (block->h.next) block->h.next->h.prev = block->h.prev;
-    pxr_allocation **link = &pxr_heap_index[pxr_heap_bucket(ptr)];
+    pxr_allocation **link = &pxr_heap_index.buckets[pxr_heap_bucket(ptr)];
     while (*link != block) link = &(*link)->h.hash_next;
     *link = block->h.hash_next;
     pxr_heap_blocks--;
@@ -2298,17 +2329,19 @@ void pxr_class_register(long long class_id, long long super_id) {
 void *pxr_object_new(long long class_id, const pxr_str *name, long long num_props) {
     if (num_props < 0) pxr_oom();
     size_t prop_bytes = pxr_size_mul(sizeof(int64_t), (size_t)num_props);
-    pxr_object *obj = (pxr_object *)pxr_heap_alloc(sizeof(pxr_object));
+    size_t payload = pxr_size_mul(prop_bytes, 2);
+    pxr_object *obj = (pxr_object *)pxr_heap_alloc(pxr_size_add(sizeof(pxr_object), payload));
     ((pxr_allocation *)obj - 1)->h.kind = PXR_HEAP_OBJECT;
     obj->class_id = (int64_t)class_id;
     obj->remote_id = 0;
     obj->class_name = name;
     obj->num_props = (size_t)num_props;
     if (num_props > 0) {
-        obj->tags = (int64_t *)pxr_heap_alloc(prop_bytes);
-        obj->bits = (int64_t *)pxr_heap_alloc(prop_bytes);
-        memset(obj->tags, 0, prop_bytes);
-        memset(obj->bits, 0, prop_bytes);
+        /* Property storage shares the object's lifetime and stable address.
+         * Keep the header ABI, but eliminate two tracked allocations per object. */
+        obj->tags = (int64_t *)(obj + 1);
+        obj->bits = obj->tags + num_props;
+        memset(obj->tags, 0, payload);
     } else {
         obj->tags = NULL;
         obj->bits = NULL;
@@ -3095,8 +3128,6 @@ void pxr_gc_collect(void) {
             case PXR_HEAP_OBJECT: {
                 pxr_object *o = ptr;
                 pxr_gc_mark(o->class_name);
-                pxr_gc_mark(o->tags);
-                pxr_gc_mark(o->bits);
                 for (size_t i = 0; i < o->num_props; i++)
                     pxr_gc_mark_value(o->tags[i], o->bits[i]);
                 break;
@@ -3158,6 +3189,10 @@ void pxr_gc_collect(void) {
         if (!block->h.marked) pxr_heap_free(block + 1);
         else block->h.marked = 0;
         block = next;
+    }
+    if (pxr_heap_index.capacity > 256 && pxr_heap_blocks < pxr_heap_index.capacity / 8) {
+        size_t capacity = pxr_grow_capacity(256, pxr_size_mul(pxr_heap_blocks, 2));
+        (void)pxr_heap_reindex(capacity);
     }
     size_t baseline = 1024 * 1024;
     pxr_gc_limit = pxr_heap_bytes > (SIZE_MAX - baseline) / 2

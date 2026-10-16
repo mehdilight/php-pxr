@@ -294,18 +294,31 @@ pub fn emit_llvm(module: &Module, opts: &LlvmOptions) -> String {
     out.push('\n');
 
     let traced = crate::roots::traced_functions(module);
+    let leaves = module
+        .functions
+        .iter()
+        .filter(|f| !traced.contains(&f.name))
+        .map(|f| f.name.clone())
+        .collect();
     for f in &module.functions {
-        emit_function(&mut out, f, &pool_idx, traced.contains(&f.name));
+        emit_function(&mut out, f, &pool_idx, traced.contains(&f.name), &leaves);
         out.push('\n');
     }
     out
 }
 
-fn emit_function(out: &mut String, f: &Function, pool: &HashMap<Vec<u8>, usize>, traced: bool) {
+fn emit_function(
+    out: &mut String,
+    f: &Function,
+    pool: &HashMap<Vec<u8>, usize>,
+    traced: bool,
+    leaves: &std::collections::BTreeSet<String>,
+) {
     let mut g = FnGen {
         f,
         pool,
         traced,
+        leaves,
         map: HashMap::new(),
         next: f.value_count(),
         is_entry: f.name == "main",
@@ -319,6 +332,7 @@ struct FnGen<'a> {
     f: &'a Function,
     pool: &'a HashMap<Vec<u8>, usize>,
     traced: bool,
+    leaves: &'a std::collections::BTreeSet<String>,
     map: HashMap<Value, Ty>,
     next: Value,
     /// True for the synthesized program entry point, whose LLVM signature must
@@ -357,7 +371,7 @@ impl<'a> FnGen<'a> {
         } else {
             vec![vec![]; self.f.body.len()]
         };
-        let allocations = crate::roots::allocation_before(self.f);
+        let allocations = crate::roots::allocation_before(self.f, self.leaves);
         let capacity = roots.iter().map(Vec::len).max().unwrap_or(0).max(1);
         self.out.push_str("entry:\n");
         if self.traced {
@@ -384,7 +398,10 @@ impl<'a> FnGen<'a> {
                 terminated = false;
             }
             let control = matches!(inst, Inst::Branch { .. } | Inst::Jump(_) | Inst::Ret { .. });
-            if self.traced && crate::roots::safepoint(inst) && (!control || allocations[index]) {
+            if self.traced
+                && crate::roots::safepoint(inst, self.leaves)
+                && (!control || allocations[index])
+            {
                 self.spill_roots(&roots[index], true);
                 if let Inst::Call { dst, .. } = inst {
                     // Arguments are rooted through the pre-call safepoint.

@@ -31,7 +31,8 @@ Strings have immutable value semantics; private append buffers may reuse capacit
 until a snapshot makes them immutable. Array writes separate shared storage.
 All runtime-owned memory now uses a **tracked heap**, replacing the page-list
 bump arena in M6.1. Private headers link allocations and record their sizes;
-returned pointers retain `max_align_t` alignment. Headers stay outside the public
+returned pointers retain `max_align_t` alignment. Native object headers and all
+property tags/payloads occupy a single allocation; their addresses remain stable. Headers stay outside the public
 value layout, so generated LLVM and literal string layouts are unchanged.
 
 * `pxr_heap_alloc(n)` allocates a stable block and registers terminal cleanup on
@@ -53,18 +54,31 @@ exit callbacks. Allocation failure continues to abort with `pxr: out of memory`.
 **Language values are reclaimed during execution.** After IR optimization, the
 compiler computes precise CFG liveness and emits stack root frames at safepoints.
 Only live slots, temporary pointers, and pointer-valued integer payloads are
-published. Scalar functions proven to have no allocation-capable callees omit
-root machinery, and control flow before its first possible allocation omits
-polling; allocating paths retain safepoints. A caller protects arguments during its pre-call safepoint, then hands
-parameter retention to the callee. Return values remain protected until the
-caller resumes. Dead roots are removed across assignment and all control-flow
-exits. Explicit `drop` emits a forced collection call.
+published. Functions proven unable to allocate managed memory or collect omit
+root machinery even when they receive or return pointers. Effects propagate
+through the call graph, including recursion, virtual dispatch wrappers and
+constructors. Unknown calls remain effectful; mixed operations and stringifiers
+can allocate or invoke callbacks.
+
+Polls precede allocation-capable operations and remain at returns on paths that
+may have allocated. Nonallocating property access, method calls and branch/loop
+edges need no extra polls: any allocation in a loop already polls before it runs.
+A caller protects arguments during an allocating call's pre-call safepoint, then
+hands parameter retention to the callee before it can collect. A nonallocating
+callee cannot collect and needs no root handoff. Return values remain protected
+until the caller resumes. Dead roots are removed across assignment and all
+control-flow exits. Explicit `drop` emits a forced collection call.
 
 The collector traces array keys/tagged entries, object names/properties, and
 mixed boxes. Class metadata and static storage are explicit global roots. An
 allocation index recognizes heap pointers without reading headers before static
-literals. An iterative worklist marks reachable graphs; sweep reclaims dead
-cycles and buffers. Ordinary collection starts at 1 MiB of payload allocation,
+literals. This per-thread hash table mixes aligned addresses and grows at 75%
+load; it shrinks after collection when occupancy falls below one eighth, with
+a minimum of 256 buckets. Resizing preserves allocation addresses. Its bucket
+metadata uses separate system allocations, is excluded from managed payload
+statistics, and is released at shutdown. Failed optional shrinking retains the
+existing valid table. An iterative worklist marks reachable graphs; sweep
+reclaims dead cycles and buffers. Ordinary collection starts at 1 MiB of payload allocation,
 then adapts to live data. These are internal thresholds, not memory limits.
 
 Native stringifier re-entry uses a guarded allocation snapshot for C runtime
@@ -328,6 +342,14 @@ IEEE infinity or UB.
 Generated modules `declare` these symbols and call them directly; `clang` resolves
 them against the cached runtime object. `main` is emitted with the C‑correct
 signature `i32 @main()` so the process exit status is well defined.
+
+Native objects keep the same header fields and property getter/setter ABI.
+For a nonempty object, tag and payload pointers address two inline `int64_t`
+regions immediately following the header. Both regions start zeroed; zero-field
+objects keep null region pointers. Checked size arithmetic covers both regions
+and the header. GC traces each property's tagged payload directly through the
+object; interior region pointers are not separate heap roots or allocations.
+Class names, arrays, mixed values and object cycles remain traced normally.
 
 ## Caching
 

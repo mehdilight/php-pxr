@@ -43,7 +43,7 @@ static void test_collection(void) {
         chain = next;
     }
     roots[0] = chain; pxr_gc_roots(&frame, 1); pxr_gc_collect();
-    assert(pxr_heap_blocks == 60000);
+    assert(pxr_heap_blocks == 20000);
     pxr_gc_roots(&frame, 0); pxr_gc_collect();
     assert(pxr_heap_blocks == 0);
 
@@ -227,6 +227,80 @@ static void test_array_cow(void) {
     pxr_gc_leave(&frame);
 }
 
+static void test_heap_index(void) {
+    enum { COUNT = 50000 };
+    assert(!pxr_heap_lookup(NULL) && !pxr_heap_lookup("literal"));
+    void **values = malloc(COUNT * sizeof(*values)); assert(values);
+    for (int i = 0; i < COUNT; i++) {
+        values[i] = pxr_heap_alloc(sizeof(uint64_t));
+        *(uint64_t *)values[i] = (uint64_t)i;
+        assert(pxr_heap_blocks <= pxr_heap_index.capacity - pxr_heap_index.capacity / 4);
+    }
+    assert(pxr_heap_index.capacity >= COUNT && pxr_heap_index.capacity < COUNT * 4);
+    for (int i = 0; i < COUNT; i++) {
+        pxr_allocation *block = pxr_heap_lookup(values[i]);
+        assert(block && block + 1 == values[i] && block->h.size == sizeof(uint64_t));
+        assert(*(uint64_t *)values[i] == (uint64_t)i);
+    }
+    for (int i = 1; i < COUNT - 1; i += 3) {
+        if (i == COUNT / 2) continue;
+        pxr_heap_free(values[i]); values[i] = NULL;
+    }
+    for (int i = 0; i < COUNT; i++) {
+        if (values[i]) assert(pxr_heap_lookup(values[i]));
+    }
+    assert(!pxr_heap_lookup("literal"));
+    pxr_gc_frame frame; void *roots[] = {values[0], values[COUNT / 2], values[COUNT - 1]};
+    pxr_gc_enter(&frame, roots); pxr_gc_roots(&frame, 3);
+    pxr_gc_collect();
+    assert(pxr_heap_blocks == 3 && pxr_heap_index.capacity == 256);
+    assert(*(uint64_t *)roots[0] == 0 && *(uint64_t *)roots[1] == COUNT / 2);
+    assert(*(uint64_t *)roots[2] == COUNT - 1);
+    for (int i = 0; i < 3; i++) assert(pxr_heap_lookup(roots[i]));
+    free(values);
+    pxr_gc_roots(&frame, 0); pxr_gc_collect(); assert(!pxr_heap_blocks && !pxr_heap_bytes);
+    pxr_gc_leave(&frame);
+}
+
+static void test_object_storage(void) {
+    pxr_gc_frame frame; void *roots[2] = {0};
+    pxr_gc_enter(&frame, roots); pxr_gc_roots(&frame, 2);
+    pxr_str *name = pxr_str_alloc(4); memcpy(name->data, "Node", 4);
+    size_t blocks = pxr_heap_blocks;
+    pxr_object *parent = pxr_object_new(1, name, 4); roots[0] = parent;
+    assert(pxr_heap_blocks == blocks + 1);
+    assert((uintptr_t)parent->tags % _Alignof(int64_t) == 0);
+    assert((uintptr_t)parent->bits % _Alignof(int64_t) == 0);
+    assert(((pxr_allocation *)parent - 1)->h.size == sizeof(*parent) + 8 * sizeof(int64_t));
+    for (int i = 0; i < 4; i++) assert(!parent->tags[i] && !parent->bits[i]);
+    pxr_str *text = pxr_str_alloc(3); memcpy(text->data, "x\0y", 3);
+    pxr_array *array = pxr_array_new(); pxr_array_push(array, PXR_TAG_STR, (intptr_t)text);
+    pxr_object *child = pxr_object_new(2, name, 1);
+    pxr_object_set_bits(child, 0, PXR_TAG_STR, (intptr_t)text);
+    void *boxed = pxr_mixed_box(PXR_TAG_OBJ, (intptr_t)child);
+    pxr_object_set_bits(parent, 0, PXR_TAG_STR, (intptr_t)text);
+    pxr_object_set_bits(parent, 1, PXR_TAG_ARR, (intptr_t)array);
+    pxr_object_set_bits(parent, 2, PXR_TAG_MIXED, (intptr_t)boxed);
+    pxr_object_set_bits(parent, 3, PXR_TAG_OBJ, (intptr_t)parent);
+    pxr_object *empty = pxr_object_new(3, NULL, 0);
+    assert(!empty->tags && !empty->bits && !empty->num_props);
+    roots[1] = pxr_object_new(4, NULL, 4096);
+    pxr_object *large = roots[1];
+    for (int i = 0; i < 4096; i++) assert(!large->tags[i] && !large->bits[i]);
+    pxr_object_set_bits(large, 4095, PXR_TAG_OBJ, (intptr_t)parent);
+    pxr_gc_collect();
+    assert(pxr_object_get_bits(parent, 3) == (intptr_t)parent);
+    assert(pxr_object_get_bits(large, 4095) == (intptr_t)parent);
+    assert(pxr_object_get_bits(child, 0) == (intptr_t)text);
+    assert(text->len == 3 && !memcmp(text->data, "x\0y", 3));
+    assert(name->len == 4 && !memcmp(name->data, "Node", 4));
+    assert(pxr_array_get_bits(array, PXR_TAG_INT, 0, NULL) == (intptr_t)text);
+    roots[0] = NULL; pxr_gc_collect(); /* parent is retained only through large */
+    assert(pxr_object_get_bits(parent, 2) == (intptr_t)boxed);
+    pxr_gc_roots(&frame, 0); pxr_gc_collect(); assert(!pxr_heap_blocks && !pxr_heap_bytes);
+    pxr_gc_leave(&frame);
+}
+
 static void test_string_append(void) {
     pxr_gc_frame frame; void *roots[4] = {0};
     pxr_gc_enter(&frame, roots); pxr_gc_roots(&frame, 4);
@@ -272,6 +346,9 @@ int main(int argc, char **argv) {
     assert(argc == 2);
     /* Registered first so this runs AFTER the heap's exit callback. */
     assert(atexit(assert_shutdown) == 0);
+    if (strcmp(argv[1], "heap-index") == 0) { test_heap_index(); return 0; }
+    if (strcmp(argv[1], "object-storage") == 0) { test_object_storage(); return 0; }
+    if (strcmp(argv[1], "object-payload-overflow") == 0) pxr_object_new(1, NULL, (long long)(SIZE_MAX / (2 * sizeof(int64_t))));
     if (strcmp(argv[1], "string-append") == 0) { test_string_append(); return 0; }
     if (strcmp(argv[1], "append-overflow") == 0) {
         pxr_str a = {.len = SIZE_MAX}, b = {.len = 1};

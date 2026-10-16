@@ -172,23 +172,26 @@ Max with PHP 8.4.25 CLI (JIT disabled), nine runs at PXR `-O3` measured:
 
 | Workload | PXR median | PHP median | PXR relative to PHP |
 | --- | ---: | ---: | --- |
-| Startup / print | 2.539 ms | 30.470 ms | 12.00× faster |
-| Recursive fib(30) | 5.091 ms | 92.238 ms | 18.12× faster |
-| Integer loop (5M) | 2.558 ms | 82.295 ms | 32.17× faster |
-| Integer-array append + reads (10k) | 3.240 ms | 29.655 ms | 9.15× faster |
-| String-key array writes + reads (5k) | 4.293 ms | 30.530 ms | 7.11× faster |
-| Read-only array copies (100k × 1k items) | 8.948 ms | 32.042 ms | 3.58× faster |
-| Array copy + two overwrites (10k × 1k items) | 20.894 ms | 43.549 ms | 2.08× faster |
-| String append (50k) | 3.763 ms | 30.765 ms | 8.18× faster |
-| String append with ten snapshots (50k) | 5.103 ms | 32.056 ms | 6.28× faster |
-| Objects + methods (2M) | 328.313 ms | 198.383 ms | 1.65× slower |
+| Startup / print | 2.439 ms | 29.073 ms | 11.92× faster |
+| Recursive fib(30) | 4.449 ms | 88.389 ms | 19.87× faster |
+| Integer loop (5M) | 2.262 ms | 81.774 ms | 36.15× faster |
+| Integer-array append + reads (10k) | 2.867 ms | 29.285 ms | 10.21× faster |
+| String-key array writes + reads (5k) | 4.223 ms | 29.380 ms | 6.96× faster |
+| Read-only array copies (100k × 1k items) | 7.810 ms | 30.433 ms | 3.90× faster |
+| Array copy + two overwrites (10k × 1k items) | 16.839 ms | 40.515 ms | 2.41× faster |
+| String append (50k) | 3.373 ms | 30.007 ms | 8.90× faster |
+| String append with ten snapshots (50k) | 3.135 ms | 29.813 ms | 9.51× faster |
+| Objects + methods (2M) | 100.490 ms | 188.720 ms | 1.88× faster |
+| Methods on one reused object (2M) | 7.392 ms | 87.851 ms | 11.89× faster |
+| Retained objects + reads (100k) | 12.121 ms | 40.530 ms | 3.34× faster |
 
 Timings include startup and exclude compilation. PHP startup on this configuration
-is about 30 ms; PXR startup is about 2.5 ms. The latest optimization improved the
-string append workload by 52.0× and appending with occasional snapshots by 53.0×
-relative to the previous PXR build. Objects still need optimization. These
-microbenchmarks are not a general application speedup claim. See the
-[string append report and raw samples](benchmarks/results/2026-10-16-string-append.md),
+is about 29 ms; PXR startup is about 2.4 ms. The latest optimization improved
+object creation by 2.9×, repeated method calls by 10.1× and retained objects by
+20.0× relative to the previous PXR build. This completes the current optimization
+pass; these microbenchmarks are not a general application speedup claim. See the
+[object/heap report and raw samples](benchmarks/results/2026-10-16-objects.md),
+[string append optimization](benchmarks/results/2026-10-16-string-append.md),
 [copy-on-write arrays](benchmarks/results/2026-10-16-array-cow.md),
 [earlier array-index optimization](benchmarks/results/2026-10-16-array-index.md),
 [original M7 comparison](benchmarks/results/2026-10-16-m7.md), or re-run

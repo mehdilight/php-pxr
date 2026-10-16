@@ -885,6 +885,19 @@ ThreadSanitizer checks pass. See [PARALLEL.md](PARALLEL.md) and the runnable
 
 **Next:** M8 — native C interoperability.
 
+## ✅ Post-M7 performance optimization pass
+
+The current optimization pass is complete. Array indexing/append caching,
+copy-on-write value storage, string append capacity with immutable snapshots,
+inline object properties, allocation-aware GC and a growing heap pointer index
+address the profiled runtime costs. No language feature or syntax restriction was
+added by these changes. The twelve-case benchmark suite compares identical
+programs with PHP and saves all samples and environment settings.
+
+See the [final report](../benchmarks/results/2026-10-16-objects.md) for measurements,
+implementation details, validation and links to the preceding optimization runs.
+M8 remains a proposed feature milestone; this pass does not implement C FFI.
+
 ## ⛔ M8 — C interoperability
 
 Draft library blocks, C types, symbol aliases and opaque pointer syntax are

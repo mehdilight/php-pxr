@@ -52,7 +52,7 @@ today     typed scalars, arrays, control flow, LLVM backend, tests, benchmarks
   ├─ M4  mixed values, narrowing, PHP interop, report          ✅ done
   ├─ M5  generics, bounds, traits, return inference        ✅ done
   ├─ M6  affine ownership, borrows, precise reclamation    ✅ done
-  ├─ M7  async/await + structured tasks, then threads     (I/O + parallelism)
+  ├─ M7  async/await + structured tasks, then threads      ✅ done
   ├─ M8  C interoperability (extern "C", FFI)             (systems access)
   └─ M9  package manager, LSP, cross-compile, JIT         (ecosystem)
 ```
@@ -80,6 +80,17 @@ limits and the restriction against combining workers with dynamic PHP interop.
 Request/response objects, routing classes, streaming HTTP, uploads, sessions and
 full web SAPI compatibility remain further extensions. Ordinary blocking calls
 still block their executor; CPU parallelism is explicit.
+
+## Post-M7 optimization pass
+
+The current profiling-driven optimization pass is complete: packed/hash-indexed
+array access and cached append keys, copy-on-write arrays, string accumulators
+with snapshot preservation, inline object storage, allocation-aware GC polling,
+and a heap pointer index that scales with live allocations. All changes retain
+the supported language behavior and have regression coverage. Twelve benchmarks
+validate identical PHP/PXR output and retain before/after samples; see the
+[final optimization report](../benchmarks/results/2026-10-16-objects.md).
+These process timings are not a general application or server throughput claim.
 
 **Next:** M8 — C interoperability: extern declarations, native linking and exports.
 The draft syntax is saved in [C_INTEROP_PROPOSAL.md](C_INTEROP_PROPOSAL.md).

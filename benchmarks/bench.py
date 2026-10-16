@@ -24,7 +24,8 @@ ROOT = Path(__file__).resolve().parent.parent
 PXR = ROOT / "target" / "release" / "pxr"
 BENCH_DIR = ROOT / "benchmarks"
 BENCHMARKS = ["startup.php", "fib.php", "loop.php", "arrays.php", "array_keys.php",
-              "array_copy.php", "array_copy_write.php", "strings.php", "strings_snapshots.php", "objects.php"]
+              "array_copy.php", "array_copy_write.php", "strings.php", "strings_snapshots.php", "objects.php",
+              "object_methods.php", "objects_retained.php"]
 
 
 def run(cmd: list[str], env: dict[str, str] | None = None) -> tuple[float, bytes]:

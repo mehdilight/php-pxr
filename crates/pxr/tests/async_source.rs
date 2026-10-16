@@ -2498,3 +2498,39 @@ async function main(): void {
         "2505:2005:2005:5:16\n",
     );
 }
+
+#[test]
+fn inline_objects_and_leaf_methods_keep_returns_and_allocating_callbacks_alive() {
+    run_case(
+        "object_leaf_gc",
+        r#"<?php
+class InlineNode {
+    public string $text;
+    public int $value;
+    public mixed $next = null;
+    public function __construct(string $text, int $value) {$this->text = $text; $this->value = $value;}
+    public function textValue(): string {return $this->text;}
+    public function bump(): int {$this->value += 1; return $this->value;}
+}
+function makeInlineText(): string {
+    $node = new InlineNode(str_repeat("x", 4096), 7);
+    return $node->textValue();
+}
+function allocatingScalar(InlineNode $node): int {
+    $garbage = str_repeat("g", 8192);
+    return $node->bump();
+}
+class TransitiveInlineNode {
+    public string $text;
+    public function __construct() {$this->text = makeInlineText();}
+    public function textValue(): string {return $this->text;}
+}
+$kept = makeInlineText();
+$node = new InlineNode("node", 10); $alias = $node; $node->next = $node;
+$parent = new TransitiveInlineNode();
+for ($i = 0; $i < 32; $i++) {allocatingScalar($node);}
+echo strlen($kept), ":", $alias->value, ":", strlen($parent->textValue()), ":", $node->textValue(), "\n";
+"#,
+        "4096:42:4096:node\n",
+    );
+}

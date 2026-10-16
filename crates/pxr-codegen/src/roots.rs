@@ -22,77 +22,63 @@ pub(crate) fn pointer(ty: &Ty) -> bool {
     )
 }
 
-pub(crate) fn safepoint(inst: &Inst) -> bool {
+/// These helpers neither allocate managed memory nor run callbacks/collection.
+/// Pointer arguments/results alone do not require a GC frame. Unknown calls
+/// remain effectful, including mixed operations and native/PHP stringifiers.
+fn runtime_leaf(callee: &str) -> bool {
     matches!(
-        inst,
-        Inst::Call { .. }
-            | Inst::Print { .. }
-            | Inst::Jump(_)
-            | Inst::Branch { .. }
-            | Inst::Ret { .. }
-            | Inst::Bin {
-                op: pxr_ir::BinOp::Concat,
-                ..
-            }
-            | Inst::Cast { to: Ty::String, .. }
+        callee,
+        "abort"
+            | "fabs"
+            | "pxr_abs_i64"
+            | "pxr_shl"
+            | "pxr_shr"
+            | "pxr_div"
+            | "pxr_mod"
+            | "pxr_object_get_bits"
+            | "pxr_object_set_bits"
+            | "pxr_object_get_class_id"
+            | "pxr_instanceof"
+            | "pxr_array_count"
+            | "pxr_array_val_bits_at"
+            | "pxr_strlen"
+            | "pxr_str_to_i64"
+            | "pxr_str_to_f64"
+            | "pxr_truthy_str"
+            | "pxr_truthy_i64"
+            | "pxr_truthy_f64"
+            | "pxr_str_eq"
+            | "pxr_str_cmp"
+            | "pxr_str_cmp_loose"
+            | "pxr_str_freeze"
     )
 }
 
-/// Functions with no pointer values or allocation-capable callees need neither
-/// root frames nor safepoints. Propagate effects through recursion before LLVM
-/// emission; never infer purity from a scalar return signature alone.
-pub(crate) fn traced_functions(module: &pxr_ir::Module) -> BTreeSet<String> {
-    let names: BTreeSet<_> = module.functions.iter().map(|f| f.name.as_str()).collect();
-    let scalar_runtime = [
-        "abort",
-        "fabs",
-        "pxr_abs_i64",
-        "pxr_shl",
-        "pxr_shr",
-        "pxr_div",
-        "pxr_mod",
-        "pxr_print_i64",
-        "pxr_print_f64",
-        "pxr_print_bool",
-    ];
-    let mut traced = BTreeSet::new();
-    for f in &module.functions {
-        let values = pointer(&f.ret)
-            || f.params.iter().chain(&f.slots).any(pointer)
-            || f.body.iter().any(|i| match i {
-                Inst::Const {
-                    lit: pxr_ir::Literal::Str(_),
-                    ..
-                } => true,
-                Inst::Call { ret, callee, .. } => {
-                    pointer(ret)
-                        || (!names.contains(callee.as_str())
-                            && !scalar_runtime.contains(&callee.as_str()))
-                }
-                Inst::Bin {
-                    lhs_ty,
-                    rhs_ty,
-                    result_ty,
-                    ..
-                } => [lhs_ty, rhs_ty, result_ty].into_iter().any(pointer),
-                Inst::Un {
-                    operand_ty,
-                    result_ty,
-                    ..
-                } => pointer(operand_ty) || pointer(result_ty),
-                Inst::Cast { from, to, .. } | Inst::BitCast { from, to, .. } => {
-                    pointer(from) || pointer(to)
-                }
-                Inst::Print { ty, .. }
-                | Inst::SlotGet { ty, .. }
-                | Inst::SlotSet { ty, .. }
-                | Inst::SlotAlloc { ty, .. } => pointer(ty),
-                _ => false,
-            });
-        if values {
-            traced.insert(f.name.clone());
-        }
+fn allocates(inst: &Inst, leaf_functions: &BTreeSet<String>) -> bool {
+    match inst {
+        Inst::Call { callee, .. } => !runtime_leaf(callee) && !leaf_functions.contains(callee),
+        Inst::Print { .. } // HTTP output can grow its response buffer.
+        | Inst::Bin { op: pxr_ir::BinOp::Concat, .. }
+        | Inst::Cast { to: Ty::String, .. } => true,
+        _ => false,
     }
+}
+
+pub(crate) fn safepoint(inst: &Inst, leaf_functions: &BTreeSet<String>) -> bool {
+    allocates(inst, leaf_functions) || matches!(inst, Inst::Ret { .. })
+}
+
+/// Propagate allocation/collection effects through the whole call graph,
+/// including recursive components. Never infer effects from return types.
+/// Allocation-free pointer getters and constructors need no roots or polls.
+pub(crate) fn traced_functions(module: &pxr_ir::Module) -> BTreeSet<String> {
+    let names: BTreeSet<_> = module.functions.iter().map(|f| f.name.clone()).collect();
+    let mut traced: BTreeSet<_> = module
+        .functions
+        .iter()
+        .filter(|f| f.body.iter().any(|i| allocates(i, &names)))
+        .map(|f| f.name.clone())
+        .collect();
     loop {
         let mut changed = false;
         for f in &module.functions {
@@ -111,10 +97,11 @@ pub(crate) fn traced_functions(module: &pxr_ir::Module) -> BTreeSet<String> {
     }
 }
 
-/// Before the first possible allocation in a region, scalar control flow
-/// cannot accumulate garbage. Keep those loops free of runtime polling calls;
-/// calls/allocating casts still publish roots before any collection can occur.
-pub(crate) fn allocation_before(f: &Function) -> Vec<bool> {
+/// Track whether a path may have allocated before a return. Allocating
+/// operations already poll before execution, so nonallocating branch/loop edges
+/// need no additional polls. Returns retain a final collection opportunity,
+/// with the returned value published as a live root.
+pub(crate) fn allocation_before(f: &Function, leaf_functions: &BTreeSet<String>) -> Vec<bool> {
     let n = f.body.len();
     let labels: HashMap<_, _> = f
         .body
@@ -132,17 +119,9 @@ pub(crate) fn allocation_before(f: &Function) -> Vec<bool> {
     loop {
         let mut changed = false;
         for (i, inst) in f.body.iter().enumerate() {
-            let allocates = matches!(
-                inst,
-                Inst::Call { .. }
-                    | Inst::Bin {
-                        op: pxr_ir::BinOp::Concat,
-                        ..
-                    }
-                    | Inst::Cast { to: Ty::String, .. }
-                    | Inst::Print { ty: Ty::Mixed, .. }
-            );
-            if !before[i] && !allocates {
+            let pending =
+                allocates(inst, leaf_functions) || (before[i] && !safepoint(inst, leaf_functions));
+            if !pending {
                 continue;
             }
             let next = match inst {
@@ -354,7 +333,7 @@ mod tests {
         let roots = live_roots(&f);
         assert_eq!(roots[3], vec![Root::Slot(0)]);
         assert_eq!(roots[6], vec![Root::Slot(0)]);
-        assert!(allocation_before(&f)[6]);
+        assert!(allocation_before(&f, &BTreeSet::new())[6]);
         assert!(roots[8].is_empty());
     }
     #[test]
@@ -385,6 +364,149 @@ mod tests {
 #[cfg(test)]
 mod effects_tests {
     use super::*;
+    #[test]
+    fn pointer_getters_and_setters_need_no_frame_but_allocating_callees_do() {
+        let node = Ty::Named("Node".into());
+        let mut getter = Function::new("getter", "getter", vec![node.clone()], Ty::String);
+        getter.body = vec![
+            Inst::Const {
+                dst: 1,
+                lit: pxr_ir::Literal::Int(0),
+            },
+            Inst::Call {
+                dst: Some(2),
+                callee: "pxr_object_get_bits".into(),
+                args: vec![0, 1],
+                ret: Ty::Int,
+            },
+            Inst::BitCast {
+                dst: 3,
+                src: 2,
+                from: Ty::Int,
+                to: Ty::String,
+            },
+            Inst::Ret {
+                ty: Ty::String,
+                src: Some(3),
+            },
+        ];
+        let mut setter = Function::new("setter", "setter", vec![node, Ty::Int], Ty::Void);
+        setter.body = vec![Inst::Call {
+            dst: None,
+            callee: "pxr_object_set_bits".into(),
+            args: vec![0, 1, 1, 1],
+            ret: Ty::Void,
+        }];
+        let mut identity = Function::new("identity", "identity", vec![Ty::String], Ty::String);
+        identity.body = vec![Inst::Ret {
+            ty: Ty::String,
+            src: Some(0),
+        }];
+        let mut caller = Function::new("caller", "caller", vec![Ty::String], Ty::Void);
+        caller.body = vec![
+            Inst::Call {
+                dst: Some(1),
+                callee: "identity".into(),
+                args: vec![0],
+                ret: Ty::String,
+            },
+            Inst::Call {
+                dst: None,
+                callee: "unknown_callback".into(),
+                args: vec![],
+                ret: Ty::Void,
+            },
+            Inst::Print {
+                ty: Ty::String,
+                src: 1,
+            },
+        ];
+        assert_eq!(live_roots(&caller)[1], vec![Root::Value(1, false)]);
+        let mut module = pxr_ir::Module::new();
+        module.functions = vec![getter, setter, identity, caller];
+        assert_eq!(traced_functions(&module), BTreeSet::from(["caller".into()]));
+    }
+
+    #[test]
+    fn collection_effects_cross_recursive_calls_even_with_scalar_results() {
+        let mut a = Function::new("a", "a", vec![], Ty::Int);
+        a.body = vec![Inst::Call {
+            dst: Some(0),
+            callee: "b".into(),
+            args: vec![],
+            ret: Ty::Int,
+        }];
+        let mut b = Function::new("b", "b", vec![], Ty::Int);
+        b.body = vec![
+            Inst::Call {
+                dst: Some(0),
+                callee: "a".into(),
+                args: vec![],
+                ret: Ty::Int,
+            },
+            Inst::Call {
+                dst: None,
+                callee: "pxr_gc_collect".into(),
+                args: vec![],
+                ret: Ty::Void,
+            },
+        ];
+        let mut module = pxr_ir::Module::new();
+        module.functions = vec![a, b];
+        assert_eq!(
+            traced_functions(&module),
+            BTreeSet::from(["a".into(), "b".into()])
+        );
+    }
+
+    #[test]
+    fn allocating_operations_poll_without_polling_nonallocating_loop_edges() {
+        let leaves = BTreeSet::from(["getter".into()]);
+        assert!(!safepoint(&Inst::Jump(0), &leaves));
+        assert!(!safepoint(
+            &Inst::Branch {
+                cond: 0,
+                then_label: 0,
+                else_label: 1
+            },
+            &leaves
+        ));
+        assert!(!safepoint(
+            &Inst::Call {
+                dst: Some(1),
+                callee: "getter".into(),
+                args: vec![0],
+                ret: Ty::String
+            },
+            &leaves
+        ));
+        assert!(safepoint(
+            &Inst::Call {
+                dst: Some(1),
+                callee: "pxr_object_new".into(),
+                args: vec![],
+                ret: Ty::Mixed
+            },
+            &leaves
+        ));
+        assert!(safepoint(
+            &Inst::Call {
+                dst: Some(1),
+                callee: "pxr_mixed_str".into(),
+                args: vec![0],
+                ret: Ty::String
+            },
+            &leaves
+        ));
+        assert!(safepoint(
+            &Inst::Print {
+                ty: Ty::Int,
+                src: 0
+            },
+            &leaves
+        ));
+    }
+
     #[test]
     fn allocation_effects_propagate_without_penalizing_scalar_recursion() {
         let mut module = pxr_ir::Module::new();
@@ -448,7 +570,7 @@ mod effects_tests {
                 src: None,
             },
         ];
-        let before = allocation_before(&loop_before_allocation);
+        let before = allocation_before(&loop_before_allocation, &BTreeSet::new());
         assert!(!before[1]);
         assert!(before[4]);
         assert_eq!(

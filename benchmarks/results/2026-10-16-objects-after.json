@@ -1,0 +1,501 @@
+{
+  "environment": {
+    "measured_at_utc": "2026-10-16T19:50:30.762010+00:00",
+    "platform": "macOS-15.8.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "compiler_revision": "784bf880570fcab56c3fc8b821add77c2f47452b",
+    "working_tree_dirty": true,
+    "pxr_binary_path": "/Users/mehdi/projects/personal-2/php-extended-runtime/target/release/pxr",
+    "pxr_binary_sha256": "772b272410d4c4d161d7fd87ceffcc2e2cc0e143d00c237d0c05ee9e9ecdc80b",
+    "pxr_version": "pxr 0.1.0\nPHP Extended Runtime compiler",
+    "clang_version": "Apple clang version 17.0.0 (clang-1700.6.4.2)\nTarget: arm64-apple-darwin24.6.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin",
+    "php_command": [
+      "/Users/mehdi/Library/Application Support/Herd/bin/php"
+    ],
+    "php_version": "PHP 8.4.25 (cli) (built: Sep 24 2026 09:20:04) (NTS clang 15.0.0)\nCopyright (c) The PHP Group\nBuilt by Laravel Herd\nZend Engine v4.4.25, Copyright (c) Zend Technologies\n    with Zend OPcache v8.4.25, Copyright (c), by Zend Technologies",
+    "cpu": "Apple M3 Max",
+    "memory_bytes": 38654705664,
+    "php_settings": {
+      "loaded_ini": false,
+      "scanned_ini": "/Users/mehdi/Library/Application Support/Herd/config/php/84/php.ini\n",
+      "opcache.enable_cli": "0",
+      "opcache.jit": "disable",
+      "opcache.jit_buffer_size": "64M"
+    }
+  },
+  "repeat": 9,
+  "warmup": 2,
+  "opt": 3,
+  "timing": "process wall time, including startup; compilation excluded",
+  "order": "PXR/PHP on even rounds, PHP/PXR on odd rounds",
+  "results": [
+    {
+      "benchmark": "startup.php",
+      "source_sha256": "929088d2c214cdff354435b3ce4a55dce2dc091c71c014288901c31eea984888",
+      "output": "ready\n",
+      "build_seconds": 0.03840424999999999,
+      "pxr": {
+        "samples_seconds": [
+          0.002456833,
+          0.002685083,
+          0.002205459,
+          0.002479542,
+          0.002166208,
+          0.002551042,
+          0.002096708,
+          0.002439458,
+          0.002153125
+        ],
+        "median_seconds": 0.002439458,
+        "best_seconds": 0.002096708,
+        "max_seconds": 0.002685083
+      },
+      "php": {
+        "samples_seconds": [
+          0.031626875,
+          0.030955208,
+          0.029043416,
+          0.029797666,
+          0.028578,
+          0.028528917,
+          0.028523125,
+          0.029072875,
+          0.029365
+        ],
+        "median_seconds": 0.029072875,
+        "best_seconds": 0.028523125,
+        "max_seconds": 0.031626875
+      },
+      "php_over_pxr_median": 11.917760010625312
+    },
+    {
+      "benchmark": "fib.php",
+      "source_sha256": "24ff0b683657ad82f8123ea9cd11473906f4c2d80d8503a3a16167de5e92addb",
+      "output": "832040\n",
+      "build_seconds": 0.04045354099999998,
+      "pxr": {
+        "samples_seconds": [
+          0.004291584,
+          0.004794167,
+          0.004424708,
+          0.004828583,
+          0.004409459,
+          0.004839625,
+          0.00425275,
+          0.004751792,
+          0.004449084
+        ],
+        "median_seconds": 0.004449084,
+        "best_seconds": 0.00425275,
+        "max_seconds": 0.004839625
+      },
+      "php": {
+        "samples_seconds": [
+          0.088388875,
+          0.089422375,
+          0.088753666,
+          0.09024225,
+          0.087834666,
+          0.088353459,
+          0.088601334,
+          0.088192583,
+          0.087961834
+        ],
+        "median_seconds": 0.088388875,
+        "best_seconds": 0.087834666,
+        "max_seconds": 0.09024225
+      },
+      "php_over_pxr_median": 19.86675796635892
+    },
+    {
+      "benchmark": "loop.php",
+      "source_sha256": "2a9868a5ccbda01e9d0aab176a39d9e2e354d4c59b63cc350d4e1e9217d0b026",
+      "output": "12499997500000\n",
+      "build_seconds": 0.038936917000000015,
+      "pxr": {
+        "samples_seconds": [
+          0.002133541,
+          0.002663708,
+          0.002095041,
+          0.002667167,
+          0.002262375,
+          0.002579917,
+          0.002059833,
+          0.002589666,
+          0.002137333
+        ],
+        "median_seconds": 0.002262375,
+        "best_seconds": 0.002059833,
+        "max_seconds": 0.002667167
+      },
+      "php": {
+        "samples_seconds": [
+          0.083013458,
+          0.08266175,
+          0.074646833,
+          0.082497,
+          0.081774084,
+          0.078655333,
+          0.080579958,
+          0.08124625,
+          0.08236975
+        ],
+        "median_seconds": 0.081774084,
+        "best_seconds": 0.074646833,
+        "max_seconds": 0.083013458
+      },
+      "php_over_pxr_median": 36.145238521465274
+    },
+    {
+      "benchmark": "arrays.php",
+      "source_sha256": "5a11fbd1b0267a516b13142bc8d4896b83aa993b19ac97add2455a088c611dc0",
+      "output": "49995000\n",
+      "build_seconds": 0.04077245899999982,
+      "pxr": {
+        "samples_seconds": [
+          0.003344458,
+          0.003031375,
+          0.002605792,
+          0.002994833,
+          0.002457167,
+          0.002922209,
+          0.002507458,
+          0.0028675,
+          0.002419041
+        ],
+        "median_seconds": 0.0028675,
+        "best_seconds": 0.002419041,
+        "max_seconds": 0.003344458
+      },
+      "php": {
+        "samples_seconds": [
+          0.034412375,
+          0.030683708,
+          0.029488584,
+          0.029284875,
+          0.028358125,
+          0.029475709,
+          0.028920042,
+          0.029070584,
+          0.028373416
+        ],
+        "median_seconds": 0.029284875,
+        "best_seconds": 0.028358125,
+        "max_seconds": 0.034412375
+      },
+      "php_over_pxr_median": 10.212685265911073
+    },
+    {
+      "benchmark": "array_keys.php",
+      "source_sha256": "d232e136a230da4adb1488f13f8673bfcb8a010a795c2fc8183e8b1bbfe7e908",
+      "output": "12497500\n",
+      "build_seconds": 0.03992095800000017,
+      "pxr": {
+        "samples_seconds": [
+          0.00470475,
+          0.004706083,
+          0.005063458,
+          0.00422275,
+          0.003741709,
+          0.004241334,
+          0.0036505,
+          0.004089709,
+          0.003504833
+        ],
+        "median_seconds": 0.00422275,
+        "best_seconds": 0.003504833,
+        "max_seconds": 0.005063458
+      },
+      "php": {
+        "samples_seconds": [
+          0.031872083,
+          0.031269542,
+          0.030791625,
+          0.030250625,
+          0.028928625,
+          0.029379583,
+          0.02906425,
+          0.029343541,
+          0.028900667
+        ],
+        "median_seconds": 0.029379583,
+        "best_seconds": 0.028900667,
+        "max_seconds": 0.031872083
+      },
+      "php_over_pxr_median": 6.9574526078976975
+    },
+    {
+      "benchmark": "array_copy.php",
+      "source_sha256": "68566d9408cac67a41069ab3b3514b9a89a98827f02ed602e6224f65cdb24970",
+      "output": "100000\n",
+      "build_seconds": 0.039431832999999195,
+      "pxr": {
+        "samples_seconds": [
+          0.008257584,
+          0.008172583,
+          0.007649916,
+          0.007845708,
+          0.00724475,
+          0.007810375,
+          0.007402667,
+          0.008169917,
+          0.007739625
+        ],
+        "median_seconds": 0.007810375,
+        "best_seconds": 0.00724475,
+        "max_seconds": 0.008257584
+      },
+      "php": {
+        "samples_seconds": [
+          0.031041708,
+          0.031098791,
+          0.03032925,
+          0.030432583,
+          0.02994875,
+          0.029903542,
+          0.029897583,
+          0.031767,
+          0.030746208
+        ],
+        "median_seconds": 0.030432583,
+        "best_seconds": 0.029897583,
+        "max_seconds": 0.031767
+      },
+      "php_over_pxr_median": 3.8964304530832385
+    },
+    {
+      "benchmark": "array_copy_write.php",
+      "source_sha256": "7d29a781980f091e48ee37596790eb8c74deee6ca64f56ea175f5c5de4b48b21",
+      "output": "100000000:1:1000\n",
+      "build_seconds": 0.04224154200000019,
+      "pxr": {
+        "samples_seconds": [
+          0.016600916,
+          0.017944416,
+          0.018570458,
+          0.017476375,
+          0.017234666,
+          0.016839,
+          0.016147625,
+          0.016452708,
+          0.016126041
+        ],
+        "median_seconds": 0.016839,
+        "best_seconds": 0.016126041,
+        "max_seconds": 0.018570458
+      },
+      "php": {
+        "samples_seconds": [
+          0.040396083,
+          0.040702417,
+          0.040827625,
+          0.040766208,
+          0.039689,
+          0.040526,
+          0.040259542,
+          0.040514709,
+          0.040260458
+        ],
+        "median_seconds": 0.040514709,
+        "best_seconds": 0.039689,
+        "max_seconds": 0.040827625
+      },
+      "php_over_pxr_median": 2.4060044539461964
+    },
+    {
+      "benchmark": "strings.php",
+      "source_sha256": "16ba682afcf5d8121e4291cc1044b7663de6d6d001065227e51888bf4676b3ba",
+      "output": "400000:abcdefgh:abcdefgh\n",
+      "build_seconds": 0.03927545799999965,
+      "pxr": {
+        "samples_seconds": [
+          0.003373,
+          0.003622584,
+          0.002936333,
+          0.0039695,
+          0.003628334,
+          0.003479125,
+          0.002874459,
+          0.003179042,
+          0.002714667
+        ],
+        "median_seconds": 0.003373,
+        "best_seconds": 0.002714667,
+        "max_seconds": 0.0039695
+      },
+      "php": {
+        "samples_seconds": [
+          0.031741542,
+          0.03158125,
+          0.03013475,
+          0.030006916,
+          0.030017917,
+          0.029995083,
+          0.029459375,
+          0.029793708,
+          0.028873042
+        ],
+        "median_seconds": 0.030006916,
+        "best_seconds": 0.028873042,
+        "max_seconds": 0.031741542
+      },
+      "php_over_pxr_median": 8.896209902164246
+    },
+    {
+      "benchmark": "strings_snapshots.php",
+      "source_sha256": "7ca20328d7888f16f9ace91e63cee7776c1d32afc232d41d8d0506abca3bba1e",
+      "output": "400000:10:8:360008\n",
+      "build_seconds": 0.04183350000000008,
+      "pxr": {
+        "samples_seconds": [
+          0.003135041,
+          0.003435792,
+          0.002891458,
+          0.003337416,
+          0.00284825,
+          0.003236,
+          0.002805791,
+          0.003191583,
+          0.002754833
+        ],
+        "median_seconds": 0.003135041,
+        "best_seconds": 0.002754833,
+        "max_seconds": 0.003435792
+      },
+      "php": {
+        "samples_seconds": [
+          0.030735167,
+          0.030726916,
+          0.029473958,
+          0.029975375,
+          0.02981325,
+          0.029789166,
+          0.029427917,
+          0.029902375,
+          0.029124583
+        ],
+        "median_seconds": 0.02981325,
+        "best_seconds": 0.029124583,
+        "max_seconds": 0.030735167
+      },
+      "php_over_pxr_median": 9.509684243363962
+    },
+    {
+      "benchmark": "objects.php",
+      "source_sha256": "28b24e37eb075ef17e010b4e9f9bc874ad9a3f82ed11d0d518b709983c5cb23d",
+      "output": "2000001000000\n",
+      "build_seconds": 0.04017749999999953,
+      "pxr": {
+        "samples_seconds": [
+          0.100348584,
+          0.104931209,
+          0.103370959,
+          0.100489666,
+          0.101118917,
+          0.101080916,
+          0.09996875,
+          0.099323083,
+          0.099504875
+        ],
+        "median_seconds": 0.100489666,
+        "best_seconds": 0.099323083,
+        "max_seconds": 0.104931209
+      },
+      "php": {
+        "samples_seconds": [
+          0.187355541,
+          0.188719625,
+          0.190342542,
+          0.187445958,
+          0.189319666,
+          0.187697625,
+          0.189365209,
+          0.187745625,
+          0.189075833
+        ],
+        "median_seconds": 0.188719625,
+        "best_seconds": 0.187355541,
+        "max_seconds": 0.190342542
+      },
+      "php_over_pxr_median": 1.8780003209484246
+    },
+    {
+      "benchmark": "object_methods.php",
+      "source_sha256": "7813b894a94fc8f3c76e4e50ec5779b9db38db6515b148979a29699bf8c7931a",
+      "output": "2000001000000:2000000\n",
+      "build_seconds": 0.038806124999998914,
+      "pxr": {
+        "samples_seconds": [
+          0.007156959,
+          0.007532875,
+          0.007010125,
+          0.007650708,
+          0.0072475,
+          0.007399417,
+          0.007234625,
+          0.007455083,
+          0.007391708
+        ],
+        "median_seconds": 0.007391708,
+        "best_seconds": 0.007010125,
+        "max_seconds": 0.007650708
+      },
+      "php": {
+        "samples_seconds": [
+          0.08740525,
+          0.08744325,
+          0.088115083,
+          0.088430375,
+          0.08785075,
+          0.088578209,
+          0.087309667,
+          0.087653416,
+          0.088600417
+        ],
+        "median_seconds": 0.08785075,
+        "best_seconds": 0.087309667,
+        "max_seconds": 0.088600417
+      },
+      "php_over_pxr_median": 11.885040642839247
+    },
+    {
+      "benchmark": "objects_retained.php",
+      "source_sha256": "72aba4d4430563ade2b6a96c1b14af9b6a834e22c5034aaf1036001bffa61e81",
+      "output": "100000:5000050000\n",
+      "build_seconds": 0.04230183299999979,
+      "pxr": {
+        "samples_seconds": [
+          0.01179175,
+          0.014212167,
+          0.0127795,
+          0.012033041,
+          0.012121333,
+          0.011855458,
+          0.012430459,
+          0.012519834,
+          0.012007417
+        ],
+        "median_seconds": 0.012121333,
+        "best_seconds": 0.01179175,
+        "max_seconds": 0.014212167
+      },
+      "php": {
+        "samples_seconds": [
+          0.040206583,
+          0.041916792,
+          0.040873625,
+          0.040173334,
+          0.040569625,
+          0.040430542,
+          0.040120833,
+          0.040678458,
+          0.04053
+        ],
+        "median_seconds": 0.04053,
+        "best_seconds": 0.040120833,
+        "max_seconds": 0.041916792
+      },
+      "php_over_pxr_median": 3.34369165503497
+    }
+  ]
+}
