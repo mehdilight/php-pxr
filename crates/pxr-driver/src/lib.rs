@@ -25,7 +25,11 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// The runtime C source, embedded so the `pxr` binary is self contained.
-pub const RUNTIME_SOURCE: &str = include_str!("../../../runtime/pxr_rt.c");
+pub const RUNTIME_SOURCE: &str = concat!(
+    include_str!("../../../runtime/pxr_rt.c"),
+    "\n",
+    include_str!("../../../runtime/pxr_async.c")
+);
 const PHP_WORKER_SOURCE: &str = include_str!("../../../runtime/pxr_php_worker.php");
 
 fn runtime_source() -> String {

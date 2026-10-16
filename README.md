@@ -24,7 +24,10 @@ worker when they execute.
 > M5 adds native specialization for generic functions, classes, interfaces, and
 > independent methods; nominal bounds, trait composition, and return inference.
 > M6 adds affine `owned<T>` handles, moves, call-scoped borrows, and precise
-> reclamation of dead values and cycles. Next is M7: async I/O and concurrency.
+> reclamation of dead values and cycles. M7 is in progress: an internal executor
+> now supports structured tasks, timers, readiness waits and suspended GC roots.
+> Async source syntax and compiler lowering are still pending; see
+> [`docs/ASYNC_RUNTIME.md`](docs/ASYNC_RUNTIME.md).
 > See [`docs/OWNERSHIP.md`](docs/OWNERSHIP.md), [`docs/GENERICS.md`](docs/GENERICS.md), [`docs/MILESTONES.md`](docs/MILESTONES.md),
 > [`docs/MIXED.md`](docs/MIXED.md), and [`docs/INTEROP.md`](docs/INTEROP.md).
 

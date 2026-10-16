@@ -1,8 +1,12 @@
-# Async/await design — planned for M7.1
+# Async/await design — M7.1 in progress
 
-**Status: planned; no async syntax or executor is implemented.** This is a PXR
+**Status: the internal executor foundation is implemented and tested; async
+syntax, typing and lowering are not implemented.** This is a PXR
 language extension. The examples below are proposed syntax, not runnable PHP or
 current PXR programs. Milestone tracking lives in [`MILESTONES.md`](MILESTONES.md).
+The delivered internal lifecycle, timer, readiness and GC contract is documented
+in [`ASYNC_RUNTIME.md`](ASYNC_RUNTIME.md); cloned upstream references and exact
+revisions are recorded in [`ASYNC_REFERENCES.md`](ASYNC_REFERENCES.md).
 
 ## Syntax and result types
 
@@ -52,12 +56,16 @@ cancellation of remaining children and waits for their cleanup before finishing.
 Awaiting transfers a task's result or failure to its caller. An unobserved child
 failure must reach the parent rather than disappearing. Task and handle
 consumption, result ownership, and the treatment of dropped unawaited tasks must
-be specified before implementation. The intended initial model is one consumer
-per result; shared tasks are outside the initial scope.
+be enforced by the compiler before source support ships. The implemented internal
+contract uses one consumer per result and discards unused lazy tasks without
+running them; dropped started handles stay in the parent scope. Shared tasks are
+outside the initial scope.
 
 Cancellation is cooperative. Suspension points are candidates for cancellation
-checks; tight CPU loops cannot be assumed to stop immediately. The exact cleanup
-mechanism and the ordering of simultaneous child failures remain design work.
+checks; tight CPU loops cannot be assumed to stop immediately. The internal
+executor runs synchronous cleanup after children finish, and preserves the first
+error observed by that executor. The source error API and generated cleanup
+remain compiler work; the runtime does not add PHP exceptions or finally blocks.
 
 ## Dependencies and implementation order
 

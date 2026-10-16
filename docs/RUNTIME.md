@@ -1,7 +1,8 @@
 # The PXR runtime
 
 The PXR runtime is the small library every compiled program links against. It is
-written in C (`runtime/pxr_rt.c`), embedded into the `pxr` binary at build time,
+written in C (`runtime/pxr_rt.c` plus `runtime/pxr_async.c`), embedded into the
+`pxr` binary at build time,
 compiled on demand with the system C compiler, and cached as an object file.
 
 The runtime provides the value operations emitted by the native backend,
@@ -351,3 +352,12 @@ negative ownership programs before lowering, verifies bounded repeated
 allocation/cyclic garbage, tests stringifier re-entry, and checks PHP handle
 release without losing live identity. Sanitizer mode instruments both the real
 runtime and the generated native executable.
+
+## Async foundation
+
+The embedded runtime also includes an internal structured executor with heap
+frames, timers, POSIX readiness waits and precise task roots. It is currently
+exercised by native C integration tests; compiler async syntax/lowering is still
+pending. See [`ASYNC_RUNTIME.md`](ASYNC_RUNTIME.md) for lifecycle, result, error,
+cancellation and descriptor ownership rules. Existing synchronous programs do
+not start an executor.

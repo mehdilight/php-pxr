@@ -2917,6 +2917,8 @@ static void pxr_gc_mark_value(int64_t tag, int64_t bits) {
     if (tag >= PXR_TAG_STR && tag <= PXR_TAG_MIXED)
         pxr_gc_mark((void *)(intptr_t)bits);
 }
+/* Defined in the appended async runtime; suspended frames are heap roots. */
+static void pxr_async_mark_roots(void);
 void pxr_gc_collect(void) {
     pxr_gc_external_pressure = 0;
     pxr_gc_collections++;
@@ -2927,6 +2929,7 @@ void pxr_gc_collect(void) {
     }
     for (pxr_gc_frame *f = pxr_gc_frames; f; f = f->previous)
         for (size_t i = 0; i < f->count; i++) pxr_gc_mark(f->roots[i]);
+    pxr_async_mark_roots();
     for (size_t i = 0; i < 256; i++) {
         for (pxr_supertype *t = pxr_supertypes[i]; t; t = t->next) pxr_gc_mark(t);
         for (pxr_static_class *c = pxr_static_classes[i]; c; c = c->next) {

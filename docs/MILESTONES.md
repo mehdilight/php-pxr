@@ -731,11 +731,11 @@ M6 does not claim full PHP reference support or `Send`/`Sync` guarantees.
 ## ⛔ M7 — Async I/O & concurrency
 
 **Sequencing.** M5 generics and M6 affine ownership/live-root reclamation are
-complete. Define structured error propagation, cancellation, and resumable task
-frame lifetimes before starting the async runtime implementation. Async is planned, not available in the compiler.
+complete. The internal structured executor foundation is delivered below. Async
+syntax, typing and lowering remain unavailable in the compiler.
 See [`ASYNC.md`](ASYNC.md) for the proposed syntax and execution contract.
 
-### ⛔ M7.1 — Async functions & structured tasks
+### 🚧 M7.1 — Async functions & structured tasks
 
 * `async function f(...): T` creates a lazy `Task<T>`; its body returns `T`.
 * `await` inside async functions starts or resumes a task and yields its result;
@@ -756,6 +756,26 @@ rules, failure propagation, cancellation, and cleanup. A timer test must prove
 that another task progresses while the first is suspended. A socket test must
 verify actual I/O readiness without blocking the executor. Async examples are
 PXR extensions and are not claimed to run in the PHP interpreter.
+
+**Delivered foundation:** `runtime/pxr_async.c` provides resumable frame callbacks,
+a FIFO ready queue, monotonic indexed timers, POSIX descriptor readiness,
+structured joins, single-consumer results, error/cancellation propagation, and
+cleanup after children. Suspended/lazy frames and completed results contribute
+precise roots to the collector. The driver embeds both runtime sources.
+Native frame integration tests cover deterministic timer progress, real socket
+backpressure/EOF, failure/cancellation cleanup, deep task trees and bounded
+completed-task retention at `-O0`/`-O3`, including forced GC and sanitizer builds.
+See [`ASYNC_RUNTIME.md`](ASYNC_RUNTIME.md) for the contract and
+[`ASYNC_REFERENCES.md`](ASYNC_REFERENCES.md) for cloned primary references.
+
+**Remaining:** lexer/parser syntax, `Task<T>` and handle typing/consumption,
+borrow-capture checks, typed-IR suspension lowering and generated frame roots,
+source error/cancellation APIs, async CLI entry and public I/O operations.
+**Validation:** 203 workspace tests pass; async/heap/ownership sanitizer checks,
+example checks and the release build pass.
+
+Hand-written C frames do not satisfy the compiler end-to-end acceptance checks;
+M7.1 and M7 remain incomplete.
 
 ### ⛔ M7.2 — Threaded parallelism
 
