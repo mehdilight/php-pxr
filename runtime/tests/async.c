@@ -138,6 +138,40 @@ static void test_failure(void) {
     assert(cleaned == 3 && ran == 1 && clock.now == 0 && !clock.waits);
     end_loop(&loop);
 }
+static int boundary_mode;
+static void boundary_parent(pxr_task *task, void *raw) {
+    pair_frame *frame = raw;
+    if (!frame->pc++) {
+        frame->a = pxr_task_new(task->loop, task, 0, 0, failure_parent, clean);
+        frame->a->isolate_failure = 1;
+        if (!boundary_mode) { pxr_task_await(task, frame->a); return; }
+        pxr_task_start(frame->a); pxr_task_release(frame->a);
+        if (boundary_mode == 2) pxr_task_cancel(task);
+        else if (boundary_mode == 3) pxr_task_fail(task, EINVAL);
+        else pxr_task_finish(task, PXR_TAG_INT, 42);
+        return;
+    }
+    /* The boundary must cancel/join its sibling subtree before recovery. */
+    assert(cleaned == 3 && !task->pending_children);
+    pxr_task_result result = pxr_task_take(frame->a);
+    assert(result.status == PXR_TASK_ERROR && result.error == EIO);
+    pxr_gc_collect();
+    pxr_task_finish(task, PXR_TAG_INT, 42);
+}
+static void test_failure_boundaries(void) {
+    for (boundary_mode = 0; boundary_mode < 4; boundary_mode++) {
+        pxr_loop loop; fake_clock clock = {0}; fake_init(&loop, &clock);
+        cleaned = ran = event_count = 0;
+        pxr_task_new(&loop, NULL, sizeof(pair_frame), 0, boundary_parent, clean);
+        pxr_task_result result = pxr_loop_run(&loop);
+        assert(result.status == (boundary_mode == 2 ? PXR_TASK_CANCELLED :
+            boundary_mode == 3 ? PXR_TASK_ERROR : PXR_TASK_OK));
+        if (boundary_mode == 3) assert(result.error == EINVAL);
+        if (boundary_mode < 2) assert(result.bits == 42);
+        assert(cleaned == 4 && !clock.waits && !loop.timer_count);
+        end_loop(&loop);
+    }
+}
 static void yields(pxr_task *task, void *raw) {
     int *count = raw;
     if (++*count < 200) {
@@ -664,7 +698,7 @@ static void test_server_cancel(void) {
 
 int main(void) {
     alarm(20); /* Turn a scheduler regression into a bounded test failure. */
-    test_timers(); test_scope(); test_failure(); test_cancellation();
+    test_timers(); test_scope(); test_failure(); test_failure_boundaries(); test_cancellation();
     test_wait_errors(); test_sockets(); test_deep();
     test_retention(); test_io_cleanup(); test_heap();
     test_frame_roots(); test_failure_order(); test_tcp_cancel(); test_server_cancel();

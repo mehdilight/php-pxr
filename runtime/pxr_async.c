@@ -37,6 +37,7 @@ struct pxr_task {
     uint64_t id, deadline;
     size_t timer_index;
     int state, queued, handle_live, claimed, body_done, cancel_requested;
+    int isolate_failure; /* Runtime-owned boundary: errors stay in this task's result. */
     int fd; short io_events, io_ready;
     pxr_task_result result;
     pxr_task_callback resume, cleanup;
@@ -210,7 +211,8 @@ static void pxr_task_destroy(pxr_task *task) {
     free(task);
 }
 /* Dropping a started handle does not detach or cancel its child. Scope exit
- * still joins it and propagates errors. Dropping a lazy handle never runs it. */
+ * still joins it and propagates errors, except at runtime-owned failure
+ * boundaries. Dropping a lazy handle never runs it. */
 static void pxr_task_release(pxr_task *task) {
     assert(task->handle_live);
     assert(task->parent || task->state == PXR_TASK_COMPLETE);
@@ -317,7 +319,7 @@ static void pxr_task_step(pxr_task *task) {
     if (parent) {
         assert(parent->pending_children);
         parent->pending_children--;
-        if (task->result.status == PXR_TASK_ERROR) {
+        if (task->result.status == PXR_TASK_ERROR && !task->isolate_failure) {
             if (!parent->result.error) parent->result.error = task->result.error;
             parent->result.status = PXR_TASK_ERROR;
             parent->body_done = 1;
@@ -718,14 +720,20 @@ static void pxr_server_connection_resume(pxr_task *task, void *raw) {
     }
     if (frame->phase == PXR_SERVER_HANDLER) {
         pxr_task_result result = pxr_task_take(frame->handler_task);
-        assert(result.status == PXR_TASK_OK && (result.tag == PXR_TAG_STR || (frame->http_handler && result.tag == 0)));
         frame->handler_task = NULL;
-        frame->response = result.tag == PXR_TAG_STR ? (void *)(intptr_t)result.bits : pxr_str_alloc(0);
-        task->roots[1] = frame->response;
-        if (frame->http_handler) {
-            pxr_http_response(task, frame, frame->response, 0);
-        } else if (frame->response->len > (uint64_t)frame->max_bytes) {
-            pxr_task_fail(task, EMSGSIZE); return;
+        if (frame->http_handler && result.status != PXR_TASK_OK) {
+            /* take is possible only after the failed handler has joined all
+             * descendants and released their resources. Discard partial output. */
+            pxr_http_response(task, frame, NULL, 500);
+        } else {
+            assert(result.status == PXR_TASK_OK && (result.tag == PXR_TAG_STR || (frame->http_handler && result.tag == 0)));
+            frame->response = result.tag == PXR_TAG_STR ? (void *)(intptr_t)result.bits : pxr_str_alloc(0);
+            task->roots[1] = frame->response;
+            if (frame->http_handler) {
+                pxr_http_response(task, frame, frame->response, 0);
+            } else if (frame->response->len > (uint64_t)frame->max_bytes) {
+                pxr_task_fail(task, EMSGSIZE); return;
+            }
         }
         frame->phase = PXR_SERVER_WRITE;
     }
@@ -759,6 +767,7 @@ static void pxr_server_connection_resume(pxr_task *task, void *raw) {
             if (ready) {
                 if (frame->http_handler) {
                     frame->handler_task = frame->http_handler();
+                    frame->handler_task->isolate_failure = 1;
                 } else {
                     pxr_str *request = pxr_str_alloc(frame->request.len);
                     if (frame->request.len) memcpy(request->data, frame->request.data, frame->request.len);
@@ -893,7 +902,10 @@ static void pxr_server_resume(pxr_task *task, void *raw) {
         connection->fd = fd; connection->max_bytes = frame->max_bytes;
         connection->handler = frame->handler;
         connection->http_handler = frame->http_handler;
-        if (frame->http_handler) child->http = pxr_http_context_new(fd, frame->max_bytes);
+        if (frame->http_handler) {
+            child->http = pxr_http_context_new(fd, frame->max_bytes);
+            child->isolate_failure = 1;
+        }
         connection->expires = (uint64_t)frame->timeout_ms > (UINT64_MAX - now) / 1000000
             ? UINT64_MAX : now + (uint64_t)frame->timeout_ms * 1000000;
         pxr_task_roots(child, 2);

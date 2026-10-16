@@ -129,6 +129,12 @@ This currently covers errors reported through the task runtime, such as an
 invalid timer duration, TCP transfer failure, size limit or deadline expiration.
 Existing synchronous runtime fatal errors retain their process-termination behavior; they are not silently converted into task errors.
 
+The [HTTP server](HTTP.md) installs internal failure boundaries for accepted
+connections and handlers. A connection timeout/transport error closes only that
+connection; an async handler failure becomes a bounded 500 after descendant
+cleanup. Listener and executor failures still propagate. This adds no general
+source-level catch syntax and leaves ordinary tasks and raw TCP servers unchanged.
+
 Cancellation is cooperative. The internal runtime removes pending waits and
 cleans children before releasing a parent frame. Source cancellation now consumes
 handles through `cancelTask`; it does not

@@ -190,11 +190,13 @@ static void chunk_cases(void) {
 static int pair[2], mode, cleaned, closed_fd, waits;
 static uint64_t now;
 static uint64_t fake_now(void *context) { (void)context; return now; }
+static int descendants_cleaned;
 static int fake_wait(struct pollfd *fds, nfds_t count, int timeout, void *context) {
     (void)context;
     if (mode == 6) { assert(count == 1 && timeout == 0); return 0; }
-    assert(count == 1 && timeout == 5);
-    assert(fds[0].events == (mode == 5 ? POLLOUT : POLLIN));
+    assert(count == (mode == 9 ? 0 : 1) && timeout == 5);
+    if (count) assert(fds[0].events == (mode == 5 ? POLLOUT : POLLIN));
+    if (mode == 7) assert(descendants_cleaned == 2);
     waits++; now += 5000000; return 0;
 }
 static void connection_cleanup(pxr_task *task, void *raw) {
@@ -215,17 +217,42 @@ static void captured_handler(pxr_task *task, void *raw) {
     pxr_task_finish(task, 0, 0); /* Still joins its descendant. */
 }
 static pxr_task *new_captured_handler(void) { return pxr_async_create(captured_handler, 1); }
+static void descendant_cleanup(pxr_task *task, void *raw) {
+    (void)task; (void)raw; descendants_cleaned++; pxr_gc_collect();
+}
+static void failed_descendant(pxr_task *task, void *raw) {
+    (void)raw; pxr_task_fail(task, EIO);
+}
+static void failed_handler(pxr_task *task, void *raw) {
+    (void)raw;
+    pxr_print_str(pxr_http_string("private", 7));
+    pxr_http_header(pxr_http_string("X-Private: secret", 17), 1, 0);
+    pxr_task *slow = pxr_task_new(task->loop, task, sizeof(int), 0, sleeping_child, descendant_cleanup);
+    pxr_task *bad = pxr_task_new(task->loop, task, 0, 0, failed_descendant, descendant_cleanup);
+    pxr_task_start(slow); pxr_task_release(slow);
+    pxr_task_start(bad); pxr_task_release(bad);
+    pxr_task_finish(task, 0, 0);
+}
+static pxr_task *new_failed_handler(void) { return pxr_async_create(failed_handler, 1); }
+static void simple_handler(pxr_task *task, void *raw) {
+    (void)raw; pxr_task_finish(task, 0, 0);
+}
+static pxr_task *new_simple_handler(void) { return pxr_async_create(simple_handler, 1); }
 static void io_parent(pxr_task *task, void *raw) {
     parent_frame *parent = raw;
     if (!parent->pc++) {
         pxr_task *child = pxr_task_new(task->loop, task, sizeof(pxr_server_connection), 2,
             pxr_server_connection_resume, connection_cleanup);
         parent->connection = child;
+        child->isolate_failure = 1;
         pxr_server_connection *frame = child->frame;
         frame->fd = pair[0]; frame->max_bytes = 4096; frame->expires = 5000000;
         frame->http_handler = unused_handler;
         child->http = pxr_http_context_new(-1, 4096); pxr_task_roots(child, 2);
         frame->phase = mode ? PXR_SERVER_READ : PXR_SERVER_DRAIN;
+        if (mode == 7) frame->http_handler = new_failed_handler;
+        if (mode == 8) frame->http_handler = new_simple_handler;
+        if (mode == 9) frame->http_handler = new_captured_handler;
         if (mode == 2 || mode == 6) {
             if (mode == 2) frame->http_handler = new_captured_handler;
             pxr_task_start(child); pxr_task_sleep(task, 0); return;
@@ -247,19 +274,24 @@ static void io_parent(pxr_task *task, void *raw) {
         assert(connection->http->output.len == 8 && !memcmp(connection->http->output.data, "captured", 8));
         pxr_async_cancel(connection); pxr_task_finish(task, 0, 0); return;
     }
-    assert(pxr_task_take(parent->connection).status == PXR_TASK_OK);
+    pxr_task_result result = pxr_task_take(parent->connection);
+    int failed = mode == 1 || (mode >= 3 && mode <= 5) || mode == 8 || mode == 9;
+    assert(result.status == (failed ? PXR_TASK_ERROR : PXR_TASK_OK));
+    if (failed && mode != 8) assert(result.error == ETIMEDOUT);
+    if (mode == 8) assert(result.error == EPIPE || result.error == ECONNRESET);
     pxr_task_finish(task, 0, 0);
 }
 static void teardown_cases(void) {
-    for (mode = 0; mode < 7; mode++) {
+    for (mode = 0; mode < 10; mode++) {
         assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
         assert(pxr_tcp_configure(pair[0]) == 0);
         if (mode == 1) {
             const char *partial = "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\nabc";
             assert(send(pair[1], partial, strlen(partial), 0) == (ssize_t)strlen(partial));
-        } else if (mode == 2) {
+        } else if (mode == 2 || mode >= 7) {
             const char *request = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
             assert(send(pair[1], request, strlen(request), 0) == (ssize_t)strlen(request));
+            if (mode == 8) { close(pair[1]); pair[1] = -1; }
         } else if (mode == 3 || mode == 6) {
             const char *partial = "POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabc";
             assert(send(pair[1], partial, strlen(partial), 0) == (ssize_t)strlen(partial));
@@ -274,15 +306,21 @@ static void teardown_cases(void) {
             assert(send(pair[1], partial, strlen(partial), 0) == (ssize_t)strlen(partial));
         }
         pxr_async_create(io_parent, (sizeof(parent_frame) + 7) / 8);
-        now = 0; waits = cleaned = 0; closed_fd = -1;
+        now = 0; waits = cleaned = descendants_cleaned = 0; closed_fd = -1;
         pxr_compiler_loop.now = fake_now; pxr_compiler_loop.wait = fake_wait;
         pxr_task_result result = pxr_loop_run(&pxr_compiler_loop);
         assert(cleaned == 1);
-        if (mode == 2 || mode == 6) assert(!waits && !now);
+        if (mode == 2 || mode == 6 || mode == 8) assert(!waits && !now);
         else assert(waits == 1 && now == 5000000);
-        int failed = mode == 1 || (mode >= 3 && mode <= 5);
-        assert(result.status == (failed ? PXR_TASK_ERROR : PXR_TASK_OK));
-        if (failed) assert(result.error == ETIMEDOUT);
+        assert(result.status == PXR_TASK_OK); /* Boundary preserves the parent. */
+        if (mode == 7) {
+            char response[1024]; ssize_t n = recv(pair[1], response, sizeof(response) - 1, 0);
+            assert(n > 0); response[n] = 0;
+            assert(strstr(response, "HTTP/1.1 500 Internal Server Error\r\n"));
+            assert(strstr(response, "\r\n\r\nInternal Server Error\n"));
+            assert(!strstr(response, "private") && !strstr(response, "X-Private"));
+            assert(descendants_cleaned == 2);
+        }
         if (mode == 4) {
             char interim[25];
             assert(recv(pair[1], interim, sizeof(interim), MSG_WAITALL) == 25);
@@ -291,7 +329,8 @@ static void teardown_cases(void) {
         errno = 0; assert(fcntl(closed_fd, F_GETFD) == -1 && errno == EBADF);
         int reused = open("/dev/null", O_RDONLY); assert(reused >= 0);
         pxr_gc_collect(); assert(fcntl(reused, F_GETFD) >= 0); close(reused);
-        close(pair[1]); pxr_loop_destroy(&pxr_compiler_loop); pxr_compiler_loop_initialized = 0;
+        if (pair[1] >= 0) close(pair[1]);
+        pxr_loop_destroy(&pxr_compiler_loop); pxr_compiler_loop_initialized = 0;
         pxr_gc_collect(); assert(!pxr_heap_blocks && !pxr_heap_bytes && !pxr_async_loops);
     }
 }

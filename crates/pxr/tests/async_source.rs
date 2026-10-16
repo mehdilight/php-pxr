@@ -1472,3 +1472,156 @@ fn http_rejects_ambiguous_chunks_and_recovers_for_the_next_request() {
         4096,
     );
 }
+
+#[test]
+fn http_handler_failures_join_descendants_and_return_clean_500_responses() {
+    let gate = server_port("127.0.0.1");
+    let handler = format!(
+        r#"
+async function reply(string $request): string {{ return $request; }}
+async function failChild(): void {{ await sleepAsync(-1); }}
+async function handle(): string {{
+    if ($_SERVER["PATH_INFO"] === "/direct") {{
+        header("X-Private: secret"); echo "private";
+        await failChild();
+        return "unreachable";
+    }}
+    $listener = spawn tcpServeAsync("127.0.0.1", {gate}, "reply", 0, 10);
+    await sleepAsync(0);
+    if ($_SERVER["PATH_INFO"] === "/tree") {{
+        header("X-Private: secret"); http_response_code(201); echo "private";
+        spawn failChild();
+        return "discarded";
+    }}
+    cancelTask($listener);
+    return "ok";
+}}"#
+    );
+    let requests = [
+        ("/tree", 500),
+        ("/healthy", 200),
+        ("/direct", 500),
+        ("/healthy", 200),
+    ]
+    .into_iter()
+    .map(|(path, status)| {
+        (
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").into_bytes(),
+            status,
+            if status == 500 {
+                b"Internal Server Error\n".to_vec()
+            } else {
+                b"ok".to_vec()
+            },
+        )
+    })
+    .collect();
+    for run in http_cases("http-handler-recovery", &handler, requests, 4096) {
+        for headers in run {
+            assert!(!headers.contains("X-Private"));
+        }
+    }
+}
+
+#[test]
+fn http_deadlines_release_connection_slots_and_cancel_handler_resources() {
+    use std::io::{Read, Write};
+    if !have_cc() {
+        return;
+    }
+    let port = server_port("127.0.0.1");
+    let gate = server_port("127.0.0.1");
+    let source = format!(
+        r#"<?php
+async function reply(string $request): string {{ return $request; }}
+async function handle(): string {{
+    $listener = spawn tcpServeAsync("127.0.0.1", {gate}, "reply", 0, 10);
+    await sleepAsync(0);
+    if ($_SERVER["PATH_INFO"] === "/slow") {{
+        echo "private"; await sleepAsync(10000000);
+    }}
+    cancelTask($listener); return "ok";
+}}
+async function main(): void {{
+    await httpServeAsync("127.0.0.1", {port}, "handle", 6, 4096, 500, 1);
+    echo "done\n";
+}}"#
+    );
+    for opt in [0, 3] {
+        let executable = build("http-deadline-recovery", &source, opt);
+        for stress in [false, true] {
+            let client = std::thread::spawn(move || {
+                for partial in [
+                    b"GET / HTTP/1.1\r\nHost: localhost\r\n".as_slice(),
+                    b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabc",
+                    b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                ] {
+                    let mut bad = connect_http(port);
+                    bad.write_all(partial).unwrap();
+                    // Queue work at capacity. It must run after timeout frees the
+                    // sole slot, with the failed handler's listener already closed.
+                    let mut healthy = connect_http(port);
+                    healthy.write_all(b"GET /healthy HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+                    let mut bytes = Vec::new();
+                    bad.read_to_end(&mut bytes).unwrap();
+                    assert!(bytes.is_empty(), "{bytes:?}");
+                    let (headers, body) = read_http(&mut healthy);
+                    assert!(headers.starts_with("HTTP/1.1 200 "), "{headers}");
+                    assert_eq!(body, b"ok");
+                }
+            });
+            let mut command = Command::new(&executable);
+            command.env("PXR_PHP", "/pxr-no-php-cli");
+            if stress {
+                command.env("PXR_GC_STRESS", "1");
+            }
+            let out = execute(&mut command);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(out.stdout, b"done\n");
+            assert!(out.stderr.is_empty());
+            client.join().unwrap();
+        }
+        std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn http_listener_failures_still_propagate_to_the_caller() {
+    if !have_cc() {
+        return;
+    }
+    let occupied = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = occupied.local_addr().unwrap().port();
+    for (i, (address, timeout)) in [("127.0.0.1", 1000), ("localhost", 1000), ("127.0.0.1", 0)]
+        .into_iter()
+        .enumerate()
+    {
+        let source = format!(
+            r#"<?php
+async function handle(): string {{ return "ok"; }}
+async function main(): void {{
+    await httpServeAsync("{address}", {port}, "handle", 1, 4096, {timeout});
+    echo "unreachable";
+}}"#
+        );
+        for opt in [0, 3] {
+            let executable = build(&format!("http-listener-error-{i}"), &source, opt);
+            for stress in [false, true] {
+                let mut command = Command::new(&executable);
+                command.env("PXR_PHP", "/pxr-no-php-cli");
+                if stress {
+                    command.env("PXR_GC_STRESS", "1");
+                }
+                let out = execute(&mut command);
+                assert_eq!(out.status.code(), Some(255), "{out:?}");
+                assert!(out.stdout.is_empty());
+                assert!(String::from_utf8_lossy(&out.stderr).starts_with("pxr: async task failed:"));
+            }
+            std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+        }
+    }
+}

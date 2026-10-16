@@ -58,7 +58,7 @@ It does not detach the child or suppress its error. A parent cannot complete or
 release its frame/resources while children remain active.
 
 The internal result envelope contains `OK`, `CANCELLED`, or `ERROR`, a positive
-error code, and the successful tagged result. An operation or child error marks
+error code, and the successful tagged result. An ordinary operation or child error marks
 the parent for failure. The first error **observed by that executor** wins;
 errors are not sorted by child creation order, and a later cancellation cannot
 replace an error. Remaining children are cancelled and joined. A failed awaited
@@ -68,6 +68,15 @@ an exception model into PXR. Positive errno values are used by current I/O and
 scheduler errors. Non-interrupt poll failures fail the root and drain its tree.
 A stalled tree without a runnable task, timer or I/O wait fails with `EDEADLK`.
 Allocation failure retains the runtime's abort behavior.
+
+Runtime-owned scopes can set `isolate_failure` before starting a task. Its failure
+still cancels/joins its descendants and runs cleanup exactly once, but completion
+does not mark its parent failed. Awaiters receive the original error envelope;
+dropped handles remain scoped/joined and capacity waiters still wake. The flag
+does not propagate to descendants and does not suppress parent cancellation or
+executor failures. It is internal, with no source-level catch/recovery syntax.
+HTTP sets it on accepted connections and their handlers: connection errors close
+only that socket, and an awaited handler error can become a bounded 500 after join.
 
 Cancellation is cooperative: the next executor visit ends the task body, removes
 its wait, requests cancellation of children, and waits for their cleanup. It
@@ -191,7 +200,10 @@ A separate rooted fallback supplies initially empty CLI request arrays and is
 never used to initialize an accepted HTTP request. Response serialization waits
 for handler descendants; `echo`/`print`/`printf` can therefore stay buffered and
 headers mutable until completion. HTTP protocol errors become local responses;
-ordinary task/transport failures retain the structured fail-fast policy. After
+handler failures become bounded 500 responses after descendant cleanup, while
+connection transport/deadline failures close only their own connection. Listener
+and executor failures still propagate. Ordinary tasks and raw TCP servers retain
+their fail-fast policy. After
 sending, HTTP tasks shut down writes and use a bounded drain phase. An expired
 drain completes successfully, while an expired application/read/write wait still
 fails with ETIMEDOUT. [HTTP.md](HTTP.md) specifies all source/protocol boundaries.

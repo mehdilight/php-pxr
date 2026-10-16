@@ -806,7 +806,9 @@ printf, header() and http_response_code() produce buffered request-local
 responses. Incremental chunked request decoding and nonblocking 100-continue
 support preserve decoded body/form globals, with separate chunk/trailer metadata
 limits and rejection of ambiguous framing. Protocol errors produce bounded local
-HTTP responses; transport/task errors retain fail-fast structured cleanup.
+HTTP responses. Accepted HTTP connections isolate transport/deadline failures;
+failed async handlers join/cancel descendants before a clean bounded 500.
+Listener/executor errors and ordinary tasks/TCP servers retain fail-fast cleanup.
 Tests prove concurrent context
 isolation, open-client-write-side framing, large binary bodies, limits, nested
 parameters and cancellation/GC roots. See [`HTTP.md`](HTTP.md),
@@ -824,7 +826,7 @@ pending. Threading remains M7.2.
 AddressSanitizer/UndefinedBehaviorSanitizer. They cover scheduling progress,
 ordered awaits, affine handles, joins/cleanup, control-flow suspension, captured
 values, module resolution, failure propagation, bounded memory and invalid forms.
-All 233 workspace tests, async/HTTP/heap/ownership sanitizer checks, example checks
+All 236 workspace tests, async/HTTP/heap/ownership sanitizer checks, example checks
 and the release build pass.
 M7.1 and M7 remain incomplete until the remaining I/O/lifecycle APIs and their
 source acceptance checks are delivered.

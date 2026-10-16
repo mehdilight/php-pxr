@@ -28,8 +28,9 @@ worker when they execute.
 > supports free async functions, affine task handles, await/spawn, nonblocking
 > timers, owned TCP exchanges, bounded native TCP servers, consuming cancellation
 > and an async main entry. A bounded HTTP adapter adds isolated request globals,
-> PHP-style output, header() and http_response_code().
-> Streaming socket APIs, recoverable errors and broader async signatures remain
+> PHP-style output, header() and http_response_code(), bounded chunked bodies,
+> 100-continue and isolated connection/handler failures.
+> Streaming socket APIs, general task error recovery and broader async signatures remain
 > pending; see
 > [`docs/ASYNC.md`](docs/ASYNC.md), [`docs/ASYNC_IO.md`](docs/ASYNC_IO.md),
 > [`docs/ASYNC_SERVER.md`](docs/ASYNC_SERVER.md), and [`docs/HTTP.md`](docs/HTTP.md).

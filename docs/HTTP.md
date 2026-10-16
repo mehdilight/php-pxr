@@ -201,12 +201,27 @@ successfully. Pending reads, handler execution and response writes still use the
 single absolute connection deadline.
 
 Protocol/input-validation errors are local HTTP responses and do not stop the
-listener. General task failures, connection deadlines and socket errors retain
-the current fail-fast structured task policy: cancel/join the server subtree,
-close resources, report the first error, and exit 255. Recoverable task errors,
-per-connection transport-error recovery and graceful shutdown with a drain
-budget remain M7 work. Existing synchronous fatal errors retain their process
-behavior. This slice is not yet a production web-server compatibility claim.
+listener. Each accepted HTTP connection is a runtime-owned failure boundary:
+read/write errors and connection deadline expiration cancel/join that connection's
+handler subtree and close its socket, while other requests continue. No response
+is guaranteed for transport errors or expired deadlines; the original absolute
+deadline is never extended to send an error. Failed connections count toward
+`maxRequests`, and release their concurrency slots only after descendant cleanup.
+
+A handler's async task failure, including a failed spawned descendant, cancels
+and joins the rest of that handler subtree before returning a bounded 500.
+Buffered output, the returned value and user response headers are discarded.
+The response still obeys HEAD framing and the connection deadline. A fresh
+request receives fresh globals/output/headers and can reuse resources released
+by the failed handler. These boundaries do not detach tasks, retry operations,
+undo handler effects or change ordinary tasks and raw TCP servers' failure rules.
+
+Invalid listener configuration, bind/listen/accept/setup errors and executor poll
+failures still fail the server/root task tree, cancel/join its work, and exit 255
+with the existing async diagnostic. General source-level error recovery,
+exceptions and graceful shutdown with a drain budget remain M7 work. Existing
+synchronous fatal errors and allocation failure retain their process behavior.
+This slice is not yet a production web-server compatibility claim.
 
 ## Verification and references
 
@@ -219,6 +234,12 @@ proves a fast request finishes while another handler is suspended; globals,
 status, headers and child-task output remain isolated. The suites run at
 `-O0`/`-O3`, normal/forced GC, and optional ASan/UBSan.
 
+Failure tests cover direct and spawned handler errors, discarded private output
+and headers, timeout recovery at concurrency one with already queued requests,
+and immediate reuse of handler-owned listener ports after cancellation/join.
+Listener failures remain fatal. Executor tests exercise awaited/dropped failure
+boundaries and parent cancellation/failure; ordinary child failures still propagate.
+
 The native C suite additionally feeds headers byte by byte, tests truncation,
 NUL/control bytes and deterministic arbitrary input, forces collection while
 request/output buffers are live, verifies nested REQUEST merging, and checks
@@ -226,5 +247,7 @@ read/interim-write deadlines, bounded teardown, cancellation during chunk
 decoding and through a handler's joining grandchild. Every truncation of a
 chunked fixture, quoted extensions and metadata limits are checked.
 Cleanup and descriptor reuse are checked before process teardown.
+HTTP socket-pair tests also verify closed-peer write errors, handler deadlines,
+isolated error results and 500 serialization after descendant cleanup.
 See [ASYNC_REFERENCES.md](ASYNC_REFERENCES.md) for RFCs, PHP source/manuals and the
 pinned llhttp checkout studied. No upstream parser code is vendored or copied.

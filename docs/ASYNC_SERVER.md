@@ -120,6 +120,8 @@ Streaming resource ownership and recoverable errors remain M7 work. The separate
 [HTTP layer](HTTP.md) now implements framed requests, request-local query/form/
 cookie/server data and PHP-style buffered output/header/status helpers. It uses
 `httpServeAsync`, rather than changing this TCP operation's EOF protocol.
+It also isolates HTTP connection failures and returns 500 after joining a failed
+handler subtree; the raw TCP operation documented here retains fail-fast errors.
 Request/response object APIs, routing classes, uploads and sessions remain future
 work. The HTTP documentation records the implemented PHP syntax and explicit
 compatibility/protocol boundaries.
