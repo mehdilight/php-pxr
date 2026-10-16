@@ -1,4 +1,4 @@
-# Native HTTP and PHP-style request data — M7 in progress
+# Native HTTP and PHP-style request data
 
 PXR has a bounded HTTP/1.x server adapter with isolated PHP-style request globals,
 buffered output, response headers and status codes. It runs on the native

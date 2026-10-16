@@ -30,7 +30,11 @@ pub const RUNTIME_SOURCE: &str = concat!(
     "\n",
     include_str!("../../../runtime/pxr_async.c"),
     "\n",
-    include_str!("../../../runtime/pxr_http.c")
+    include_str!("../../../runtime/pxr_http.c"),
+    "\n",
+    include_str!("../../../runtime/pxr_stream.c"),
+    "\n",
+    include_str!("../../../runtime/pxr_parallel.c")
 );
 const PHP_WORKER_SOURCE: &str = include_str!("../../../runtime/pxr_php_worker.php");
 
@@ -733,7 +737,7 @@ fn cache_dir() -> PathBuf {
 fn compile_runtime(cc: &str, workspace: &WorkDir) -> Result<PathBuf, BuildError> {
     let dir = cache_dir();
     let source = runtime_source();
-    let hash = fnv1a(format!("{cc}\n{source}").as_bytes());
+    let hash = fnv1a(format!("{cc}\n-pthread\n{source}").as_bytes());
     let cached = dir.join(format!("pxr_rt-{hash:016x}.o"));
     if cached.is_file() {
         return Ok(cached);
@@ -747,6 +751,7 @@ fn compile_runtime(cc: &str, workspace: &WorkDir) -> Result<PathBuf, BuildError>
             .arg("-c")
             .arg("-O2")
             .arg("-std=c11")
+            .arg("-pthread")
             .arg("-o")
             .arg(&object)
             .arg(&c_path),
@@ -786,7 +791,8 @@ fn link(
         .arg(runtime_obj)
         .arg("-o")
         .arg(output)
-        .arg("-Wno-override-module");
+        .arg("-Wno-override-module")
+        .arg("-pthread");
     run_tool(&mut cmd, "linking")?;
     Ok(())
 }

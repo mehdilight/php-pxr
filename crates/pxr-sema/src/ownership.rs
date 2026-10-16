@@ -56,6 +56,27 @@ fn nominal(t: Option<&TypeRef>) -> Option<String> {
         _ => None,
     }
 }
+fn result_ownership_compatible(expected: &TypeRef, actual: &TypeRef) -> bool {
+    let expected = inner(expected);
+    let actual = inner(actual);
+    match (&expected, &actual) {
+        (TypeRef::Applied(a, xs, _), TypeRef::Applied(b, ys, _))
+            if a.rsplit('\\')
+                .next()
+                .unwrap_or(a)
+                .eq_ignore_ascii_case("TaskResult")
+                && b.rsplit('\\')
+                    .next()
+                    .unwrap_or(b)
+                    .eq_ignore_ascii_case("TaskResult")
+                && xs.len() == 1
+                && ys.len() == 1 =>
+        {
+            mode(Some(&xs[0])) == mode(Some(&ys[0])) && result_ownership_compatible(&xs[0], &ys[0])
+        }
+        _ => true,
+    }
+}
 fn copy_safe(t: Option<&TypeRef>) -> bool {
     matches!(
         t.map(inner),
@@ -166,6 +187,25 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
                     "httprequestbody",
                     "canceltask",
                     "stopserver",
+                    "tcpconnectasync",
+                    "tcplistenasync",
+                    "tcpacceptasync",
+                    "tcpreadasync",
+                    "tcpwriteasync",
+                    "closesocket",
+                    "tcpshutdownwrite",
+                    "taskresultasync",
+                    "resultvalueasync",
+                    "resultok",
+                    "resulterror",
+                    "resultstatus",
+                    "parallelasync",
+                    "channelasync",
+                    "channelpeerasync",
+                    "channelcloneasync",
+                    "channelsendasync",
+                    "channelreceiveasync",
+                    "closechannel",
                 ]
                 .contains(
                     &f.name
@@ -430,9 +470,21 @@ impl Checker {
         } else {
             match t {
                 TypeRef::Array(t) => self.validate_type(t, &[], span),
-                TypeRef::Applied(_, ts, _) => {
+                TypeRef::Applied(n, ts, _) => {
                     for t in ts {
-                        self.validate_type(t, &[], span);
+                        self.validate_type(
+                            t,
+                            if n.rsplit('\\')
+                                .next()
+                                .unwrap_or(n)
+                                .eq_ignore_ascii_case("TaskResult")
+                            {
+                                &[Mode::Owned]
+                            } else {
+                                &[]
+                            },
+                            span,
+                        );
                     }
                 }
                 _ => {}
@@ -757,6 +809,16 @@ impl Checker {
                                 Mode::Shared
                             })
                     });
+                    if let (Some(expected), Some(actual)) = (
+                        ty.as_ref()
+                            .map(inner)
+                            .or_else(|| old.as_ref().and_then(|b| b.ty.clone())),
+                        v.ty.as_ref(),
+                    ) {
+                        if !result_ownership_compatible(&expected, actual) {
+                            self.error(*span, "TaskResult payload ownership must be preserved");
+                        }
+                    }
                     if want == Mode::Owned {
                         if v.mode != Mode::Transfer && !(v.fresh && v.mode == Mode::Shared) {
                             self.error(*span, "owned initialization requires a fresh value or explicit move($owner)");
@@ -803,6 +865,11 @@ impl Checker {
                 if let Some(e) = value {
                     let v = self.expr(e);
                     self.return_types.push(v.ty.clone());
+                    if let (Some(expected), Some(actual)) = (self.ret.as_ref(), v.ty.as_ref()) {
+                        if !result_ownership_compatible(expected, actual) {
+                            self.error(*span, "TaskResult payload ownership must be preserved");
+                        }
+                    }
                     if want == Mode::Owned {
                         if v.mode != Mode::Transfer && !(v.fresh && v.mode == Mode::Shared) {
                             self.error(
@@ -1270,6 +1337,12 @@ impl Checker {
                 }
             }
             let want = mode(expected);
+            if let (Some(expected), Some(actual)) = (expected, v.ty.as_ref()) {
+                let expected = substitute(expected, &bindings);
+                if !result_ownership_compatible(&expected, actual) {
+                    self.error(arg.span(), "TaskResult payload ownership must be preserved");
+                }
+            }
             match want {
                 Mode::Owned => {
                     if v.mode != Mode::Transfer && !(v.mode == Mode::Shared && v.fresh) {
@@ -1404,6 +1477,42 @@ impl Checker {
                 type_shape(expected) == type_shape(&view)
             })
     }
+    fn send_type(&self, ty: &TypeRef, root: bool) -> bool {
+        if matches!(mode(Some(ty)), Mode::Read | Mode::Write) {
+            return false;
+        }
+        let owned = mode(Some(ty)) == Mode::Owned;
+        match inner(ty) {
+            TypeRef::Int
+            | TypeRef::Float
+            | TypeRef::Bool
+            | TypeRef::String
+            | TypeRef::Void
+            | TypeRef::Mixed => true,
+            TypeRef::Array(t) => self.send_type(&t, false),
+            TypeRef::Param(_, _) if !root => true,
+            TypeRef::Named(ref n) if root && owned && n == "Channel" => true,
+            t @ (TypeRef::Named(_) | TypeRef::Applied(_, _, _)) if root && owned => {
+                let views = self.class_views(&t);
+                !views.is_empty()
+                    && views.iter().all(|(class, bindings)| {
+                        class.name != "TcpStream"
+                            && class.name != "TcpListener"
+                            && class.members.iter().all(|m| {
+                                if let a::ClassMember::Property(p) = m {
+                                    p.is_static
+                                        || p.ty.as_ref().is_some_and(|t| {
+                                            self.send_type(&substitute(t, bindings), false)
+                                        })
+                                } else {
+                                    true
+                                }
+                            })
+                    })
+            }
+            _ => false,
+        }
+    }
     fn expr(&mut self, e: &Expr) -> Value {
         match e {
             Expr::IntLit(..) => Value {
@@ -1428,6 +1537,288 @@ impl Checker {
             },
             Expr::Var(n, sp) => self.read(n, *sp),
             Expr::Paren(e, _) => self.expr(e),
+            Expr::Call {
+                callee,
+                fallback,
+                args,
+                span,
+                ..
+            } if fallback
+                .as_deref()
+                .unwrap_or(callee)
+                .eq_ignore_ascii_case("parallelAsync") =>
+            {
+                let signature = args.first().and_then(|e| match unparen(e) {
+                    Expr::StrLit(n, _) => std::str::from_utf8(n)
+                        .ok()
+                        .and_then(|n| {
+                            self.signatures
+                                .get(&n.trim_start_matches('\\').to_ascii_lowercase())
+                        })
+                        .cloned(),
+                    _ => None,
+                });
+                let Some(signature) = signature
+                    .filter(|s| s.is_async && s.params.len() == 1 && s.type_params.is_empty())
+                else {
+                    self.error(*span, "parallelAsync requires a literal non-generic native async function with one Send parameter");
+                    return Value::plain(None);
+                };
+                self.arguments(&args[1..], Some(&signature), false, *span, false);
+                if !signature.params[0]
+                    .as_ref()
+                    .is_some_and(|t| self.send_type(t, true))
+                    || !signature
+                        .ret
+                        .as_ref()
+                        .is_some_and(|t| self.send_type(t, true))
+                {
+                    self.error(*span, "parallelAsync input and result must be Send: values, owned Channel, or moved owned objects containing value fields");
+                }
+                Value {
+                    mode: Mode::Transfer,
+                    ty: Some(task_type(
+                        signature.ret.unwrap_or(TypeRef::Void),
+                        *span,
+                        false,
+                    )),
+                    fresh: false,
+                    origins: BTreeSet::new(),
+                }
+            }
+            Expr::Call {
+                callee,
+                fallback,
+                args,
+                span,
+                ..
+            } if [
+                "channelasync",
+                "channelpeerasync",
+                "channelcloneasync",
+                "channelsendasync",
+                "channelreceiveasync",
+                "closechannel",
+            ]
+            .iter()
+            .any(|n| {
+                fallback
+                    .as_deref()
+                    .unwrap_or(callee)
+                    .eq_ignore_ascii_case(n)
+            }) =>
+            {
+                let name = fallback.as_deref().unwrap_or(callee).to_ascii_lowercase();
+                if name != "channelasync" {
+                    if let Some(argument) = args.first() {
+                        let value = if name == "closechannel" {
+                            if let Expr::Var(n, sp) = unparen(argument) {
+                                self.consume(n, *sp)
+                            } else {
+                                self.expr(argument)
+                            }
+                        } else {
+                            self.expr(argument)
+                        };
+                        if name == "closechannel" {
+                            if value.mode != Mode::Transfer {
+                                self.error(*span, "closeChannel consumes a channel owner");
+                            }
+                        } else if value.mode != Mode::Owned || !self.loans.is_empty() {
+                            self.error(*span, "channel operations require an owned channel local; borrows cannot enter tasks");
+                        }
+                    }
+                }
+                for argument in args.iter().skip(if name == "channelasync" { 0 } else { 1 }) {
+                    let value = self.expr(argument);
+                    self.escape(&value, argument.span());
+                    if name == "channelsendasync"
+                        && !value.ty.as_ref().is_some_and(|t| self.send_type(t, false))
+                    {
+                        self.error(
+                            argument.span(),
+                            "channel messages must contain only scalar, string and array values",
+                        );
+                    }
+                }
+                if name == "closechannel" {
+                    return Value::plain(Some(TypeRef::Void));
+                }
+                let ret = match name.as_str() {
+                    "channelasync" | "channelpeerasync" | "channelcloneasync" => {
+                        TypeRef::Applied(OWN.into(), vec![TypeRef::Named("Channel".into())], *span)
+                    }
+                    "channelsendasync" => TypeRef::Void,
+                    _ => TypeRef::Mixed,
+                };
+                Value {
+                    mode: Mode::Transfer,
+                    ty: Some(task_type(ret, *span, false)),
+                    fresh: false,
+                    origins: BTreeSet::new(),
+                }
+            }
+            Expr::Call {
+                callee,
+                fallback,
+                args,
+                span,
+                ..
+            } if [
+                "tcpconnectasync",
+                "tcplistenasync",
+                "tcpacceptasync",
+                "tcpreadasync",
+                "tcpwriteasync",
+                "closesocket",
+                "tcpshutdownwrite",
+            ]
+            .iter()
+            .any(|n| {
+                fallback
+                    .as_deref()
+                    .unwrap_or(callee)
+                    .eq_ignore_ascii_case(n)
+            }) =>
+            {
+                let name = fallback.as_deref().unwrap_or(callee).to_ascii_lowercase();
+                if ["tcpconnectasync", "tcplistenasync"].contains(&name.as_str()) {
+                    self.arguments(args, None, false, *span, false);
+                } else if let Some(argument) = args.first() {
+                    let value = if name == "closesocket" {
+                        if let Expr::Var(n, sp) = unparen(argument) {
+                            self.consume(n, *sp)
+                        } else {
+                            self.expr(argument)
+                        }
+                    } else {
+                        self.expr(argument)
+                    };
+                    if name == "closesocket" {
+                        if value.mode != Mode::Transfer {
+                            self.error(*span, "closeSocket consumes a socket owner");
+                        }
+                    } else if value.mode != Mode::Owned || !self.loans.is_empty() {
+                        self.error(*span,"async socket operations require an owned socket local; borrowed handles cannot enter tasks");
+                    }
+                    for argument in args.iter().skip(1) {
+                        let value = self.expr(argument);
+                        self.escape(&value, argument.span());
+                    }
+                }
+                if ["closesocket", "tcpshutdownwrite"].contains(&name.as_str()) {
+                    return Value::plain(Some(TypeRef::Void));
+                }
+                let ret = match name.as_str() {
+                    "tcpconnectasync" | "tcpacceptasync" => TypeRef::Applied(
+                        OWN.into(),
+                        vec![TypeRef::Named("TcpStream".into())],
+                        *span,
+                    ),
+                    "tcplistenasync" => TypeRef::Applied(
+                        OWN.into(),
+                        vec![TypeRef::Named("TcpListener".into())],
+                        *span,
+                    ),
+                    "tcpwriteasync" => TypeRef::Int,
+                    _ => TypeRef::String,
+                };
+                Value {
+                    mode: Mode::Transfer,
+                    ty: Some(task_type(ret, *span, false)),
+                    fresh: false,
+                    origins: BTreeSet::new(),
+                }
+            }
+            Expr::Call {
+                callee,
+                fallback,
+                args,
+                span,
+                ..
+            } if [
+                "taskresultasync",
+                "resultvalueasync",
+                "resultok",
+                "resulterror",
+                "resultstatus",
+            ]
+            .iter()
+            .any(|n| {
+                fallback
+                    .as_deref()
+                    .unwrap_or(callee)
+                    .eq_ignore_ascii_case(n)
+            }) =>
+            {
+                let name = fallback.as_deref().unwrap_or(callee).to_ascii_lowercase();
+                let Some(argument) = args.first() else {
+                    return Value::plain(None);
+                };
+                let consume = name == "taskresultasync" || name == "resultvalueasync";
+                let value = if consume {
+                    if let Expr::Var(n, sp) = unparen(argument) {
+                        self.consume(n, *sp)
+                    } else {
+                        self.expr(argument)
+                    }
+                } else {
+                    self.expr(argument)
+                };
+                if consume && value.mode != Mode::Transfer {
+                    self.error(
+                        *span,
+                        "result operations consume a fresh expression or moved owner",
+                    );
+                }
+                if name == "taskresultasync" {
+                    let Some(result) = task_result(value.ty.as_ref()).cloned() else {
+                        self.error(*span, "taskResultAsync requires a task handle");
+                        return Value::plain(None);
+                    };
+                    let result = TypeRef::Applied("TaskResult".into(), vec![result], *span);
+                    return Value {
+                        mode: Mode::Transfer,
+                        ty: Some(task_type(
+                            TypeRef::Applied(OWN.into(), vec![result], *span),
+                            *span,
+                            false,
+                        )),
+                        fresh: false,
+                        origins: BTreeSet::new(),
+                    };
+                }
+                let payload = match value.ty.as_ref() {
+                    Some(TypeRef::Applied(n, ts, _))
+                        if n.rsplit('\\')
+                            .next()
+                            .unwrap_or(n)
+                            .eq_ignore_ascii_case("TaskResult")
+                            && ts.len() == 1 =>
+                    {
+                        Some(ts[0].clone())
+                    }
+                    _ => None,
+                };
+                let Some(payload) = payload else {
+                    self.error(*span, "result operations require a TaskResult");
+                    return Value::plain(None);
+                };
+                if name == "resultvalueasync" {
+                    Value {
+                        mode: Mode::Transfer,
+                        ty: Some(task_type(payload, *span, false)),
+                        fresh: false,
+                        origins: BTreeSet::new(),
+                    }
+                } else {
+                    Value::plain(Some(if name == "resultok" {
+                        TypeRef::Bool
+                    } else {
+                        TypeRef::Int
+                    }))
+                }
+            }
             Expr::Call {
                 callee,
                 fallback,
@@ -2111,8 +2502,10 @@ fn erase_stmt(s: &mut Stmt) {
     match s {
         Stmt::Expr(Expr::Call { callee, .. }, _) if callee == "$pxr_drop" => {
             if let Stmt::Expr(Expr::Call { callee, args, .. }, _) = s {
-                *callee = "$pxr_collect".into();
-                args.clear();
+                *callee = "$pxr_value_drop".into();
+                for argument in args {
+                    erase_expr(argument);
+                }
             }
             return;
         }

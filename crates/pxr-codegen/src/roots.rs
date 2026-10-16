@@ -18,7 +18,7 @@ pub(crate) enum Root {
 pub(crate) fn pointer(ty: &Ty) -> bool {
     matches!(
         ty,
-        Ty::String | Ty::Array(_) | Ty::Named(_) | Ty::Task(_) | Ty::Mixed
+        Ty::String | Ty::Array(_) | Ty::Named(_) | Ty::Task(_) | Ty::TaskResult(_) | Ty::Mixed
     )
 }
 

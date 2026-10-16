@@ -361,7 +361,8 @@ functions, affine task locals, timers and an async entry now compile to generate
 resumable frames. Owned TCP exchanges, bounded native TCP servers with concurrent
 async handlers, and consuming cancellation are available. See
 [`ASYNC_SERVER.md`](ASYNC_SERVER.md) for the EOF-delimited server contract.
-Streaming socket/resource and recoverable error APIs remain pending. See [`ASYNC_RUNTIME.md`](ASYNC_RUNTIME.md) for lifecycle, result, error,
+Owned streaming resources and TaskResult recovery are implemented, along with
+shared-nothing OS-thread workers and channels ([PARALLEL.md](PARALLEL.md)). See [`ASYNC_RUNTIME.md`](ASYNC_RUNTIME.md) for lifecycle, result, error,
 cancellation and descriptor ownership rules. Existing synchronous programs do
 not start an executor.
 

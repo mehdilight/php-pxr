@@ -87,3 +87,19 @@ REQUEST merging in the existing ignored PHP 8.5.11 source archive,
 version verified in `main/php_version.h`; PHP License 3.01 read). No PHP source
 was copied. [HTTP.md](HTTP.md) records fixed GP precedence, input limits,
 malformed-name handling and other deliberate compatibility boundaries.
+
+## Threaded workers and channels
+
+Read on 2026-10-16: the previously pinned libuv `src/threadpool.c`, especially
+worker completion publication, loop notification, cancellation and lock ordering.
+The original PXR implementation uses separate per-worker heaps/executors and
+bounded serialized duplex queues, rather than copying libuv's pool. No upstream
+source was copied and no new dependency was added.
+
+Checked primary POSIX references for [thread creation](https://pubs.opengroup.org/onlinepubs/000095399/functions/pthread_create.html),
+[mutex ownership](https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_mutex_lock.html),
+and [memory synchronization](https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/V1_chap04.html).
+These informed joinable worker lifetimes, mutex-protected queue/reference state,
+and atomic publication after cleanup. Cancellation uses an owned pipe and
+cooperative task joins; no pthread cancellation of arbitrary generated code.
+[PARALLEL.md](PARALLEL.md) specifies PXR's transfer and cancellation contract.

@@ -4,7 +4,8 @@ PXR can listen on a numeric IPv4/IPv6 address, accept connections and run native
 async handlers concurrently. This first server API implements bounded,
 EOF-delimited TCP requests. The separate [HTTP adapter](HTTP.md) adds HTTP
 framing, PHP-style request globals and buffered responses. Request/response
-objects, router classes and streaming handles remain pending.
+objects and router classes remain further extensions. Owned streaming handles
+are available separately in [ASYNC_IO.md](ASYNC_IO.md).
 
 ```php
 <?php
@@ -110,8 +111,9 @@ The first observed task error fails the server, cancels remaining work, and
 propagates to its caller. A malformed configuration reports `EINVAL`; timeout
 reports `ETIMEDOUT`; other socket errors keep their errno. The CLI drains the
 tree, prints `pxr: async task failed: ...`, and exits 255. This first slice has
-no per-connection error recovery. General recoverable errors remain future work;
-cancellation stops active handlers. For graceful shutdown, use `stopServer` below.
+no implicit per-connection error recovery. A handler can use TaskResult to
+recover an operation error; callers can wrap the server task itself.
+Cancellation stops active handlers. For graceful shutdown, use `stopServer` below.
 Cancellation cannot retract bytes already transmitted or undo handler effects.
 
 ## Graceful shutdown
@@ -156,7 +158,8 @@ No OS signal handler, cross-scope server registry or detached task is introduced
 
 ## Next server layers
 
-Streaming resource ownership and recoverable errors remain M7 work. The separate
+Owned streaming resources and TaskResult recovery are documented in
+[ASYNC_IO.md](ASYNC_IO.md). The separate
 [HTTP layer](HTTP.md) now implements framed requests, request-local query/form/
 cookie/server data and PHP-style buffered output/header/status helpers. It uses
 `httpServeAsync`, rather than changing this TCP operation's EOF protocol.

@@ -51,7 +51,9 @@ fn build(name: &str, source: &str, opt: u8) -> PathBuf {
         "{name}: {}",
         String::from_utf8_lossy(&built.stderr)
     );
-    if std::env::var_os("PXR_RUNTIME_SANITIZERS").is_some() {
+    if std::env::var_os("PXR_RUNTIME_SANITIZERS").is_some()
+        || std::env::var_os("PXR_RUNTIME_THREAD_SANITIZER").is_some()
+    {
         let runtime = dir.join("runtime.c");
         let worker = include_str!("../../../runtime/pxr_php_worker.php")
             .trim_start_matches("<?php")
@@ -70,14 +72,18 @@ fn build(name: &str, source: &str, opt: u8) -> PathBuf {
         .unwrap();
         let linked = Command::new(std::env::var("CC").unwrap_or_else(|_| "clang".into()))
             .args([
-                "-fsanitize=address,undefined",
+                if std::env::var_os("PXR_RUNTIME_THREAD_SANITIZER").is_some() {
+                    "-fsanitize=thread"
+                } else {
+                    "-fsanitize=address,undefined"
+                },
                 "-fno-omit-frame-pointer",
                 "-g",
             ])
             .arg(format!("-O{opt}"))
             .arg(output.with_extension("ll"))
             .arg(runtime)
-            .args(["-lm", "-o"])
+            .args(["-pthread", "-lm", "-o"])
             .arg(&output)
             .output()
             .unwrap();
@@ -2144,4 +2150,298 @@ fn stop_server_rejects_invalid_source_and_runtime_targets() {
             std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
         }
     }
+}
+
+#[test]
+fn recoverable_results() {
+    run_case(
+        "recoverable_results",
+        r#"<?php
+class X { public int $value; public function __construct(int $v) { $this->value=$v; } }
+async function fail(): int { await sleepAsync(-1); return 1; }
+async function make(): owned<X> { await sleepAsync(0); return new X(42); }
+async function main(): void {
+    $failed = spawn taskResultAsync(fail());
+    $made = spawn taskResultAsync(make());
+    await sleepAsync(0);
+    $a = await $failed; echo resultOk($a), resultStatus($a), ":", resultError($a) > 0, ":";
+    drop($a);
+    $b = await $made; echo resultOk($b), ":";
+    $obj = await resultValueAsync($b); echo $obj->value, "\n";
+}
+"#,
+        "2:1:1:42\n",
+    );
+}
+
+#[test]
+fn streaming_sockets() {
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    drop(socket);
+    let source = r#"<?php
+async function server(owned<TcpListener> $listener): void {
+    $stream = await tcpAcceptAsync($listener);
+    closeSocket($listener);
+    $request = await tcpReadAsync($stream, 1024);
+    await tcpWriteAsync($stream, "reply:" . $request);
+    tcpShutdownWrite($stream); closeSocket($stream);
+}
+async function connect(): owned<TcpStream> { return await tcpConnectAsync("127.0.0.1", {port}); }
+async function main(): void {
+    $listener = await tcpListenAsync("127.0.0.1", {port});
+    $server = spawn server(move($listener));
+    $result = await taskResultAsync(connect());
+    if (resultOk($result)) {
+        $stream = await resultValueAsync($result);
+        await tcpWriteAsync($stream, "hello");
+        echo await tcpReadAsync($stream, 1024), "\n";
+        closeSocket($stream);
+    } else { echo "error:", resultError($result); }
+    await $server;
+}
+"#
+    .replace("{port}", &port.to_string());
+    run_case("streaming_sockets", &source, "reply:hello\n");
+}
+
+#[test]
+fn recoverable_io_failures_preserve_siblings_and_owned_payloads() {
+    run_case(
+        "io-errors",
+        r#"<?php
+async function fail(): int { await sleepAsync(-1); return 0; }
+async function good(): int { await sleepAsync(0); return 42; }
+async function main(): void {
+    $bad = spawn taskResultAsync(fail());
+    $good = spawn good();
+    $a = await $bad;
+    echo resultStatus($a), ":", resultError($a) > 0, ":", await $good, ":";
+    drop($a);
+    $invalid = await taskResultAsync(tcpConnectAsync("not-an-address", 80));
+    echo resultOk($invalid), resultStatus($invalid), ":", resultError($invalid) > 0, "\n";
+    drop($invalid);
+}
+"#,
+        "2:1:42:2:1\n",
+    );
+}
+
+#[test]
+fn isolated_workers_and_duplex_channels_make_concurrent_progress() {
+    run_case(
+        "parallel-channels",
+        include_str!("../../../examples/async/parallel.php"),
+        "42:7:12:13:10\n",
+    );
+}
+
+#[test]
+fn workers_transfer_owned_objects_arrays_and_mixed_without_aliasing() {
+    run_case(
+        "worker-values",
+        include_str!("../../../examples/async/parallel_values.php"),
+        "42:2:2:42:42\n",
+    );
+}
+
+#[test]
+fn channels_apply_backpressure_and_report_peer_close_timeout_and_busy() {
+    run_case(
+        "channel-pressure",
+        r#"<?php
+async function main(): void {
+    $a = await channelAsync(1); $b = await channelPeerAsync($a);
+    await channelSendAsync($a, "first");
+    $second = spawn channelSendAsync($a, "second");
+    await sleepAsync(0);
+    echo await channelReceiveAsync($b), ":";
+    await $second; echo await channelReceiveAsync($b), ":";
+    $waiting = spawn taskResultAsync(channelReceiveAsync($b));
+    await sleepAsync(0);
+    $busy = await taskResultAsync(channelReceiveAsync($b));
+    echo resultStatus($busy), ":"; drop($busy);
+    $timeout = await taskResultAsync(channelReceiveAsync($a, 0));
+    echo resultStatus($timeout), ":"; drop($timeout);
+    closeChannel($a);
+    $closed = await $waiting;
+    echo resultStatus($closed), ":", resultError($closed) > 0, "\n"; drop($closed);
+    closeChannel($b);
+}
+"#,
+        "first:second:2:2:2:1\n",
+    );
+}
+
+#[test]
+fn worker_failure_cancellation_lazy_drop_and_channel_transfer_cleanup() {
+    run_case(
+        "worker-lifetime",
+        r#"<?php
+async function failed(int $n): int { await sleepAsync(-1); return $n; }
+async function slow(owned<Channel> $c): void { await channelReceiveAsync($c); }
+async function roundTrip(owned<Channel> $c): owned<Channel> { await sleepAsync(0); return move($c); }
+async function main(): void {
+    $lazy = parallelAsync("failed", 1); drop($lazy);
+    $failed = await taskResultAsync(parallelAsync("failed", 0));
+    echo resultStatus($failed), ":"; drop($failed);
+    $i = 0;
+    while ($i < 20) {
+        $a = await channelAsync(1); $b = await channelPeerAsync($a);
+        $work = spawn parallelAsync("slow", move($b));
+        await sleepAsync(1); cancelTask($work);
+        $closed = await taskResultAsync(channelReceiveAsync($a, 1000));
+        echo resultOk($closed); drop($closed); closeChannel($a); $i++;
+    }
+    $a = await channelAsync(); $b = await channelPeerAsync($a);
+    $b = await parallelAsync("roundTrip", move($b));
+    await channelSendAsync($b, 42); echo await channelReceiveAsync($a), "\n";
+    drop($a); drop($b);
+}
+"#,
+        "2:42\n",
+    );
+}
+
+#[test]
+fn invalid_thread_resource_and_result_contracts_are_diagnosed() {
+    let cases = [
+        "class TaskResult {}",
+        "namespace Bad { class TaskResult<T> {} }",
+        "class Channel {}",
+        "class X extends TcpStream {}",
+        "async function main(): void { $r = await taskResultAsync(sleepAsync(0)); $s = $r; }",
+        "async function main(): void { $c = await channelAsync(); $d = $c; }",
+        "async function main(): void { $c = await channelAsync(); closeChannel($c); await channelReceiveAsync($c); }",
+        "async function main(): void { $c = await channelAsync(); await channelSendAsync($c, new X()); } class X {}",
+        "async function f(int $n): int {return $n;} async function main(): void { $name = \"f\"; await parallelAsync($name, 1); }",
+        "async function f(int $n): int {return $n;} function main(): void { parallelAsync(\"f\", 1); }",
+        "async function f(): int {return 0;} async function main(): void { await parallelAsync(\"f\", 1); }",
+        "function f(int $n): int {return $n;} async function main(): void { await parallelAsync(\"f\", 1); }",
+        "class X {} async function f(X $x): int {return 1;} async function main(): void { await parallelAsync(\"f\", new X()); }",
+        "class X {} async function f(int $x): X {return new X();} async function main(): void { await parallelAsync(\"f\", 1); }",
+        "async function f(&int $x): int {return $x;} async function main(): void {$x: owned<int> = 1; await parallelAsync(\"f\", &$x);}",
+        "async function f(owned<TcpStream> $s): int {return 0;} async function main(): void {$s = await tcpConnectAsync(\"127.0.0.1\", 80); await parallelAsync(\"f\", move($s));}",
+        "class Y {} class X {public Y $child;} async function f(owned<X> $x): int {return 0;} async function main(): void {$x: owned<X> = new X(); await parallelAsync(\"f\", move($x));}",
+        "class X {} async function make(): owned<X> {return new X();} async function main(): void {$r: owned<TaskResult<X>> = await taskResultAsync(make());}",
+        "async function main(): void { closeSocket(); }",
+        "async function main(): void { await channelAsync(\"wrong\"); }",
+    ];
+    let dir = std::env::temp_dir().join(format!("pxr-m7-thread-errors-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (i, case) in cases.iter().enumerate() {
+        let input = dir.join(format!("{i}.php"));
+        std::fs::write(&input, format!("<?php\n{case}")).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_pxr"))
+            .arg("check")
+            .arg(&input)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "case {i} unexpectedly accepted: {case}"
+        );
+        assert!(
+            stderr.contains("error") && !stderr.contains("panicked"),
+            "{i}: {stderr}"
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn workers_preserve_scalar_bits_namespaces_and_nested_task_trees() {
+    run_case(
+        "worker-scalars",
+        r#"<?php
+namespace Jobs {
+async function number(float $n): float { return $n + 0.5; }
+async function negate(bool $b): bool { return !$b; }
+async function identity(mixed $m): mixed { return $m; }
+async function nested(int $n): int { return await parallelAsync("Jobs\\numberInt", $n); }
+async function numberInt(int $n): int { return $n + 1; }
+async function numberInt__parallel(int $n): int { return $n; }
+}
+namespace {
+async function main(): void {
+    echo await parallelAsync("Jobs\\number", 41.5), ":", await parallelAsync("Jobs\\negate", false), ":";
+    echo is_null(await parallelAsync("Jobs\\identity", null)), ":", await parallelAsync("Jobs\\nested", 41), "\n";
+}
+}
+"#,
+        "42:1:1:42\n",
+    );
+}
+
+#[test]
+fn recoverable_outcomes_preserve_void_and_rethrow_errors_structurally() {
+    run_case(
+        "result-rethrow",
+        r#"<?php
+async function main(): void {
+    $ok = await taskResultAsync(sleepAsync(0));
+    echo resultOk($ok), ":", resultError($ok), ":";
+    await resultValueAsync($ok);
+    $bad = await taskResultAsync(sleepAsync(-1));
+    $again = await taskResultAsync(resultValueAsync($bad));
+    echo resultStatus($again), ":", resultError($again) > 0, "\n";
+    drop($again);
+}
+"#,
+        "1:0:2:1\n",
+    );
+}
+
+#[test]
+fn channel_clones_preserve_queued_values_and_dynamic_messages_are_validated() {
+    run_case(
+        "channel-clones",
+        r#"<?php
+class X {}
+async function main(): void {
+    $a = await channelAsync(1); $b = await channelPeerAsync($a);
+    $clone = await channelCloneAsync($b); drop($b);
+    await channelSendAsync($clone, "last"); closeChannel($clone);
+    echo await channelReceiveAsync($a), ":";
+    $eof = await taskResultAsync(channelReceiveAsync($a));
+    echo resultStatus($eof), ":"; drop($eof); drop($a);
+    $a = await channelAsync(); $b = await channelPeerAsync($a);
+    $hidden: mixed = new X();
+    $invalid = await taskResultAsync(channelSendAsync($a, $hidden));
+    echo resultStatus($invalid), ":"; drop($invalid);
+    await channelSendAsync($a, ["binary" => "a\0b", "nested" => [42]]);
+    $value = await channelReceiveAsync($b);
+    if (is_array($value)) {
+        echo strlen(strval($value["binary"])), ":";
+        $nested = $value["nested"]; if (is_array($nested)) {echo $nested[0];}
+    }
+    echo "\n"; drop($a); drop($b);
+}
+"#,
+        "last:2:2:3:42\n",
+    );
+}
+
+#[test]
+fn generic_helpers_preserve_channel_and_result_ownership() {
+    run_case(
+        "generic-resources",
+        r#"<?php
+async function send<T>(owned<Channel> $c, T $value): owned<Channel> {
+    await channelSendAsync($c, $value); return move($c);
+}
+async function unwrap<T>(owned<TaskResult<T>> $result): T { return await resultValueAsync($result); }
+async function answer(): int {return 42;}
+async function main(): void {
+    $a = await channelAsync(); $b = await channelPeerAsync($a);
+    $a = await send(move($a), [42]);
+    $value = await channelReceiveAsync($b);
+    if (is_array($value)) {echo $value[0], ":";}
+    echo await unwrap(await taskResultAsync(answer())), "\n";
+    drop($a); drop($b);
+}
+"#,
+        "42:42\n",
+    );
 }

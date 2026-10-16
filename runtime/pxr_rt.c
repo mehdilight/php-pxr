@@ -43,13 +43,14 @@ union pxr_allocation {
     max_align_t alignment;
 };
 
-static pxr_allocation *pxr_heap_head = NULL;
-static size_t pxr_heap_blocks = 0;
-static size_t pxr_heap_bytes = 0;
-static int pxr_heap_initialized = 0;
-static pxr_allocation *pxr_heap_index[4096];
+static _Thread_local int pxr_worker_thread;
+static _Thread_local pxr_allocation *pxr_heap_head = NULL;
+static _Thread_local size_t pxr_heap_blocks = 0;
+static _Thread_local size_t pxr_heap_bytes = 0;
+static _Thread_local int pxr_heap_initialized = 0;
+static _Thread_local pxr_allocation *pxr_heap_index[4096];
 enum { PXR_HEAP_RAW, PXR_HEAP_ARRAY, PXR_HEAP_OBJECT, PXR_HEAP_MIXED };
-static uint64_t pxr_heap_serial = 0;
+static _Thread_local uint64_t pxr_heap_serial = 0;
 /* A C runtime operation may hold private temporaries when it calls native
  * __toString. Protect its allocation snapshot, while allowing the callback's
  * subsequent allocations to be collected through ordinary compiler roots. */
@@ -59,9 +60,9 @@ typedef struct pxr_gc_guard {
     const void *result;
 } pxr_gc_guard;
 void pxr_gc_collect(void);
-static pxr_gc_guard *pxr_gc_guards = NULL;
-static int pxr_gc_external_pressure = 0;
-static size_t pxr_gc_collections = 0, pxr_heap_peak = 0;
+static _Thread_local pxr_gc_guard *pxr_gc_guards = NULL;
+static _Thread_local int pxr_gc_external_pressure = 0;
+static _Thread_local size_t pxr_gc_collections = 0, pxr_heap_peak = 0;
 static size_t pxr_heap_bucket(const void *ptr) {
     return ((uintptr_t)ptr >> 4) % 4096;
 }
@@ -106,7 +107,7 @@ static void *pxr_heap_alloc(size_t n) {
     size_t total = pxr_size_add(sizeof(pxr_allocation), n ? n : 1);
     size_t bytes = pxr_size_add(pxr_heap_bytes, n);
     if (!pxr_heap_initialized) {
-        if (atexit(pxr_heap_shutdown) != 0) pxr_oom();
+        if (!pxr_worker_thread && atexit(pxr_heap_shutdown) != 0) pxr_oom();
         pxr_heap_initialized = 1;
     }
     pxr_allocation *block = malloc(total);
@@ -633,7 +634,7 @@ typedef struct {
     int shared;      /* an observed copy needs a fresh lineage on mutation */
 } pxr_array;
 
-static int64_t pxr_array_identity = -1;
+static _Thread_local int64_t pxr_array_identity = -1;
 static int64_t pxr_array_fresh_identity(void) {
     if (pxr_array_identity == INT64_MIN) pxr_oom();
     return pxr_array_identity--;
@@ -2159,7 +2160,7 @@ typedef struct pxr_supertype {
     int64_t super_id;
     struct pxr_supertype *next;
 } pxr_supertype;
-static pxr_supertype *pxr_supertypes[256];
+static _Thread_local pxr_supertype *pxr_supertypes[256];
 
 void pxr_class_register(long long class_id, long long super_id) {
     size_t bucket = (uint64_t)class_id % 256;
@@ -2196,7 +2197,7 @@ typedef struct pxr_static_class {
     void *storage;
     struct pxr_static_class *next;
 } pxr_static_class;
-static pxr_static_class *pxr_static_classes[256];
+static _Thread_local pxr_static_class *pxr_static_classes[256];
 
 void *pxr_static_storage(long long class_id, long long num_props) {
     size_t bucket = (uint64_t)class_id % 256;
@@ -2669,8 +2670,8 @@ void *pxr_mixed_binary(long long op, const void *lp, const void *rp) {
  * Only programs that execute a dynamic include/call require PHP on PATH.
  */
 extern const char pxr_php_worker_source[];
-static FILE *pxr_php_input = NULL, *pxr_php_output = NULL;
-static pid_t pxr_php_pid = -1;
+static _Thread_local FILE *pxr_php_input = NULL, *pxr_php_output = NULL;
+static _Thread_local pid_t pxr_php_pid = -1;
 
 static void pxr_php_fail(const char *message) {
     fprintf(stderr, "Fatal error: PHP interop: %s\n", message);
@@ -2688,6 +2689,7 @@ static void pxr_php_cleanup(void) {
 }
 
 static void pxr_php_start(void) {
+    if (pxr_worker_thread) pxr_php_fail("PHP interop cannot run in parallel workers");
     if (pxr_php_input) return;
     int requests[2], responses[2];
     if (pipe(requests) < 0) pxr_php_fail("could not open request pipe");
@@ -2789,7 +2791,7 @@ typedef struct pxr_php_handle {
     pxr_object *object;
     struct pxr_php_handle *next;
 } pxr_php_handle;
-static pxr_php_handle *pxr_php_handles = NULL;
+static _Thread_local pxr_php_handle *pxr_php_handles = NULL;
 
 static void *pxr_php_receive_value(unsigned depth) {
     if (depth > 128) pxr_php_fail("interop nesting exceeds 128 levels");
@@ -2891,8 +2893,8 @@ typedef struct pxr_gc_frame {
     void **roots;
     size_t count;
 } pxr_gc_frame;
-static pxr_gc_frame *pxr_gc_frames = NULL;
-static size_t pxr_gc_limit = 1024 * 1024;
+static _Thread_local pxr_gc_frame *pxr_gc_frames = NULL;
+static _Thread_local size_t pxr_gc_limit = 1024 * 1024;
 void pxr_gc_enter(void *storage, void **roots) {
     pxr_gc_frame *frame = storage;
     frame->previous = pxr_gc_frames;
@@ -2909,7 +2911,7 @@ void pxr_gc_leave(void *storage) {
     pxr_gc_frames = frame->previous;
 }
 
-static pxr_allocation *pxr_gc_gray = NULL;
+static _Thread_local pxr_allocation *pxr_gc_gray = NULL;
 static void pxr_gc_mark(const void *ptr) {
     pxr_allocation *block = pxr_heap_lookup(ptr);
     if (!block || block->h.marked) return;
@@ -3016,7 +3018,7 @@ void pxr_gc_collect(void) {
         ? SIZE_MAX : pxr_heap_bytes * 2 + baseline;
 }
 void pxr_gc_safepoint(void) {
-    static int stress = -1;
+    static _Thread_local int stress = -1;
     if (stress < 0) stress = getenv("PXR_GC_STRESS") != NULL;
     if (stress || pxr_gc_external_pressure || pxr_heap_bytes >= pxr_gc_limit) pxr_gc_collect();
 }

@@ -18,6 +18,28 @@ pub fn lower_program(prog: &TProgram) -> Module {
     let mut m = Module::new();
     for f in &prog.funcs {
         m.function(lower_func(f));
+        if prog.parallel_handlers.contains(&f.name) {
+            let ty = &f.params[0].1;
+            let mut bridge = Lowerer::new(Function::new(
+                format!("pxr$parallel${}", f.name),
+                "parallel bridge",
+                vec![Ty::Int, Ty::Int],
+                Ty::Task(Box::new(f.ret.clone())),
+            ));
+            let input = bridge.decode_bits(1, ty);
+            let task = bridge.rt_call(&f.name, vec![input], Ty::Task(Box::new(f.ret.clone())));
+            bridge.terminator(Inst::Ret {
+                ty: Ty::Task(Box::new(f.ret.clone())),
+                src: Some(task),
+            });
+            m.function(bridge.into_function());
+        }
+    }
+    if !prog.parallel_handlers.is_empty() {
+        let mut bootstrap = prog.main.clone();
+        bootstrap.name = "pxr_parallel_bootstrap".into();
+        bootstrap.body = prog.worker_bootstrap.clone();
+        m.function(lower_main(&bootstrap, &prog.class_registrations));
     }
     m.function(lower_stringifier(&prog.stringifiers));
     m.function(lower_main(&prog.main, &prog.class_registrations));
@@ -1341,7 +1363,7 @@ impl Lowerer {
             Ty::Bool => 3,
             Ty::String => 4,
             Ty::Array(_) => 5,
-            Ty::Named(_) => 6,
+            Ty::Named(_) | Ty::TaskResult(_) => 6,
             Ty::Mixed => 7,
             _ => 0,
         }
@@ -2072,6 +2094,27 @@ impl Lowerer {
 
     fn lower_call(&mut self, callee: &Callee, ret: &Ty, args: &[TExpr], arg_tys: &[Ty]) -> Value {
         match callee {
+            Callee::Parallel { handler } => {
+                let value = self.lower_expr(&args[0]);
+                let value = self.cast(value, &args[0].ty(), &arg_tys[0]);
+                let bits = self.encode_bits(value, &arg_tys[0]);
+                let tag = self.emit_const(Literal::Int(Self::tag_of(&arg_tys[0])));
+                let callback = self.fresh();
+                self.emit(Inst::FunctionAddr {
+                    dst: callback,
+                    name: format!("pxr$parallel${handler}"),
+                });
+                let bootstrap = self.fresh();
+                self.emit(Inst::FunctionAddr {
+                    dst: bootstrap,
+                    name: "pxr_parallel_bootstrap".into(),
+                });
+                self.rt_call(
+                    "pxr_async_parallel",
+                    vec![callback, tag, bits, bootstrap],
+                    ret.clone(),
+                )
+            }
             Callee::AsyncServer { handler, http } => {
                 let mut values: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let callback = self.fresh();
@@ -2108,6 +2151,13 @@ impl Lowerer {
             Callee::User {
                 mangled, params, ..
             } => {
+                if mangled == "$pxr_value_drop" {
+                    let value = self.lower_expr(&args[0]);
+                    let tag = self.emit_const(Literal::Int(Self::tag_of(&arg_tys[0])));
+                    let bits = self.encode_bits(value, &arg_tys[0]);
+                    self.rt_call("pxr_value_drop", vec![tag, bits], Ty::Void);
+                    return self.rt_call("pxr_gc_collect", vec![], Ty::Void);
+                }
                 let mut vals = Vec::new();
                 for (i, a) in args.iter().enumerate() {
                     let v = self.lower_expr(a);

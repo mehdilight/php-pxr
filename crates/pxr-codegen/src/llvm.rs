@@ -28,6 +28,27 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     ("pxr_async_publish", "void", &["ptr", "ptr"]),
     ("pxr_async_await", "void", &["ptr", "ptr"]),
     ("pxr_async_take", "i64", &["ptr"]),
+    (
+        "pxr_async_stream_connect",
+        "ptr",
+        &["ptr", "i64", "i64", "i64"],
+    ),
+    (
+        "pxr_async_stream_listen",
+        "ptr",
+        &["ptr", "i64", "i64", "i64"],
+    ),
+    ("pxr_async_stream_accept", "ptr", &["ptr", "i64", "i64"]),
+    ("pxr_async_stream_read", "ptr", &["ptr", "i64", "i64"]),
+    ("pxr_async_stream_write", "ptr", &["ptr", "ptr", "i64"]),
+    ("pxr_socket_close", "void", &["ptr"]),
+    ("pxr_value_drop", "void", &["i64", "i64"]),
+    ("pxr_socket_shutdown_write", "void", &["ptr"]),
+    ("pxr_async_result_task", "ptr", &["ptr"]),
+    ("pxr_async_result_value_task", "ptr", &["ptr"]),
+    ("pxr_async_result_ok", "i1", &["ptr"]),
+    ("pxr_async_result_error", "i64", &["ptr"]),
+    ("pxr_async_result_status", "i64", &["ptr"]),
     ("pxr_async_finish", "void", &["ptr", "i64", "i64"]),
     ("pxr_async_spawn", "ptr", &["ptr"]),
     ("pxr_async_sleep_task", "ptr", &["i64"]),
@@ -172,6 +193,13 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     ("pxr_static_storage", "ptr", &["i64", "i64"]),
     ("pxr_object_get_bits", "i64", &["ptr", "i64"]),
     ("pxr_object_set_bits", "void", &["ptr", "i64", "i64", "i64"]),
+    ("pxr_async_adopt_resource", "void", &["ptr", "ptr"]),
+    ("pxr_async_parallel", "ptr", &["ptr", "i64", "i64", "ptr"]),
+    (
+        "pxr_async_channel",
+        "ptr",
+        &["i64", "ptr", "ptr", "i64", "i64"],
+    ),
     ("pxr_class_register", "void", &["i64", "i64"]),
     ("pxr_object_get_class_id", "i64", &["ptr"]),
     ("pxr_instanceof", "i64", &["ptr", "i64"]),
@@ -189,7 +217,7 @@ pub fn llty(ty: &Ty) -> &'static str {
         // literal itself is otherwise rejected at compile time.
         Ty::Null => "ptr",
         Ty::Array(_) => "ptr",
-        Ty::Named(_) | Ty::Task(_) => "ptr",
+        Ty::Named(_) | Ty::Task(_) | Ty::TaskResult(_) => "ptr",
     }
 }
 
@@ -519,6 +547,7 @@ impl<'a> FnGen<'a> {
                     | (Ty::Array(_), Ty::Int)
                     | (Ty::Named(_), Ty::Int)
                     | (Ty::Task(_), Ty::Int)
+                    | (Ty::TaskResult(_), Ty::Int)
                     | (Ty::Null, Ty::Int) => {
                         format!("%v{dst} = ptrtoint ptr %v{src} to i64")
                     }
@@ -527,6 +556,7 @@ impl<'a> FnGen<'a> {
                     | (Ty::Int, Ty::Array(_))
                     | (Ty::Int, Ty::Named(_))
                     | (Ty::Int, Ty::Task(_))
+                    | (Ty::Int, Ty::TaskResult(_))
                     | (Ty::Int, Ty::Null) => {
                         format!("%v{dst} = inttoptr i64 %v{src} to ptr")
                     }

@@ -34,6 +34,11 @@ pub(super) fn type_ref(ty: &Ty) -> ast::TypeRef {
         Ty::Null => R::EmptyElement,
         Ty::Array(element) => R::Array(Box::new(type_ref(element))),
         Ty::Named(name) => R::Named(name.clone()),
+        Ty::TaskResult(result) => R::Applied(
+            "TaskResult".into(),
+            vec![type_ref(result)],
+            Span::synthetic(),
+        ),
         Ty::Task(result) => R::Applied(
             "$pxr_task".into(),
             vec![type_ref(result)],
@@ -54,6 +59,9 @@ pub(super) fn concrete_type(ty: &ast::TypeRef) -> Ty {
         R::EmptyElement => Ty::Null,
         R::Array(element) => Ty::array(concrete_type(element)),
         R::Named(name) => Ty::Named(name.clone()),
+        R::Applied(name, args, _) if name.eq_ignore_ascii_case("TaskResult") && args.len() == 1 => {
+            Ty::TaskResult(Box::new(concrete_type(&args[0])))
+        }
         _ => unreachable!("class instance arguments are concrete"),
     }
 }
@@ -247,6 +255,20 @@ impl ClassExpander {
     pub fn validate_type(&mut self, ty: &ast::TypeRef) {
         match ty {
             ast::TypeRef::Applied(name, args, span) => {
+                if name
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or(name)
+                    .eq_ignore_ascii_case("TaskResult")
+                {
+                    if args.len() != 1 {
+                        self.error("E0300", *span, "TaskResult requires one result type".into());
+                    }
+                    for argument in args {
+                        self.validate_type(argument);
+                    }
+                    return;
+                }
                 match self.templates.get(&name.to_ascii_lowercase()) {
                     Some(template) if template.type_params.len() == args.len() => {}
                     Some(template) => self.error(
@@ -309,6 +331,15 @@ impl ClassExpander {
             R::Applied(name, args, span) => {
                 for argument in args.iter_mut() {
                     self.rewrite_type(argument, bindings);
+                }
+                if name
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or(name)
+                    .eq_ignore_ascii_case("TaskResult")
+                {
+                    *name = "TaskResult".into();
+                    return;
                 }
                 if args.iter().all(closed) {
                     let name = name.clone();

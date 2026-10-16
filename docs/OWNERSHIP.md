@@ -101,8 +101,9 @@ reference parameters or `&$alias = $variable` aliases.
 An owned object owns its outer handle; ordinary property types retain their
 existing value/shared semantics and independent managed lifetimes. Ownership is
 not a claim that every reachable object is recursively unique. Shared child
-objects can still be shared elsewhere. Thread transfer/`Send`/`Sync` proofs remain
-M7.2 work, and must account for those shared members.
+objects can still be shared elsewhere. M7.2 derives Send only for the documented
+value-field subset, rejecting shared nested objects and validating dynamic
+payloads before copying. See [PARALLEL.md](PARALLEL.md).
 
 Classes freshly constructed for owned destinations are audited, including their
 instance methods and ancestors: `$this` cannot escape into shared storage or

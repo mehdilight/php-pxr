@@ -29,7 +29,7 @@ fn structured_async_runtime() {
         }
         let compiled = command
             .arg(&source)
-            .args(["-lm", "-o"])
+            .args(["-pthread", "-lm", "-o"])
             .arg(&executable)
             .output()
             .unwrap();

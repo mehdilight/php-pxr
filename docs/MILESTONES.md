@@ -728,14 +728,14 @@ remain shared. These rejected forms are documented in [`OWNERSHIP.md`](OWNERSHIP
 M6 does not claim full PHP reference support or `Send`/`Sync` guarantees.
 **Next:** M7.1 — async functions and structured tasks.
 
-## 🚧 M7 — Async I/O & concurrency
+## ✅ M7 — Async I/O & concurrency
 
 **Sequencing.** M5 generics and M6 affine ownership/live-root reclamation are
 complete. The structured runtime and first native source slice are delivered
 below. See [`ASYNC.md`](ASYNC.md) for runnable syntax, current boundaries and
 the execution contract.
 
-### 🚧 M7.1 — Async functions & structured tasks
+### ✅ M7.1 — Async functions & structured tasks
 
 * `async function f(...): T` creates a lazy `Task<T>`; its body returns `T`.
 * `await` inside async functions starts or resumes a task and yields its result;
@@ -833,27 +833,57 @@ interface dispatch, bounded return inference, and explicit owned task results.
 Moved receivers and results preserve affine ownership; borrowed frame captures
 and borrowed results receive diagnostics.
 
-**Remaining:** streaming socket/resource APIs and recoverable error APIs. Unsupported source forms
-receive diagnostics. The current runtime error envelope does not implement PHP
-exceptions or finally/destructors. Request/response objects, router classes,
-streaming HTTP, uploads, sessions and full PHP web SAPI compatibility remain
-pending. Threading remains M7.2.
+**Delivered resources and recovery:** native owned TCP listeners/streams with
+nonblocking connect/accept/read/write, independent read/write leases, half-close,
+consuming close/drop, absolute deadlines and task-scope cleanup. Owned captures,
+returns, unclaimed results and TaskResult payloads preserve resource ownership.
+`taskResultAsync` captures failures after joining descendants; result inspectors
+and consuming `resultValueAsync` preserve affine payloads and support explicit
+recovery. See [ASYNC_IO.md](ASYNC_IO.md).
+
+**Boundaries:** rejected source forms receive diagnostics. TaskResult does not
+introduce PHP catch/finally or user destructors. Request/response objects, routing,
+streaming HTTP, uploads, sessions and full PHP web SAPI compatibility are further
+extensions outside this milestone's native executor/I/O contract.
 
 **Validation:** native source tests run at `-O0`/`-O3`, normal/forced GC, and with
 AddressSanitizer/UndefinedBehaviorSanitizer. They cover scheduling progress,
 ordered awaits, affine handles, joins/cleanup, control-flow suspension, captured
 values, module resolution, failure propagation, bounded memory and invalid forms.
-All 244 workspace tests, async/HTTP/heap/ownership sanitizer checks, example checks
-and the release build pass.
-M7.1 and M7 remain incomplete until the remaining I/O/lifecycle APIs and their
-source acceptance checks are delivered.
+All 261 workspace tests, 68 async/HTTP/heap/ownership/parallel sanitizer checks,
+example checks/runs and the release build pass. Native and generated worker
+programs also pass ThreadSanitizer with normal/forced GC.
 
-### ⛔ M7.2 — Threaded parallelism
+### ✅ M7.2 — Threaded parallelism
 
 * OS threads with `Send`/`Sync`‑style guarantees derived from ownership.
 * Channels and shared‑nothing tasks; data‑race freedom by construction.
 * Explicit cross-thread task transfer rules; async tasks initially stay on their
   event-loop thread. CPU parallelism is separate from async I/O.
+
+**Delivered:** `parallelAsync` runs a literal native async callback on a joinable
+OS thread with a separate heap, precise roots, executor, class registrations,
+static properties and request globals. The ownership checker derives Send for
+value data and moved owned objects containing value fields; dynamic payloads
+are validated before publication. Mutable ordinary objects, borrows, sockets and
+task handles never implicitly cross threads. Worker and message limits bound
+publication; ordinary async tasks stay on their creating thread.
+
+Owned duplex Channel endpoints provide bounded FIFO queues, backpressure,
+deadlines, clone/peer creation and permanent peer closure. Queues contain copied
+data under a native mutex; only explicit endpoint tokens cross workers. Atomic
+completion/cancellation and notification pipes coordinate workers. Cancellation
+joins descendants and frees resources/heaps before parent completion, including
+lazy drop, started drop, failure, nested workers and unclaimed results.
+
+**Acceptance:** source/native tests verify concurrent protocol progress, actual
+distinct pthreads, isolated statics/heaps, moved objects and array value semantics,
+scalar/null/mixed/binary transfers, channel pressure/busy/timeout/closure,
+resource/descriptor counts and cleanup order. O0/O3, forced GC, ASan/UBSan and
+ThreadSanitizer checks pass. See [PARALLEL.md](PARALLEL.md) and the runnable
+`examples/async/parallel.php` / `parallel_values.php`.
+
+**Next:** M8 — native C interoperability.
 
 ## ⛔ M8 — C interoperability
 

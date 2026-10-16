@@ -11,6 +11,17 @@
 
 typedef struct pxr_task pxr_task;
 typedef struct pxr_loop pxr_loop;
+typedef struct pxr_socket_resource pxr_socket_resource;
+struct pxr_socket_resource {
+    pxr_object *object; pxr_task *owner, *reader, *writer;
+    pxr_socket_resource *previous, *next;
+    int fd, listener, closed, kind;
+    void *payload; void (*dispose_payload)(void *, int);
+};
+static void pxr_socket_resources_cleanup(pxr_task *task);
+static void pxr_socket_promote_result(pxr_task *task, int64_t tag, int64_t bits);
+static void pxr_socket_discard_result(int64_t tag, int64_t bits);
+void pxr_async_adopt_resource(void *handle, void *value);
 typedef struct {
     pxr_array *globals[6], *headers, *response_headers;
     pxr_str *body;
@@ -20,7 +31,7 @@ typedef struct {
     int64_t max_bytes;
     pxr_buf output, decoded;
 } pxr_http_context;
-static pxr_http_context *pxr_http_cli_context;
+static _Thread_local pxr_http_context *pxr_http_cli_context;
 static void pxr_http_mark_context(pxr_http_context *context);
 static pxr_http_context *pxr_http_context_new(int fd, int64_t max_bytes);
 typedef void (*pxr_task_callback)(pxr_task *, void *);
@@ -37,6 +48,7 @@ struct pxr_task {
     uint64_t id, deadline;
     size_t timer_index;
     int state, queued, handle_live, claimed, body_done, cancel_requested;
+    int defer_cancel;
     int isolate_failure; /* Runtime-owned boundary: errors stay in this task's result. */
     int fd; short io_events, io_ready;
     pxr_task_result result;
@@ -45,6 +57,7 @@ struct pxr_task {
     void **roots;
     size_t root_count, root_capacity;
     pxr_http_context *http;
+    pxr_socket_resource *resources;
 };
 struct pxr_loop {
     pxr_loop *registered_next;
@@ -56,12 +69,14 @@ struct pxr_loop {
     size_t poll_capacity;
     uint64_t next_id;
     int running;
+    int cancel_fd;
+    int (*cancelled)(void *); void *cancel_context;
     uint64_t (*now)(void *);
     int (*wait)(struct pollfd *, nfds_t, int, void *);
     void *clock_context;
 };
-static pxr_loop *pxr_async_loops;
-static int pxr_async_running;
+static _Thread_local pxr_loop *pxr_async_loops;
+static _Thread_local int pxr_async_running;
 
 static void *pxr_async_resize(void *ptr, size_t count, size_t size) {
     void *result = realloc(ptr, pxr_size_mul(count, size));
@@ -83,6 +98,7 @@ static int pxr_async_wait(struct pollfd *fds, nfds_t count, int timeout, void *c
 }
 static void pxr_loop_init(pxr_loop *loop) {
     memset(loop, 0, sizeof(*loop));
+    loop->cancel_fd = -1;
     loop->now = pxr_async_now;
     loop->wait = pxr_async_wait;
     loop->registered_next = pxr_async_loops;
@@ -96,6 +112,7 @@ static void pxr_async_mark_roots(void) {
             for (size_t i = 0; i < task->root_count; i++) pxr_gc_mark(task->roots[i]);
             pxr_gc_mark_value(task->result.tag, task->result.bits);
             pxr_http_mark_context(task->http);
+            for (pxr_socket_resource *r = task->resources; r; r = r->next) pxr_gc_mark(r->object);
         }
 }
 /* Roots are exact payload addresses. A frame is raw storage, never scanned.
@@ -200,6 +217,7 @@ static void pxr_task_cancel(pxr_task *task) {
 static void pxr_task_destroy(pxr_task *task) {
     assert(task->state == PXR_TASK_COMPLETE && !task->queued && !task->children);
     pxr_loop *loop = task->loop;
+    if (!task->claimed) pxr_socket_discard_result(task->result.tag, task->result.bits);
     if (task->sibling_prev) task->sibling_prev->sibling_next = task->sibling_next;
     else if (task->parent) task->parent->children = task->sibling_next;
     if (task->sibling_next) task->sibling_next->sibling_prev = task->sibling_prev;
@@ -246,6 +264,7 @@ static void pxr_task_sleep(pxr_task *task, uint64_t milliseconds) {
 }
 static void pxr_task_finish(pxr_task *task, int64_t tag, int64_t bits) {
     assert(task == task->loop->current && task->state == PXR_TASK_RUNNING);
+    pxr_socket_promote_result(task, tag, bits);
     task->result.tag = tag; task->result.bits = bits;
     task->body_done = 1;
     pxr_task_wake(task);
@@ -290,7 +309,9 @@ static pxr_task_result pxr_task_take(pxr_task *child) {
  * callbacks. Deep task trees cannot overflow the native stack during cleanup. */
 static void pxr_task_step(pxr_task *task) {
     pxr_loop *loop = task->loop;
-    if (task->cancel_requested) {
+    if (task->defer_cancel && (task->cancel_requested || task->body_done)) {
+        task->cancel_requested = 1; task->body_done = 0;
+    } else if (task->cancel_requested) {
         task->body_done = 1;
         if (!task->result.error) task->result.status = PXR_TASK_CANCELLED;
     }
@@ -310,7 +331,9 @@ static void pxr_task_step(pxr_task *task) {
     if (task->pending_children) return;
     /* Children are complete before the parent's resources/locals are released.
      * Cleanup may collect; this task and its roots stay registered throughout. */
+    if (task->result.status != PXR_TASK_OK) pxr_socket_discard_result(task->result.tag, task->result.bits);
     if (task->cleanup) task->cleanup(task, task->frame);
+    pxr_socket_resources_cleanup(task);
     while (task->children) pxr_task_destroy(task->children);
     pxr_heap_free(task->frame); task->frame = NULL;
     free(task->roots); task->roots = NULL; task->root_count = 0;
@@ -337,7 +360,7 @@ static void pxr_loop_events(pxr_loop *loop) {
     uint64_t now = loop->now(loop->clock_context);
     while (loop->timer_count && loop->timers[0]->deadline <= now)
         pxr_task_wake(loop->timers[0]);
-    size_t count = 0;
+    size_t count = loop->cancel_fd >= 0 ? 1 : 0;
     for (pxr_task *task = loop->tasks; task; task = task->all_next)
         if (task->state == PXR_TASK_IO) count++;
     if (count > loop->poll_capacity) {
@@ -351,6 +374,10 @@ static void pxr_loop_events(pxr_loop *loop) {
             loop->poll_fds[i] = (struct pollfd){ task->fd, task->io_events, 0 };
             loop->poll_tasks[i++] = task;
         }
+    if (loop->cancel_fd >= 0) {
+        loop->poll_fds[i] = (struct pollfd){loop->cancel_fd, POLLIN, 0};
+        loop->poll_tasks[i++] = NULL;
+    }
     int timeout = -1;
     if (loop->ready_head) timeout = 0;
     else if (loop->timer_count) {
@@ -370,6 +397,7 @@ static void pxr_loop_events(pxr_loop *loop) {
     for (i = 0; i < count; i++) {
         short events = loop->poll_fds[i].revents;
         pxr_task *task = loop->poll_tasks[i];
+        if (!task) continue;
         if (events & POLLNVAL) pxr_task_fail(task, EBADF);
         else if (events) { task->io_ready = events; pxr_task_wake(task); }
     }
@@ -379,6 +407,10 @@ static pxr_task_result pxr_loop_run(pxr_loop *loop) {
     loop->running = pxr_async_running = 1;
     if (loop->root->state == PXR_TASK_NEW) pxr_task_start(loop->root);
     while (loop->root->state != PXR_TASK_COMPLETE) {
+        if (loop->cancelled && loop->cancelled(loop->cancel_context)) {
+            pxr_task_cancel(loop->root);
+            char bytes[128]; while (read(loop->cancel_fd, bytes, sizeof(bytes)) > 0) {}
+        }
         /* Poll I/O after a bounded ready batch so self-yielding CPU work cannot
          * starve timers or already-ready sockets. No busy polling when idle. */
         for (unsigned budget = 0; budget < 64 && loop->ready_head; budget++) {
@@ -411,8 +443,8 @@ static void pxr_loop_destroy(pxr_loop *loop) {
 /* Generated-code bridge. Cells are 64-bit ABI payloads; a pointer bitmap
  * atomically replaces the frame's live root view. Storing a new pointer roots
  * it immediately, before a following generated safepoint can collect it. */
-static pxr_loop pxr_compiler_loop;
-static int pxr_compiler_loop_initialized;
+static _Thread_local pxr_loop pxr_compiler_loop;
+static _Thread_local int pxr_compiler_loop_initialized;
 void *pxr_async_create(pxr_task_callback callback, int64_t cells) {
     assert(cells > 0);
     if (!pxr_compiler_loop_initialized) {
@@ -492,6 +524,62 @@ void pxr_async_cancel(void *handle) {
     assert(task->parent == task->loop->current && task->handle_live && !task->claimed);
     pxr_task_cancel(task);
     pxr_task_release(task);
+}
+
+/* A result operation adopts its operand, retaining a single structured owner.
+ * Error isolation is installed before either lazy task is first polled. */
+typedef struct { int pc; pxr_task *child; pxr_object *value; } pxr_result_frame;
+static pxr_object *pxr_result_checked(void *raw) {
+    pxr_object *value = raw;
+    assert(value && value->class_id == -100 && value->num_props == 4 && !value->bits[3]);
+    return value;
+}
+static void pxr_result_resume(pxr_task *task, void *raw) {
+    pxr_result_frame *frame = raw;
+    if (!frame->pc++) { pxr_task_await(task, frame->child); return; }
+    pxr_task_result result = pxr_task_take(frame->child); frame->child = NULL;
+    pxr_object *value = pxr_object_new(-100, NULL, 4);
+    value->tags[0] = value->tags[1] = value->tags[3] = PXR_TAG_INT;
+    value->bits[0] = result.status; value->bits[1] = result.error;
+    if (result.status == PXR_TASK_OK) { value->tags[2] = result.tag; value->bits[2] = result.bits; }
+    task->roots[0] = value;
+    pxr_task_finish(task, PXR_TAG_OBJ, (intptr_t)value);
+}
+void *pxr_async_result_task(void *handle) {
+    pxr_task *child = handle, *parent = child->loop->current;
+    assert(child->parent == parent && child->handle_live && !child->claimed);
+    pxr_task *task = pxr_task_new(child->loop, parent, sizeof(pxr_result_frame), 1, pxr_result_resume, NULL);
+    ((pxr_result_frame *)task->frame)->child = child; pxr_task_roots(task, 1);
+    child->isolate_failure = 1;
+    /* Splice the operand out of its old sibling list and into the wrapper. */
+    if (child->sibling_prev) child->sibling_prev->sibling_next = child->sibling_next;
+    else parent->children = child->sibling_next;
+    if (child->sibling_next) child->sibling_next->sibling_prev = child->sibling_prev;
+    child->parent = task; child->sibling_prev = NULL; child->sibling_next = NULL;
+    task->children = child;
+    if (child->state != PXR_TASK_COMPLETE) { parent->pending_children--; task->pending_children++; }
+    return task;
+}
+_Bool pxr_async_result_ok(void *raw) { return pxr_result_checked(raw)->bits[0] == PXR_TASK_OK; }
+int64_t pxr_async_result_status(void *raw) { return pxr_result_checked(raw)->bits[0]; }
+int64_t pxr_async_result_error(void *raw) {
+    pxr_object *value = pxr_result_checked(raw);
+    return value->bits[0] == PXR_TASK_CANCELLED ? ECANCELED : value->bits[1];
+}
+static void pxr_result_value_resume(pxr_task *task, void *raw) {
+    pxr_object *value = ((pxr_result_frame *)raw)->value;
+    if (value->bits[0] != PXR_TASK_OK) {
+        pxr_task_fail(task, value->bits[0] == PXR_TASK_CANCELLED ? ECANCELED : (int)value->bits[1]);
+    } else pxr_task_finish(task, value->tags[2], value->bits[2]);
+}
+void *pxr_async_result_value_task(void *raw) {
+    pxr_object *value = pxr_result_checked(raw); value->bits[3] = 1;
+    pxr_task *task = pxr_task_new(&pxr_compiler_loop, pxr_compiler_loop.current,
+        sizeof(pxr_result_frame), 1, pxr_result_value_resume, NULL);
+    ((pxr_result_frame *)task->frame)->value = value;
+    pxr_async_adopt_resource(task, value);
+    task->roots[0] = value; pxr_task_roots(task, 1);
+    return task;
 }
 
 /* One owned TCP connection per exchange. No descriptor crosses the language

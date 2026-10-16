@@ -43,6 +43,12 @@ fn infer_bindings(
             }
         }
         ast::TypeRef::Applied(base, patterns, _) => {
+            if base.eq_ignore_ascii_case("TaskResult") {
+                if let (Some(pattern), Ty::TaskResult(value)) = (patterns.first(), actual) {
+                    return infer_bindings(pattern, value, bindings, classes, class_infos);
+                }
+                return Err("expected a TaskResult argument".into());
+            }
             let Ty::Named(name) = actual else {
                 return Err(format!("expected `{base}<...>`, found `{actual}`"));
             };
@@ -93,6 +99,7 @@ fn encode_type(ty: &Ty) -> String {
         Ty::Array(element) => format!("a{}", encode_type(element)),
         Ty::Named(name) => format!("n{}", hex_name(name)),
         Ty::Task(result) => format!("task{}", encode_type(result)),
+        Ty::TaskResult(result) => format!("result{}", encode_type(result)),
     }
 }
 

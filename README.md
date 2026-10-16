@@ -17,22 +17,23 @@ The same `main.php` can still run under PHP for comparison. Native programs link
 only the small PXR runtime; explicitly marked legacy boundaries use a PHP CLI
 worker when they execute.
 
-> **Project status: milestones 1–6 complete.**
+> **Project status: milestones 1–7 complete.**
 > M4 adds mixed scalar/null/array/object values, guard narrowing, dynamic
 > operators, runtime PHP include/call boundaries, and a migration report.
 > `examples/migration/main.php` runs a typed native entry point with untyped PHP.
 > M5 adds native specialization for generic functions, classes, interfaces, and
 > independent methods; nominal bounds, trait composition, and return inference.
 > M6 adds affine `owned<T>` handles, moves, call-scoped borrows, and precise
-> reclamation of dead values and cycles. M7 is in progress: an internal executor
+> reclamation of dead values and cycles. M7 adds an internal executor that
 > supports generic async functions/methods, inferred and owned results, affine task handles, await/spawn, nonblocking
 > timers, owned TCP exchanges, bounded native TCP servers, consuming cancellation
 > and an async main entry. A bounded HTTP adapter adds isolated request globals,
 > PHP-style output, header() and http_response_code(), bounded chunked bodies,
 > 100-continue and isolated connection/handler failures. `stopServer` adds
 > graceful TCP/HTTP shutdown with a deadline for accepted work.
-> Streaming socket APIs, general task error recovery and broader async signatures remain
-> pending; see
+> Owned streaming sockets and TaskResult error recovery complete the I/O layer.
+> Explicit OS-thread workers use isolated heaps, ownership-derived transfers and
+> bounded duplex channels; see [`docs/PARALLEL.md`](docs/PARALLEL.md) and
 > [`docs/ASYNC.md`](docs/ASYNC.md), [`docs/ASYNC_IO.md`](docs/ASYNC_IO.md),
 > [`docs/ASYNC_SERVER.md`](docs/ASYNC_SERVER.md), and [`docs/HTTP.md`](docs/HTTP.md).
 > See [`docs/OWNERSHIP.md`](docs/OWNERSHIP.md), [`docs/GENERICS.md`](docs/GENERICS.md), [`docs/MILESTONES.md`](docs/MILESTONES.md),
@@ -217,9 +218,9 @@ annotations, overflow promotion for concrete `int` arithmetic, late static bindi
 advanced trait adaptations and generic trait mixins,
 stored/named-lifetime borrows and owned fields, the complex string‑interpolation forms (`"$a[0]"`,
 `"{$expr}"`, `"${name}"`, `"$obj->p"`; the simple `"$name"` / `"{$name}"` work),
-native exceptions, C interop (`extern`), streaming async socket APIs and recoverable task errors,
-threaded concurrency (M7 is in progress; see
-[`docs/ASYNC.md`](docs/ASYNC.md)), and broader PHP language/library coverage in compiled code.
+native exceptions, C interop (`extern`), and broader PHP language/library coverage
+in compiled code. Async/worker API boundaries are documented in
+[`docs/ASYNC.md`](docs/ASYNC.md) and [`docs/PARALLEL.md`](docs/PARALLEL.md).
 
 ## License
 

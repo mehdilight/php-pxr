@@ -1,4 +1,4 @@
-# Async TCP exchange and cancellation
+# Async TCP connections, streams and cancellation
 
 PXR provides a first source-level TCP operation with an owned connection:
 
@@ -30,12 +30,13 @@ The operation opens a nonblocking TCP connection, writes the entire request,
 shuts down its write side, and reads a response until peer EOF. Its result is a
 binary-safe PXR string, including embedded NUL bytes. The peer protocol must
 accept request EOF and then finish its response by closing its send side. This
-is a request-then-response operation, not a general full-duplex stream API.
+is a request-then-response operation. Use the separate stream API below for persistent or full-duplex protocols.
 
 Addresses must be numeric IPv4 or IPv6 literals; pass `"::1"` without URL brackets
-for IPv6 loopback. Hostnames, scoped IPv6 addresses, URLs, TLS, DNS, accepted socket
-handles, persistent connections and streaming read/write APIs are not supplied
-by this operation. Native listening/acceptance is now available separately through
+for IPv6 loopback. Hostnames, scoped IPv6 addresses, URLs, TLS and DNS remain
+outside these APIs. Accepted handles, persistent connections and streaming
+read/write use the separate resource API below. Native listening/acceptance with
+EOF-framed handlers is also available through
 [`tcpServeAsync`](ASYNC_SERVER.md), with the same EOF-delimited protocol. Invalid addresses and embedded NULs fail with
 `EINVAL` when the task starts. Ports must be 1–65535.
 
@@ -123,3 +124,81 @@ The suites run at `-O0`/`-O3`, with normal/forced GC and optional AddressSanitiz
 and UndefinedBehaviorSanitizer. See [ASYNC_REFERENCES.md](ASYNC_REFERENCES.md) for
 primary implementation references and [ASYNC_RUNTIME.md](ASYNC_RUNTIME.md) for
 the internal task contract.
+
+## Owned listeners and streams
+
+`TcpListener` and `TcpStream` are abstract native resource types. User code cannot
+construct or extend them, box their owners into mixed, borrow them across awaits,
+or transfer them to an OS-thread worker. Native factories return affine owners:
+
+| Operation | Completed result |
+| --- | --- |
+| `tcpListenAsync(string $address, int $port, int $backlog = 64)` | `owned<TcpListener>` |
+| `tcpAcceptAsync($listener, int $timeoutMs = 30000)` | `owned<TcpStream>` |
+| `tcpConnectAsync(string $address, int $port, int $timeoutMs = 30000)` | `owned<TcpStream>` |
+| `tcpReadAsync($stream, int $maxBytes, int $timeoutMs = 30000)` | `string` |
+| `tcpWriteAsync($stream, string $bytes, int $timeoutMs = 30000)` | `int`, bytes written |
+| `tcpShutdownWrite($stream)` | Synchronous half-close after pending writes finish |
+| `closeSocket($owner)` | Consumes and closes the listener/stream |
+| `drop($owner)` | Consumes and closes the resource |
+
+Factories and I/O require an async context. Half-close and close may also be
+used in synchronous helpers with owned parameters. Numeric IPv4/IPv6 addresses
+and ports 1–65535 follow the exchange API. Backlog is 1–1024. Read returns at
+most `min(maxBytes, 8192)` available bytes; an empty string means EOF. `maxBytes`
+must be positive. Write handles partial writes/backpressure until the full binary
+string is sent, then returns its length. Deadline expiry fails the operation,
+including after a partial write; retrying must account for that partial delivery.
+Negative timeouts fail; zero is an already-expired socket deadline.
+
+Operations require an owned local without consuming it. One read (or listener
+accept) and one write can be pending per resource; another operation in the same
+direction fails with EBUSY. Read and write can run concurrently. Half-close with
+a pending writer fails with EBUSY. Closing a resource fails pending operations
+with ECANCELED, removes their poll registrations before descriptor reuse, and
+closes exactly once. Other operation errors do not implicitly close an owner;
+use TaskResult to recover, then close/drop it or attempt another operation.
+
+Resources are rooted in their owning task scope and close after its children
+join. Generated async constructors adopt transferred resources, including
+resources inside owned TaskResult payloads; successful owned returns promote
+them to the parent. Lazy capture cancellation, unclaimed task results, explicit
+drop and failed task cleanup release their resources. Native resource cleanup
+is distinct from user-defined PHP destructors, which remain outside this API.
+
+See `examples/async/stream.php` for a finite listener/client round trip. Its
+matching source test selects an available loopback port. The native lifecycle
+suite asserts leases, descriptor closure, unclaimed results, owned outcome drop
+and cancelled lazy extraction at O0/O3 with GC stress and sanitizers.
+
+## Recoverable task results
+
+`taskResultAsync($task)` consumes an unclaimed task handle and returns a lazy
+`Task<owned<TaskResult<T>>>`. Construct this boundary before the operand first
+runs: a failure that already reached the parent cannot be retroactively cleared.
+The wrapper owns/joins the operand; its failure is captured after descendant
+cleanup instead of failing siblings. Spawn the wrapper for concurrent work:
+
+```php
+$task = spawn taskResultAsync(tcpConnectAsync("127.0.0.1", 8765));
+$result = await $task;
+if (resultOk($result)) {
+    $stream = await resultValueAsync($result);
+    // use $stream, then closeSocket($stream)
+} else {
+    echo resultError($result);
+    drop($result);
+}
+```
+
+`resultOk`, `resultStatus` and `resultError` inspect without consuming the owned
+outcome. Status is 0 (OK), 1 (cancelled) or 2 (error). Error is zero on success,
+positive errno on failure, ECANCELED for cancellation. Inspectors work in sync
+helpers too. `resultValueAsync` consumes the outcome and produces `Task<T>`:
+success transfers the value once, including owned resources/objects or void;
+failure propagates the stored error through ordinary structured task failure.
+It can itself be wrapped to recover that failure. Dropping an outcome releases
+an owned resource payload. Ownership qualifiers inside TaskResult annotations
+must be preserved through locals, arguments and returns. There is no automatic
+conversion to mixed, PHP exception, catch/finally or user destructor semantics.
+See `examples/async/results.php`.

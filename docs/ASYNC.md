@@ -1,12 +1,12 @@
-# Async/await — M7.1 in progress
+# Async/await and structured tasks
 
-**Implemented first source slice:** async functions and methods with explicit or inferred result
+**Implemented:** async functions and methods with explicit or inferred result
 types, inferred affine task handles, `await`, `spawn`, nonblocking timers,
-owned TCP exchanges, bounded native TCP/HTTP servers, consuming cancellation and an
+owned TCP exchanges/streams, recoverable task results, bounded native TCP/HTTP servers, consuming cancellation and an
 async CLI entry point. Programs compile to native resumable frames and run
 without PHP. This syntax is a PXR language extension and cannot run in PHP.
-M7.1 remains incomplete: streaming/resource APIs, recoverable errors and broader
-async function/task signatures remain pending. See [MILESTONES.md](MILESTONES.md), the internal
+Shared-nothing OS-thread workers and bounded channels are described in
+[PARALLEL.md](PARALLEL.md). See [MILESTONES.md](MILESTONES.md), the internal
 [runtime contract](ASYNC_RUNTIME.md) and [primary references](ASYNC_REFERENCES.md).
 
 ## Runnable syntax
@@ -61,8 +61,8 @@ PHP-style request globals, buffered output and header/status helpers; see
 [HTTP.md](HTTP.md) and `examples/async/http.php`.
 
 The initial executor is cooperative and single-threaded. Ordinary blocking
-functions and CPU work occupy that thread until they return or await. OS-thread
-parallelism remains M7.2 work.
+functions and CPU work occupy that thread until they return or await. Use explicit `parallelAsync` for OS-thread CPU work; each worker has its own
+executor and heap. Ordinary async handles stay on their creating thread.
 
 ## Entry and current source boundaries
 
@@ -182,9 +182,9 @@ synchronously await cleanup or expose a recoverable cancellation result.
 `stopServer` consumes a direct TCP/HTTP server handle and requests graceful
 shutdown with a bounded period for accepted work before cancellation/join;
 see [the server contract](ASYNC_SERVER.md#graceful-shutdown).
-Recoverable task errors/catch, async cleanup, PHP `finally`, native destructors
-and public streaming socket resources remain unimplemented. Heap reclamation
-of captured values does not supply those resource semantics.
+Owned streaming sockets and explicit TaskResult recovery are implemented in
+[ASYNC_IO.md](ASYNC_IO.md). PHP catch/finally, user-defined native destructors
+and arbitrary asynchronous cleanup remain outside this source contract.
 
 ## Lowering and validation
 
@@ -206,4 +206,5 @@ bounded repeated-result retention, failure cancellation and invalid forms.
 Native TCP client/server tests verify concurrent progress, bounded binary transfers,
 IPv4/IPv6, handler limits/deadlines, and cancellation through generated parent frames. Deterministic C executor tests
 additionally cover readiness/backpressure, descriptor reuse/cleanup, broken pipes
-and I/O deadlines. Streaming resources and broader lifecycle APIs remain M7 work.
+and I/O deadlines. Owned streaming sockets and TaskResult recovery are covered
+in [ASYNC_IO.md](ASYNC_IO.md); worker/channel transfers in [PARALLEL.md](PARALLEL.md).

@@ -236,7 +236,13 @@ impl Builtin {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Callee {
     /// A statically checked async string handler, passed as a native constructor.
-    AsyncServer { handler: String, http: bool },
+    AsyncServer {
+        handler: String,
+        http: bool,
+    },
+    Parallel {
+        handler: String,
+    },
     Php {
         name: String,
         fallback: Option<String>,
@@ -733,6 +739,8 @@ pub struct TProgram {
     pub main: TFunc,
     pub class_registrations: Vec<(u32, u32)>,
     pub stringifiers: Vec<(u32, String)>,
+    pub worker_bootstrap: Vec<TStmt>,
+    pub parallel_handlers: std::collections::HashSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -779,6 +787,8 @@ pub struct MethodInfo {
 }
 
 pub struct Analyzer {
+    parallel_handlers: std::collections::HashSet<String>,
+    worker_bootstrap: Vec<TStmt>,
     unresolved_returns: Vec<(String, Span)>,
     return_contract_errors: Vec<Diagnostic>,
     class_expander: class_generics::ClassExpander,
@@ -881,9 +891,64 @@ fn uses_php(statement: &ast::Stmt) -> bool {
 }
 
 pub fn analyze(program: &ast::Program) -> (Option<TProgram>, Diagnostics) {
-    let (expanded_traits, diagnostics) = traits::expand(program);
+    let (mut expanded_traits, diagnostics) = traits::expand(program);
     if diagnostics.has_errors() {
         return (None, diagnostics);
+    }
+    for item in &expanded_traits.items {
+        if let ast::Stmt::ClassDecl(class) = item {
+            if class
+                .name
+                .rsplit('\\')
+                .next()
+                .unwrap_or(&class.name)
+                .eq_ignore_ascii_case("TaskResult")
+            {
+                let mut diagnostics = Diagnostics::new();
+                diagnostics.emit(
+                    Diagnostic::error("TaskResult is a reserved native result type")
+                        .with_code("E0300")
+                        .with_span(class.name_span),
+                );
+                return (None, diagnostics);
+            }
+        }
+    }
+    for name in ["TcpStream", "TcpListener", "Channel"] {
+        for item in &expanded_traits.items {
+            if let ast::Stmt::ClassDecl(class) = item {
+                if class.name.eq_ignore_ascii_case(name)
+                    || class
+                        .extends
+                        .as_ref()
+                        .is_some_and(|parent| parent.name.eq_ignore_ascii_case(name))
+                {
+                    let mut diagnostics = Diagnostics::new();
+                    diagnostics.emit(
+                        Diagnostic::error("native resource types cannot be declared or extended")
+                            .with_code("E0300")
+                            .with_span(class.name_span),
+                    );
+                    return (None, diagnostics);
+                }
+            }
+        }
+        expanded_traits
+            .items
+            .push(ast::Stmt::ClassDecl(Box::new(ast::ClassDecl {
+                type_params: vec![],
+                bounds: vec![],
+                is_trait: false,
+                trait_uses: vec![],
+                is_interface: false,
+                interfaces: vec![],
+                is_abstract: true,
+                name: name.into(),
+                name_span: Span::synthetic(),
+                extends: None,
+                members: vec![],
+                span: Span::synthetic(),
+            })));
     }
     let (owned_program, diagnostics) = ownership::check_and_erase(&expanded_traits);
     if diagnostics.has_errors() {
@@ -897,6 +962,8 @@ pub fn analyze(program: &ast::Program) -> (Option<TProgram>, Diagnostics) {
             return (None, class_expander.diags);
         }
         let mut a = Analyzer {
+            parallel_handlers: std::collections::HashSet::new(),
+            worker_bootstrap: vec![],
             unresolved_returns: Vec::new(),
             return_contract_errors: Vec::new(),
             class_expander,
@@ -968,7 +1035,11 @@ impl Analyzer {
             return true;
         }
         match (from, to) {
-            (from, Ty::Mixed) if *from != Ty::Void && !matches!(from, Ty::Task(_)) => true,
+            (from, Ty::Mixed)
+                if *from != Ty::Void && !matches!(from, Ty::Task(_) | Ty::TaskResult(_)) =>
+            {
+                true
+            }
             (Ty::Int, Ty::Float) => true,
             (Ty::Array(e), Ty::Array(t)) => {
                 matches!(**e, Ty::Null)
@@ -1389,6 +1460,8 @@ impl Analyzer {
             main: main?,
             class_registrations,
             stringifiers,
+            worker_bootstrap: self.worker_bootstrap.clone(),
+            parallel_handlers: self.parallel_handlers.clone(),
         })
     }
 
@@ -2180,6 +2253,16 @@ impl Analyzer {
     fn resolve_type_with(&mut self, t: &ast::TypeRef, bindings: &HashMap<String, Ty>) -> Ty {
         match t {
             ast::TypeRef::EmptyElement => Ty::Null,
+            ast::TypeRef::Applied(name, args, _)
+                if name
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or(name)
+                    .eq_ignore_ascii_case("TaskResult")
+                    && args.len() == 1 =>
+            {
+                Ty::TaskResult(Box::new(self.resolve_type_with(&args[0], bindings)))
+            }
             ast::TypeRef::Applied(..) => {
                 if self.validating_template {
                     self.class_expander.validate_type(t);
@@ -2427,6 +2510,7 @@ impl Analyzer {
                 }
             }
         }
+        self.worker_bootstrap = body.clone();
         if let Some(entry) = self.funcs.get("main").filter(|f| f.is_async).cloned() {
             if !entry.params.is_empty()
                 || (entry.ret != Ty::Void && entry.ret != Ty::Infer)
@@ -2531,7 +2615,7 @@ impl Analyzer {
                 let mut texprs = Vec::new();
                 for e in exprs {
                     if let Some(t) = self.infer(e, ctx) {
-                        if matches!(t.ty(), Ty::Void | Ty::Task(_)) {
+                        if matches!(t.ty(), Ty::Void | Ty::Task(_) | Ty::TaskResult(_)) {
                             self.diags.emit(
                                 Diagnostic::error(
                                     "echo requires a completed value, not void or a task handle",
@@ -2558,7 +2642,7 @@ impl Analyzer {
             }
             ast::Stmt::Print(e, _) => {
                 let t = self.infer(e, ctx)?;
-                if matches!(t.ty(), Ty::Void | Ty::Task(_)) {
+                if matches!(t.ty(), Ty::Void | Ty::Task(_) | Ty::TaskResult(_)) {
                     self.diags.emit(
                         Diagnostic::error(
                             "print requires a completed value, not void or a task handle",
@@ -3787,6 +3871,25 @@ impl Analyzer {
                         "httprequestbody",
                         "canceltask",
                         "stopserver",
+                        "tcpconnectasync",
+                        "tcplistenasync",
+                        "tcpacceptasync",
+                        "tcpreadasync",
+                        "tcpwriteasync",
+                        "closesocket",
+                        "tcpshutdownwrite",
+                        "taskresultasync",
+                        "resultvalueasync",
+                        "resultok",
+                        "resulterror",
+                        "resultstatus",
+                        "parallelasync",
+                        "channelasync",
+                        "channelpeerasync",
+                        "channelcloneasync",
+                        "channelsendasync",
+                        "channelreceiveasync",
+                        "closechannel",
                     ]
                     .iter()
                     .any(|n| name.eq_ignore_ascii_case(n))
@@ -4563,7 +4666,9 @@ impl Analyzer {
         if l.contains_infer() || r.contains_infer() {
             return Some(Ty::Infer);
         }
-        if matches!(l, Ty::Task(_)) || matches!(r, Ty::Task(_)) {
+        if matches!(l, Ty::Task(_) | Ty::TaskResult(_))
+            || matches!(r, Ty::Task(_) | Ty::TaskResult(_))
+        {
             return self.bad_operands(op, l, r, span);
         }
         if *l == Ty::Mixed || *r == Ty::Mixed {
@@ -5098,6 +5203,160 @@ impl Analyzer {
                 span,
             });
         }
+        if key == "parallelasync" {
+            if self.php_interop {
+                self.diags.emit(Diagnostic::error("parallel workers cannot be combined with PHP module interop; use native functions").with_code("E0300").with_span(span));
+                return None;
+            }
+            if !ctx.is_async || args.len() != 2 || !type_args.is_empty() {
+                self.diags.emit(Diagnostic::error("parallelAsync requires (literal native async function name, Send input) in an async context").with_code("E0300").with_span(span));
+                return None;
+            }
+            let mut name = &args[0];
+            while let ast::Expr::Paren(inner, _) = name {
+                name = inner;
+            }
+            let ast::Expr::StrLit(bytes, _) = name else {
+                self.diags.emit(
+                    Diagnostic::error(
+                        "parallelAsync callback must be a literal native async function name",
+                    )
+                    .with_code("E0300")
+                    .with_span(span),
+                );
+                return None;
+            };
+            let Some(handler) = std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|n| {
+                    self.funcs
+                        .get(&n.trim_start_matches('\\').to_ascii_lowercase())
+                })
+                .filter(|f| f.is_async && f.params.len() == 1)
+                .cloned()
+            else {
+                self.diags.emit(Diagnostic::error("parallelAsync callback must be a non-generic native async function with one Send parameter").with_code("E0300").with_span(span));
+                return None;
+            };
+            let value = self.infer_for_type(&args[1], ctx, &handler.params[0])?;
+            if !self.is_assignable(&value.ty(), &handler.params[0]) {
+                return self.builtin_ty_err(callee, "the callback input type", &value.ty(), span);
+            }
+            self.parallel_handlers.insert(handler.mangled.clone());
+            return Some(TExpr::Call {
+                callee: Callee::Parallel {
+                    handler: handler.mangled,
+                },
+                ret: Ty::Task(Box::new(handler.ret)),
+                args: vec![value],
+                arg_tys: handler.params,
+                span,
+            });
+        }
+        if [
+            "channelasync",
+            "channelpeerasync",
+            "channelcloneasync",
+            "channelsendasync",
+            "channelreceiveasync",
+            "closechannel",
+        ]
+        .contains(&key.as_str())
+        {
+            let channel = Ty::Named("Channel".into());
+            let (op, minimum, maximum, ret) = match key.as_str() {
+                "channelasync" => (0, 0, 1, Ty::Task(Box::new(channel.clone()))),
+                "channelpeerasync" => (1, 1, 1, Ty::Task(Box::new(channel.clone()))),
+                "channelcloneasync" => (2, 1, 1, Ty::Task(Box::new(channel.clone()))),
+                "channelsendasync" => (3, 2, 3, Ty::Task(Box::new(Ty::Void))),
+                "channelreceiveasync" => (4, 1, 2, Ty::Task(Box::new(Ty::Mixed))),
+                _ => (5, 1, 1, Ty::Void),
+            };
+            if (op != 5 && !ctx.is_async)
+                || !(minimum..=maximum).contains(&args.len())
+                || !type_args.is_empty()
+            {
+                self.diags.emit(
+                    Diagnostic::error(
+                        "channel operation requires its declared operands in an async context",
+                    )
+                    .with_code("E0300")
+                    .with_span(span),
+                );
+                return None;
+            }
+            let object = if op == 0 {
+                TExpr::Null
+            } else {
+                let object = self.infer(&args[0], ctx)?;
+                if object.ty() != channel {
+                    return self.builtin_ty_err(callee, "an owned Channel", &object.ty(), span);
+                }
+                object
+            };
+            if op == 5 {
+                return Some(TExpr::Call {
+                    callee: Callee::User {
+                        mangled: "pxr_socket_close".into(),
+                        name: callee.into(),
+                        params: vec![channel.clone()],
+                    },
+                    ret,
+                    args: vec![object],
+                    arg_tys: vec![channel],
+                    span,
+                });
+            }
+            let value = if op == 3 {
+                let v = self.infer_for_type(&args[1], ctx, &Ty::Mixed)?;
+                if !send_value_type(&v.ty()) {
+                    return self.builtin_ty_err(callee, "Send scalar/array data", &v.ty(), span);
+                }
+                TExpr::Coerce {
+                    expr: Box::new(v),
+                    ty: Ty::Mixed,
+                }
+            } else {
+                TExpr::Null
+            };
+            let number_arg = if op == 0 {
+                args.first()
+            } else if op == 3 {
+                args.get(2)
+            } else if op == 4 {
+                args.get(1)
+            } else {
+                None
+            };
+            let number = if let Some(n) = number_arg {
+                let n = self.infer(n, ctx)?;
+                if n.ty() != Ty::Int {
+                    return self.builtin_ty_err(callee, "int capacity or timeout", &n.ty(), span);
+                }
+                n
+            } else {
+                TExpr::Int(if op == 0 { 64 } else { 30000 })
+            };
+            let values = vec![
+                TExpr::Int(op),
+                object,
+                value,
+                number,
+                TExpr::Int(self.classes["channel"].class_id as i64),
+            ];
+            let params = values.iter().map(TExpr::ty).collect::<Vec<_>>();
+            return Some(TExpr::Call {
+                callee: Callee::User {
+                    mangled: "pxr_async_channel".into(),
+                    name: callee.into(),
+                    params: params.clone(),
+                },
+                ret,
+                args: values,
+                arg_tys: params,
+                span,
+            });
+        }
         if key == "tcpserveasync" || key == "httpserveasync" {
             let http = key == "httpserveasync";
             if !ctx.is_async || !(5..=7).contains(&args.len()) || !type_args.is_empty() {
@@ -5207,6 +5466,202 @@ impl Analyzer {
                 ret: Ty::Task(Box::new(Ty::String)),
                 args: values,
                 arg_tys: params,
+                span,
+            });
+        }
+        if [
+            "taskresultasync",
+            "resultvalueasync",
+            "resultok",
+            "resulterror",
+            "resultstatus",
+        ]
+        .contains(&key.as_str())
+        {
+            if args.len() != 1 || !type_args.is_empty() || (!ctx.is_async && key.ends_with("async"))
+            {
+                self.diags.emit(Diagnostic::error("task result operations require one operand; async operations require an async context").with_code("E0300").with_span(span));
+                return None;
+            }
+            let value = self.infer(&args[0], ctx)?;
+            let input = value.ty();
+            let (runtime, ret) = match (&*key, &input) {
+                ("taskresultasync", Ty::Task(result)) => (
+                    "pxr_async_result_task",
+                    Ty::Task(Box::new(Ty::TaskResult(result.clone()))),
+                ),
+                ("resultvalueasync", Ty::TaskResult(result)) => {
+                    ("pxr_async_result_value_task", Ty::Task(result.clone()))
+                }
+                ("resultok", Ty::TaskResult(_)) => ("pxr_async_result_ok", Ty::Bool),
+                ("resulterror", Ty::TaskResult(_)) => ("pxr_async_result_error", Ty::Int),
+                ("resultstatus", Ty::TaskResult(_)) => ("pxr_async_result_status", Ty::Int),
+                _ => {
+                    return self.builtin_ty_err(
+                        callee,
+                        "a task or TaskResult operand",
+                        &input,
+                        span,
+                    );
+                }
+            };
+            return Some(TExpr::Call {
+                callee: Callee::User {
+                    mangled: runtime.into(),
+                    name: callee.into(),
+                    params: vec![input.clone()],
+                },
+                ret,
+                args: vec![value],
+                arg_tys: vec![input],
+                span,
+            });
+        }
+        if [
+            "tcpconnectasync",
+            "tcplistenasync",
+            "tcpacceptasync",
+            "tcpreadasync",
+            "tcpwriteasync",
+            "closesocket",
+            "tcpshutdownwrite",
+        ]
+        .contains(&key.as_str())
+        {
+            let stream = Ty::Named("TcpStream".into());
+            let listener = Ty::Named("TcpListener".into());
+            let (params, minimum, ret, runtime, class_name) = match key.as_str() {
+                "tcpconnectasync" => (
+                    vec![Ty::String, Ty::Int, Ty::Int],
+                    2,
+                    Ty::Task(Box::new(stream.clone())),
+                    "pxr_async_stream_connect",
+                    Some("tcpstream"),
+                ),
+                "tcplistenasync" => (
+                    vec![Ty::String, Ty::Int, Ty::Int],
+                    2,
+                    Ty::Task(Box::new(listener.clone())),
+                    "pxr_async_stream_listen",
+                    Some("tcplistener"),
+                ),
+                "tcpacceptasync" => (
+                    vec![listener, Ty::Int],
+                    1,
+                    Ty::Task(Box::new(stream.clone())),
+                    "pxr_async_stream_accept",
+                    Some("tcpstream"),
+                ),
+                "tcpreadasync" => (
+                    vec![stream, Ty::Int, Ty::Int],
+                    2,
+                    Ty::Task(Box::new(Ty::String)),
+                    "pxr_async_stream_read",
+                    None,
+                ),
+                "tcpwriteasync" => (
+                    vec![stream, Ty::String, Ty::Int],
+                    2,
+                    Ty::Task(Box::new(Ty::Int)),
+                    "pxr_async_stream_write",
+                    None,
+                ),
+                "tcpshutdownwrite" => {
+                    (vec![stream], 1, Ty::Void, "pxr_socket_shutdown_write", None)
+                }
+                _ => {
+                    if args.len() != 1 || !type_args.is_empty() {
+                        self.diags.emit(
+                            Diagnostic::error("closeSocket requires one owned socket")
+                                .with_code("E0300")
+                                .with_span(span),
+                        );
+                        return None;
+                    }
+                    let value = self.infer(&args[0], ctx)?;
+                    let ty = value.ty();
+                    if args.len() != 1
+                        || !type_args.is_empty()
+                        || !matches!(&ty, Ty::Named(n) if n == "TcpStream" || n == "TcpListener")
+                    {
+                        self.diags.emit(
+                            Diagnostic::error("closeSocket requires an owned native socket")
+                                .with_code("E0300")
+                                .with_span(span),
+                        );
+                        return None;
+                    }
+                    return Some(TExpr::Call {
+                        callee: Callee::User {
+                            mangled: "pxr_socket_close".into(),
+                            name: callee.into(),
+                            params: vec![ty.clone()],
+                        },
+                        ret: Ty::Void,
+                        args: vec![value],
+                        arg_tys: vec![ty],
+                        span,
+                    });
+                }
+            };
+            if (key.ends_with("async") && !ctx.is_async)
+                || !(minimum..=params.len()).contains(&args.len())
+                || !type_args.is_empty()
+            {
+                self.diags.emit(
+                    Diagnostic::error(
+                        "socket operations require an async context and their declared operands",
+                    )
+                    .with_code("E0300")
+                    .with_span(span),
+                );
+                return None;
+            }
+            let mut values = Vec::new();
+            for (argument, expected) in args.iter().zip(&params) {
+                let value = self.infer(argument, ctx)?;
+                if value.ty() != *expected {
+                    return self.builtin_ty_err(
+                        callee,
+                        "the declared socket operand types",
+                        &value.ty(),
+                        span,
+                    );
+                }
+                values.push(value);
+            }
+            if values.len() < params.len() {
+                values.push(TExpr::Int(if key == "tcplistenasync" { 64 } else { 30000 }));
+            }
+            let mut abi = params;
+            if let Some(class_name) = class_name {
+                values.push(TExpr::Int(self.classes[class_name].class_id as i64));
+                abi.push(Ty::Int);
+            }
+            return Some(TExpr::Call {
+                callee: Callee::User {
+                    mangled: runtime.into(),
+                    name: callee.into(),
+                    params: abi.clone(),
+                },
+                ret,
+                args: values,
+                arg_tys: abi,
+                span,
+            });
+        }
+        if key == "$pxr_value_drop" && args.len() == 1 {
+            let value = self.infer(&args[0], ctx)?;
+            let ty = value.ty();
+            return Some(TExpr::Call {
+                callee: Callee::User {
+                    mangled: key.clone(),
+                    name: key.clone(),
+                    params: vec![ty.clone()],
+                },
+                ret: Ty::Void,
+                args: vec![value],
+                arg_tys: vec![ty],
                 span,
             });
         }
@@ -5472,7 +5927,10 @@ impl Analyzer {
             targs.push(self.infer(a, ctx)?);
         }
         let atys: Vec<Ty> = targs.iter().map(|t| t.ty()).collect();
-        if let Some(task) = atys.iter().find(|t| matches!(t, Ty::Task(_))) {
+        if let Some(task) = atys
+            .iter()
+            .find(|t| matches!(t, Ty::Task(_) | Ty::TaskResult(_)))
+        {
             return self.builtin_ty_err(
                 name,
                 "an ordinary value rather than a task handle",
@@ -6270,5 +6728,13 @@ fn invalidate_writes(statements: &[ast::Stmt], ctx: &mut FnCtx) {
             }
             _ => {}
         }
+    }
+}
+
+fn send_value_type(ty: &Ty) -> bool {
+    match ty {
+        Ty::Null | Ty::Bool | Ty::Int | Ty::Float | Ty::String | Ty::Mixed => true,
+        Ty::Array(t) => send_value_type(t),
+        _ => false,
     }
 }

@@ -64,21 +64,24 @@ trustworthy standard library (M2). The early milestones exist so the compiler is
 
 ## Async sequencing
 
-M7.1 is in progress. Free `async function` declarations with explicit results,
-`await`, `spawn`, affine task locals, nonblocking timers and global async main
-now compile to resumable native frames. M5 generics and M6 ownership/reclamation
-remain foundations; the async compiler extends borrow checks and precise roots
-to captures and suspension. [`ASYNC.md`](ASYNC.md) records runnable syntax and
-current rejected forms. Owned TCP exchanges, bounded native TCP servers with
-concurrent async handlers, and consuming `cancelTask` are delivered. Streaming
-socket resources, recoverable errors and threading remain pending. Async methods,
-return inference and explicit owned task results are implemented. See [`ASYNC_IO.md`](ASYNC_IO.md) and
-[`ASYNC_SERVER.md`](ASYNC_SERVER.md). The [HTTP adapter](HTTP.md) now adds bounded
-request framing, isolated PHP-style query/form/cookie/server globals, buffered
-output and header/status helpers. Request/response objects, routing classes,
-uploads, sessions and full web SAPI compatibility remain pending.
-The executor uses one thread; ordinary blocking calls still block it.
-Threaded parallelism remains M7.2.
+M7.1 and M7.2 are delivered. Async functions/methods, generic specialization,
+inferred and owned results, affine task handles, await/spawn, timers and async
+main lower to resumable native frames. M6 ownership and precise reclamation cover
+captures, suspension, resource transfer and child joins. Owned TCP exchanges and
+streams, bounded TCP/HTTP servers, graceful shutdown, PHP-style request globals
+and TaskResult error recovery use the same executor. See [ASYNC.md](ASYNC.md),
+[ASYNC_IO.md](ASYNC_IO.md), [ASYNC_SERVER.md](ASYNC_SERVER.md) and [HTTP.md](HTTP.md).
+
+Explicit OS-thread workers have separate heaps, GC, statics and executors.
+Ownership-derived Send checks and bounded serialized channels govern transfer;
+ordinary async tasks remain on their creating thread. Cancellation joins worker
+cleanup before parent completion. [PARALLEL.md](PARALLEL.md) records syntax,
+limits and the restriction against combining workers with dynamic PHP interop.
+Request/response objects, routing classes, streaming HTTP, uploads, sessions and
+full web SAPI compatibility remain further extensions. Ordinary blocking calls
+still block their executor; CPU parallelism is explicit.
+
+**Next:** M8 — C interoperability: extern declarations, native linking and exports.
 
 ## Non‑goals (for now)
 

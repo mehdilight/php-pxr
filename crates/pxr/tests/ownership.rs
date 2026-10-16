@@ -55,7 +55,7 @@ fn build(name: &str, source: &str, opt: u8) -> PathBuf {
             .arg(format!("-O{opt}"))
             .arg(output.with_extension("ll"))
             .arg(runtime)
-            .args(["-lm", "-o"])
+            .args(["-pthread", "-lm", "-o"])
             .arg(&output)
             .output()
             .unwrap();

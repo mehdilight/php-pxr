@@ -1,8 +1,8 @@
-# Async runtime foundation — M7.1 in progress
+# Structured async runtime
 
 `runtime/pxr_async.c` implements a single-thread executor tested with native,
 hand-written and compiler-generated resumable frames. The driver embeds it
-alongside `pxr_rt.c` and `pxr_http.c`, so standalone programs need no checkout or external async
+alongside `pxr_rt.c`, `pxr_http.c`, `pxr_stream.c` and `pxr_parallel.c`, so standalone programs need no checkout or external async
 library. The first compiler source slice is documented in [ASYNC.md](ASYNC.md).
 These internal C interfaces are not a public FFI or a stable generated-code ABI.
 
@@ -20,8 +20,8 @@ already completed child still yields once. A FIFO queue coalesces wakeups;
 `pxr_task_yield` reschedules the current task. No work runs in the task constructor.
 The scheduler polls I/O and timers after at most 64 ready callbacks, preventing
 a continuously yielding task from starving readiness. A callback that never
-returns still blocks the executor. Reentrant and concurrent executors are not
-supported.
+returns still blocks the executor. Reentrant executors and concurrent use of one executor are rejected. Explicit
+workers run independent thread-local executors/heaps.
 
 Timers use monotonic absolute nanosecond deadlines and an indexed minimum heap.
 Equal deadlines are ordered by task creation ID. Removing a cancelled timer is
@@ -36,8 +36,8 @@ and unsupported event masks. Readiness is a hint: the operation must retry
 `EAGAIN`/`EWOULDBLOCK`, handle partial transfers, and retry `EINTR`. Hangup/error
 readiness wakes the task so its operation can observe EOF or the actual error;
 `POLLNVAL` fails the task with `EBADF`. The initial backend rebuilds a `poll`
-array from active waits; it does not yet provide an epoll/kqueue backend,
-streaming socket handles, DNS or TLS. The first source operation,
+array from active waits; it does not yet provide an epoll/kqueue backend, DNS
+or TLS. Owned streaming socket handles use the same readiness backend. The first source operation,
 `tcpExchangeAsync`, owns one connection and is documented in
 [ASYNC_IO.md](ASYNC_IO.md). Ordinary file and legacy PHP operations remain blocking.
 
@@ -62,9 +62,10 @@ error code, and the successful tagged result. An ordinary operation or child err
 the parent for failure. The first error **observed by that executor** wins;
 errors are not sorted by child creation order, and a later cancellation cannot
 replace an error. Remaining children are cancelled and joined. A failed awaited
-child fails its parent before the parent body resumes. There is no source-level
-catch, task error object, or recovery API yet; this envelope does not introduce
-an exception model into PXR. Positive errno values are used by current I/O and
+child fails its parent before the parent body resumes. Source `taskResultAsync` installs an isolated child boundary before execution
+and returns an owned TaskResult after cleanup. `resultValueAsync` consumes it
+and either transfers its payload or propagates its error; see [ASYNC_IO.md](ASYNC_IO.md).
+This does not introduce a PHP exception model. Positive errno values are used by current I/O and
 scheduler errors. Non-interrupt poll failures fail the root and drain its tree.
 A stalled tree without a runnable task, timer or I/O wait fails with `EDEADLK`.
 Allocation failure retains the runtime's abort behavior.
@@ -74,7 +75,7 @@ still cancels/joins its descendants and runs cleanup exactly once, but completio
 does not mark its parent failed. Awaiters receive the original error envelope;
 dropped handles remain scoped/joined and capacity waiters still wake. The flag
 does not propagate to descendants and does not suppress parent cancellation or
-executor failures. It is internal, with no source-level catch/recovery syntax.
+executor failures. It is internal; source recovery is the explicit taskResultAsync wrapper.
 HTTP sets it on accepted connections and their handlers: connection errors close
 only that socket, and an awaited handler error can become a bounded 500 after join.
 
@@ -121,7 +122,8 @@ inferred task locals, async methods (including generic/virtual methods), inferre
 results and explicit owned results. Owned result qualifiers are preserved by the
 source ownership pass and await transfers the result exactly once. Borrowed
 results and borrowed async parameters/receivers remain rejected.
-OS threads, `Send`/`Sync`, shared tasks and detached tasks remain future work.
+Explicit OS-thread workers use derived Send checks and synchronized native
+channels; see [PARALLEL.md](PARALLEL.md). Shared/detached task handles remain rejected.
 
 ## Validation
 
@@ -148,8 +150,9 @@ A per-process alarm bounds scheduler regressions. The harness checks:
 `cargo test -p pxr --test async_source` additionally exercises PHP source through
 parsing, typing, ownership, IR optimization, frame lowering and native execution,
 including forced GC and optional sanitizers. Source TCP clients/servers and
-consuming cancellation now use this runtime. Broader
-resource/signature APIs and recoverable errors remain M7.1 work.
+consuming cancellation, owned streaming resources, TaskResult recovery and
+isolated workers/channels now use this runtime. The native parallel suite checks
+thread identities, TLS heaps/statics, cancellation joins and resource lifetimes.
 
 ## Generated-code bridge
 
@@ -223,3 +226,21 @@ their fail-fast policy. After
 sending, HTTP tasks shut down writes and use a bounded drain phase. An expired
 drain completes successfully, while an expired application/read/write wait still
 fails with ETIMEDOUT. [HTTP.md](HTTP.md) specifies all source/protocol boundaries.
+
+## Resource and worker ownership
+
+Each task roots an explicit native-resource list. Native objects are heap-local
+proxies for owned C control records. A generated async constructor adopts resource
+parameters, and successful task results promote a resource to the parent before
+joining cleanup. TaskResult payload traversal preserves this behavior through
+recovery wrappers. Explicit value drop, unclaimed result destruction and failed
+completion discard resource results. Pending read/write leases keep closed
+control records alive until their operations have removed waits and cleaned up.
+
+Workers serialize data into bounded malloc-owned trees without managed pointers.
+Their completion state is published atomically after loop/resource/heap cleanup;
+the parent joins only after this publication. Deferred cancellation prevents a
+parallel task from completing while its OS thread still owns data. Cancellation
+pipes participate in worker polling, including nested parallel joins. Channels
+hold serialized values under a mutex and nonblocking pipe readiness hints; there
+is no managed shared heap. [PARALLEL.md](PARALLEL.md) records the public contract.
