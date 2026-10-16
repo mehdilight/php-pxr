@@ -32,3 +32,12 @@ these references do not establish PHP compatibility or source support.
 
 See [ASYNC_RUNTIME.md](ASYNC_RUNTIME.md) for the implemented internal contract and
 [ASYNC.md](ASYNC.md) for supported source syntax and remaining work.
+
+For the TCP exchange slice, also studied `src/unix/stream.c` connect completion
+and `src/unix/tcp.c` in the pinned libuv checkout. Primary platform documentation
+was checked for [nonblocking connect and SO_ERROR](https://man7.org/linux/man-pages/man2/connect.2.html),
+[send flags and SIGPIPE](https://man7.org/linux/man-pages/man2/send.2.html), and
+[Apple socket options](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/setsockopt.2.html).
+The PXR operation uses the platform's MSG_NOSIGNAL or SO_NOSIGPIPE facility; it
+does not install a process-wide signal handler. The implementation remains
+original and adds no upstream build dependency.

@@ -1,11 +1,12 @@
 # Async/await — M7.1 in progress
 
 **Implemented first source slice:** free async functions with explicit result
-types, inferred affine task handles, `await`, `spawn`, nonblocking timers and an
+types, inferred affine task handles, `await`, `spawn`, nonblocking timers,
+owned TCP exchanges, consuming cancellation and an
 async CLI entry point. Programs compile to native resumable frames and run
 without PHP. This syntax is a PXR language extension and cannot run in PHP.
-M7.1 remains incomplete: public socket operations and source cancellation/error
-APIs are still pending. See [MILESTONES.md](MILESTONES.md), the internal
+M7.1 remains incomplete: streaming/resource APIs, recoverable errors and broader
+async function/task signatures remain pending. See [MILESTONES.md](MILESTONES.md), the internal
 [runtime contract](ASYNC_RUNTIME.md) and [primary references](ASYNC_REFERENCES.md).
 
 ## Runnable syntax
@@ -49,6 +50,11 @@ as a PXR intrinsic, including in namespaces; `async`, `await` and `spawn` are
 case-insensitive reserved keywords. Await/spawn bind as unary expressions, so
 `await value() + 1` adds one to the completed result.
 
+`tcpExchangeAsync` adds a lazy, bounded request/response connection with numeric
+IPv4/IPv6 addresses and a whole-operation deadline. `cancelTask($handle)` consumes
+a handle and requests cancellation; parent scope exit still joins cleanup. See
+[ASYNC_IO.md](ASYNC_IO.md) for exact signatures, protocol, limits and examples.
+
 The initial executor is cooperative and single-threaded. Ordinary blocking
 functions and CPU work occupy that thread until they return or await. OS-thread
 parallelism remains M7.2 work.
@@ -78,10 +84,12 @@ checking rather than generating placeholder code.
 
 ## Ownership and lifetime
 
-Every task result has one consumer. Await, spawn, move and drop consume a task
-variable; later use fails until it is reinitialized. Consume or drop an existing
+Every task result has one consumer. Await, spawn, move, drop and cancelTask consume
+a task variable; later use fails until it is reinitialized. Consume or drop an existing
 handle before reinitializing its binding. Moving between locals in
 the same scope is supported; ordinary assignment cannot duplicate a handle.
+Selecting existing handles in a ternary/match requires explicit moves of the
+candidates; both are then treated as potentially consumed after the branch join.
 
 ```php
 $t = delayedValue(1);
@@ -92,8 +100,8 @@ echo await $joined;
 ```
 
 Call-scoped borrowed parameters cannot be captured by async functions, even if
-an immediate await would appear safe. Await/spawn also cannot cross an active
-call borrow during argument evaluation. Owned locals and explicitly moved owned
+an immediate await would appear safe. Await/spawn/cancelTask also cannot cross
+an active call borrow during argument evaluation. Owned locals and explicitly moved owned
 parameters can survive suspension; synchronous borrow calls are allowed once no
 suspension crosses their call lifetime.
 
@@ -113,13 +121,15 @@ and waits for their cleanup. A failed awaited child prevents the parent body
 from resuming. The first error observed by the executor wins. The CLI reports
 `pxr: async task failed: ...` and exits with status 255 after draining the tree.
 This currently covers errors reported through the task runtime, such as an
-invalid timer duration. Existing synchronous runtime fatal errors retain their
-process-termination behavior; they are not silently converted into task errors.
+invalid timer duration, TCP transfer failure, size limit or deadline expiration.
+Existing synchronous runtime fatal errors retain their process-termination behavior; they are not silently converted into task errors.
 
 Cancellation is cooperative. The internal runtime removes pending waits and
-cleans children before releasing a parent frame. Source-level explicit
-cancellation, recoverable task errors/catch, async cleanup, PHP `finally`, native
-destructors and public socket resources remain unimplemented. Heap reclamation
+cleans children before releasing a parent frame. Source cancellation now consumes
+handles through `cancelTask`; it does not
+synchronously await cleanup or expose a recoverable cancellation result.
+Recoverable task errors/catch, async cleanup, PHP `finally`, native destructors
+and public streaming socket resources remain unimplemented. Heap reclamation
 of captured values does not supply those resource semantics.
 
 ## Lowering and validation
@@ -139,6 +149,7 @@ forced GC, plus sanitizer builds. They cover timer progress and ordered awaits,
 implicit joins, moved handles, branch joins, control flow around suspension,
 owned captures, arrays/objects/mixed/scalar results, module/name resolution,
 bounded repeated-result retention, failure cancellation and invalid forms.
-Deterministic C executor tests additionally cover readiness/backpressure,
-descriptor cleanup and cancellation. Public socket I/O through PXR source is
-still required before the async I/O portion of M7.1 is complete.
+Native TCP tests verify concurrent progress, bounded binary transfers, IPv4/IPv6
+and cancellation through generated parent frames. Deterministic C executor tests
+additionally cover readiness/backpressure, descriptor reuse/cleanup, broken pipes
+and I/O deadlines. Streaming resources and broader lifecycle APIs remain M7 work.

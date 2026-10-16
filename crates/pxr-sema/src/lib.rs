@@ -3703,7 +3703,9 @@ impl Analyzer {
                     fallback.as_deref().unwrap_or(callee)
                 };
                 if self.php_interop
-                    && !name.eq_ignore_ascii_case("sleepasync")
+                    && !["sleepasync", "tcpexchangeasync", "canceltask"]
+                        .iter()
+                        .any(|n| name.eq_ignore_ascii_case(n))
                     && !self.is_compiled_function(&callee.to_ascii_lowercase())
                     && fallback
                         .as_ref()
@@ -4925,11 +4927,53 @@ impl Analyzer {
         ctx: &mut FnCtx,
     ) -> Option<TExpr> {
         let key = callee.to_ascii_lowercase();
-        if ["$pxr_await", "$pxr_spawn", "$pxr_task_drop", "sleepasync"].contains(&key.as_str()) {
+        if key == "tcpexchangeasync" {
+            if !ctx.is_async || !(4..=5).contains(&args.len()) || !type_args.is_empty() {
+                self.diags.emit(Diagnostic::error("tcpExchangeAsync requires an async context and (string address, int port, string request, int maxBytes, optional int timeoutMs)").with_code("E0300").with_span(span));
+                return None;
+            }
+            let params = vec![Ty::String, Ty::Int, Ty::String, Ty::Int, Ty::Int];
+            let mut values = Vec::new();
+            for (arg, expected) in args.iter().zip(&params) {
+                let value = self.infer(arg, ctx)?;
+                if value.ty() != *expected {
+                    return self.builtin_ty_err(
+                        "tcpExchangeAsync",
+                        &format!("argument of type `{expected}`"),
+                        &value.ty(),
+                        arg.span(),
+                    );
+                }
+                values.push(value);
+            }
+            if values.len() == 4 {
+                values.push(TExpr::Int(30000));
+            }
+            return Some(TExpr::Call {
+                callee: Callee::User {
+                    mangled: "pxr_async_tcp_exchange".into(),
+                    name: callee.into(),
+                    params: params.clone(),
+                },
+                ret: Ty::Task(Box::new(Ty::String)),
+                args: values,
+                arg_tys: params,
+                span,
+            });
+        }
+        if [
+            "$pxr_await",
+            "$pxr_spawn",
+            "$pxr_task_drop",
+            "sleepasync",
+            "canceltask",
+        ]
+        .contains(&key.as_str())
+        {
             if !ctx.is_async || args.len() != 1 || !type_args.is_empty() {
                 self.diags.emit(
                     Diagnostic::error(
-                        "await, spawn and sleepAsync require an async context and one operand",
+                        "task control and sleepAsync require an async context and one operand",
                     )
                     .with_code("E0300")
                     .with_span(span),
@@ -4944,7 +4988,9 @@ impl Analyzer {
                 }
                 ("pxr_async_sleep_task", Ty::Task(Box::new(Ty::Void)))
             } else if let Ty::Task(result) = &input {
-                if key == "$pxr_task_drop" {
+                if key == "canceltask" {
+                    ("pxr_async_cancel", Ty::Void)
+                } else if key == "$pxr_task_drop" {
                     ("pxr_async_drop", Ty::Void)
                 } else if key == "$pxr_await" {
                     ("$pxr_await", (**result).clone())
@@ -4953,7 +4999,7 @@ impl Analyzer {
                 }
             } else {
                 self.diags.emit(
-                    Diagnostic::error(format!("await/spawn requires a Task, found `{input}`"))
+                    Diagnostic::error(format!("task control requires a Task, found `{input}`"))
                         .with_code("E0300")
                         .with_span(span),
                 );

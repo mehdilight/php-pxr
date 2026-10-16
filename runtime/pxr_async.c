@@ -1,6 +1,6 @@
 /* PXR single-thread async runtime, appended to pxr_rt.c by the driver.
- * Internal ABI for future compiler-generated resumable frames. No PHP syntax
- * uses this yet. See docs/ASYNC_RUNTIME.md for ownership and failure rules.
+ * Internal ABI for compiler-generated resumable frames and owned operations.
+ * See docs/ASYNC_RUNTIME.md for ownership and failure rules.
  * Original implementation; upstream reading is recorded in ASYNC_REFERENCES.md.
  */
 #include <assert.h>
@@ -206,13 +206,10 @@ static void pxr_task_yield(pxr_task *task) {
     assert(task == task->loop->current && task->state == PXR_TASK_RUNNING);
     pxr_task_wake(task);
 }
-static void pxr_task_sleep(pxr_task *task, uint64_t milliseconds) {
-    assert(task == task->loop->current && task->state == PXR_TASK_RUNNING);
+static void pxr_task_timer_at(pxr_task *task, uint64_t deadline) {
+    assert(task->timer_index == SIZE_MAX);
     pxr_loop *loop = task->loop;
-    uint64_t now = loop->now(loop->clock_context);
-    task->deadline = milliseconds > (UINT64_MAX - now) / 1000000
-        ? UINT64_MAX : now + milliseconds * 1000000;
-    task->state = PXR_TASK_TIMER;
+    task->deadline = deadline;
     if (loop->timer_count == loop->timer_capacity) {
         loop->timer_capacity = pxr_grow_capacity(loop->timer_capacity, pxr_size_add(loop->timer_count, 1));
         loop->timers = pxr_async_resize(loop->timers, loop->timer_capacity, sizeof(*loop->timers));
@@ -220,6 +217,14 @@ static void pxr_task_sleep(pxr_task *task, uint64_t milliseconds) {
     size_t i = loop->timer_count++;
     loop->timers[i] = task; task->timer_index = i;
     pxr_timer_up(loop, i);
+}
+static void pxr_task_sleep(pxr_task *task, uint64_t milliseconds) {
+    assert(task == task->loop->current && task->state == PXR_TASK_RUNNING);
+    uint64_t now = task->loop->now(task->loop->clock_context);
+    uint64_t deadline = milliseconds > (UINT64_MAX - now) / 1000000
+        ? UINT64_MAX : now + milliseconds * 1000000;
+    task->state = PXR_TASK_TIMER;
+    pxr_task_timer_at(task, deadline);
 }
 static void pxr_task_finish(pxr_task *task, int64_t tag, int64_t bits) {
     assert(task == task->loop->current && task->state == PXR_TASK_RUNNING);
@@ -460,3 +465,174 @@ void pxr_async_run(void *handle) {
     }
 }
 void pxr_async_drop(void *task) { pxr_task_release(task); }
+
+/* Consume a handle without detaching its task. Parents still join cancellation
+ * cleanup; cancellation cannot overwrite an already observed task error. */
+void pxr_async_cancel(void *handle) {
+    pxr_task *task = handle;
+    assert(task->parent == task->loop->current && task->handle_live && !task->claimed);
+    pxr_task_cancel(task);
+    pxr_task_release(task);
+}
+
+/* One owned TCP connection per exchange. No descriptor crosses the language
+ * ABI. Numeric addresses keep name resolution out of the executor thread. */
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+enum { PXR_TCP_NEW, PXR_TCP_CONNECTING, PXR_TCP_SENDING, PXR_TCP_READING };
+typedef struct {
+    int fd, phase, started;
+    int64_t port, max_bytes, timeout_ms;
+    uint64_t expires;
+    pxr_str *address, *request;
+    size_t sent;
+    pxr_buf response;
+} pxr_tcp_frame;
+
+static void pxr_tcp_cleanup(pxr_task *task, void *raw) {
+    pxr_tcp_frame *frame = raw;
+    if (frame->fd >= 0) {
+        int fd = frame->fd;
+        frame->fd = -1;
+        (void)close(fd); /* Never retry close: the fd may already be released. */
+    }
+    task->roots[2] = NULL;
+    pxr_heap_free(frame->response.data);
+    frame->response.data = NULL;
+}
+static int pxr_tcp_open(pxr_tcp_frame *frame, struct sockaddr_storage *storage,
+                        socklen_t *length) {
+    if (frame->port < 1 || frame->port > 65535 || frame->max_bytes < 0 ||
+        !frame->address->len || frame->address->len >= INET6_ADDRSTRLEN ||
+        memchr(frame->address->data, 0, frame->address->len)) return EINVAL;
+    char address[INET6_ADDRSTRLEN];
+    memcpy(address, frame->address->data, frame->address->len);
+    address[frame->address->len] = 0;
+    int family;
+    struct sockaddr_in v4 = {0};
+    struct sockaddr_in6 v6 = {0};
+    if (inet_pton(AF_INET, address, &v4.sin_addr) == 1) {
+        family = AF_INET; v4.sin_family = AF_INET;
+        v4.sin_port = htons((uint16_t)frame->port);
+        *length = sizeof(v4); memcpy(storage, &v4, sizeof(v4));
+    } else if (inet_pton(AF_INET6, address, &v6.sin6_addr) == 1) {
+        family = AF_INET6; v6.sin6_family = AF_INET6;
+        v6.sin6_port = htons((uint16_t)frame->port);
+        *length = sizeof(v6); memcpy(storage, &v6, sizeof(v6));
+    } else return EINVAL;
+    frame->fd = socket(family, SOCK_STREAM, 0);
+    if (frame->fd < 0) return errno;
+    int flags = fcntl(frame->fd, F_GETFL);
+    if (flags < 0 || fcntl(frame->fd, F_SETFL, flags | O_NONBLOCK) < 0) return errno;
+    flags = fcntl(frame->fd, F_GETFD);
+    if (flags < 0 || fcntl(frame->fd, F_SETFD, flags | FD_CLOEXEC) < 0) return errno;
+#ifdef SO_NOSIGPIPE
+    int yes = 1;
+    if (setsockopt(frame->fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes)) < 0) return errno;
+#elif !defined(MSG_NOSIGNAL)
+    return ENOTSUP; /* Do not change the process-wide SIGPIPE disposition. */
+#endif
+    return 0;
+}
+static void pxr_tcp_wait(pxr_task *task, pxr_tcp_frame *frame, short events) {
+    pxr_task_wait_fd(task, frame->fd, events);
+    if (task->state == PXR_TASK_IO) pxr_task_timer_at(task, frame->expires);
+}
+static void pxr_tcp_resume(pxr_task *task, void *raw) {
+    pxr_tcp_frame *frame = raw;
+    uint64_t now = task->loop->now(task->loop->clock_context);
+    if (!frame->started) {
+        if (frame->timeout_ms < 0) { pxr_task_fail(task, EINVAL); return; }
+        frame->expires = (uint64_t)frame->timeout_ms > (UINT64_MAX - now) / 1000000
+            ? UINT64_MAX : now + (uint64_t)frame->timeout_ms * 1000000;
+        frame->started = 1;
+    }
+    if (now >= frame->expires) { pxr_task_fail(task, ETIMEDOUT); return; }
+    if (frame->phase == PXR_TCP_NEW) {
+        struct sockaddr_storage address;
+        socklen_t length;
+        int error = pxr_tcp_open(frame, &address, &length);
+        if (error) { pxr_task_fail(task, error); return; }
+        int result = connect(frame->fd, (struct sockaddr *)&address, length);
+        if (result < 0 && errno != EINPROGRESS && errno != EINTR) {
+            pxr_task_fail(task, errno); return;
+        }
+        if (result < 0) {
+            frame->phase = PXR_TCP_CONNECTING;
+            pxr_tcp_wait(task, frame, POLLOUT); return;
+        }
+        frame->phase = PXR_TCP_SENDING;
+    }
+    if (frame->phase == PXR_TCP_CONNECTING) {
+        int error = 0; socklen_t length = sizeof(error);
+        if (getsockopt(frame->fd, SOL_SOCKET, SO_ERROR, &error, &length) < 0) {
+            if (errno == EINTR) pxr_task_yield(task);
+            else pxr_task_fail(task, errno);
+            return;
+        }
+        if (error == EINPROGRESS || error == EALREADY) {
+            pxr_tcp_wait(task, frame, POLLOUT); return;
+        }
+        if (error) { pxr_task_fail(task, error); return; }
+        frame->phase = PXR_TCP_SENDING;
+    }
+    /* Bound each callback even when the peer continuously accepts/sends data. */
+    for (unsigned budget = 0; budget < 64; budget++) {
+        if (frame->phase == PXR_TCP_SENDING) {
+            if (frame->sent == frame->request->len) {
+                if (shutdown(frame->fd, SHUT_WR) < 0) {
+                    if (errno == EINTR) { pxr_task_yield(task); return; }
+                    pxr_task_fail(task, errno); return;
+                }
+                frame->phase = PXR_TCP_READING;
+                continue;
+            }
+            size_t size = frame->request->len - frame->sent;
+            if (size > 8192) size = 8192;
+            int flags = 0;
+#ifdef MSG_NOSIGNAL
+            flags = MSG_NOSIGNAL;
+#endif
+            ssize_t n = send(frame->fd, frame->request->data + frame->sent, size, flags);
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                pxr_tcp_wait(task, frame, POLLOUT); return;
+            }
+            if (n <= 0) { pxr_task_fail(task, n < 0 ? errno : EPIPE); return; }
+            frame->sent += (size_t)n;
+        } else {
+            char chunk[8192];
+            ssize_t n = recv(frame->fd, chunk, sizeof(chunk), 0);
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                pxr_tcp_wait(task, frame, POLLIN); return;
+            }
+            if (n < 0) { pxr_task_fail(task, errno); return; }
+            if (!n) {
+                pxr_str *result = pxr_str_alloc(frame->response.len);
+                if (frame->response.len) memcpy(result->data, frame->response.data, frame->response.len);
+                pxr_task_finish(task, PXR_TAG_STR, (intptr_t)result); return;
+            }
+            if ((size_t)n > (size_t)frame->max_bytes - frame->response.len) {
+                pxr_task_fail(task, EMSGSIZE); return;
+            }
+            pxr_buf_append(&frame->response, chunk, (size_t)n);
+            task->roots[2] = frame->response.data;
+        }
+    }
+    pxr_task_yield(task);
+}
+void *pxr_async_tcp_exchange(pxr_str *address, int64_t port,
+                             pxr_str *request, int64_t max_bytes, int64_t timeout_ms) {
+    assert(pxr_compiler_loop_initialized && pxr_compiler_loop.current);
+    pxr_task *task = pxr_task_new(&pxr_compiler_loop, pxr_compiler_loop.current,
+        sizeof(pxr_tcp_frame), 3, pxr_tcp_resume, pxr_tcp_cleanup);
+    pxr_tcp_frame *frame = task->frame;
+    frame->fd = -1; frame->address = address; frame->port = port;
+    frame->request = request; frame->max_bytes = max_bytes; frame->timeout_ms = timeout_ms;
+    task->roots[0] = address; task->roots[1] = request;
+    pxr_task_roots(task, 3);
+    return task;
+}

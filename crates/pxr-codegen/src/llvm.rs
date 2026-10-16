@@ -33,6 +33,12 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     ("pxr_async_sleep_task", "ptr", &["i64"]),
     ("pxr_async_run", "void", &["ptr"]),
     ("pxr_async_drop", "void", &["ptr"]),
+    ("pxr_async_cancel", "void", &["ptr"]),
+    (
+        "pxr_async_tcp_exchange",
+        "ptr",
+        &["ptr", "i64", "ptr", "i64", "i64"],
+    ),
     ("pxr_gc_enter", "void", &["ptr", "ptr"]),
     ("pxr_gc_roots", "void", &["ptr", "i64"]),
     ("pxr_gc_leave", "void", &["ptr"]),

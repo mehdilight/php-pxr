@@ -443,12 +443,112 @@ static void test_failure_order(void) {
     end_loop(&loop);
 }
 
+
+/* Exercise the actual owned TCP operation's pending write/read cleanup with
+ * small kernel buffers, then an actual nonblocking TCP connect. */
+static int tcp_mode, tcp_pair[2], tcp_closed_fd, tcp_cleanup_count;
+static int tcp_deadline_wait(struct pollfd *fds, nfds_t count, int timeout, void *context) {
+    (void)fds; assert(count == 1 && timeout == 5);
+    fake_clock *clock = context; clock->waits++; clock->now += 5000000;
+    return 0;
+}
+static void tcp_observe_cleanup(pxr_task *task, void *raw) {
+    tcp_cleanup_count++;
+    tcp_closed_fd = ((pxr_tcp_frame *)raw)->fd;
+    pxr_tcp_cleanup(task, raw);
+}
+typedef struct { int pc; pxr_task *child; } tcp_parent_frame;
+static void tcp_cancel_parent(pxr_task *task, void *raw) {
+    tcp_parent_frame *frame = raw;
+    if (!frame->pc++) {
+        pxr_str *address = pxr_str_alloc(9); memcpy(address->data, "127.0.0.1", 9);
+        pxr_str *request = pxr_str_alloc((tcp_mode == 1 || tcp_mode == 5) ? 262144 : 0);
+        memset(request->data, 'x', request->len);
+        frame->child = pxr_async_tcp_exchange(address, tcp_pair[1], request, 4096, (tcp_mode == 4 || tcp_mode == 6) ? 5 : 30000);
+        pxr_tcp_frame *io = frame->child->frame;
+        frame->child->cleanup = tcp_observe_cleanup;
+        if (tcp_mode < 2 || tcp_mode >= 5) {
+            io->fd = tcp_pair[0];
+            io->phase = (tcp_mode == 1 || tcp_mode == 5) ? PXR_TCP_SENDING : PXR_TCP_READING;
+        }
+        if (tcp_mode == 3) {
+            assert(io->fd == -1); pxr_async_cancel(frame->child);
+            pxr_task_finish(task, PXR_TAG_INT, 1); return;
+        }
+        if (tcp_mode >= 4) { pxr_task_await(task, frame->child); return; }
+        pxr_task_start(frame->child); pxr_task_sleep(task, 0); return;
+    }
+    assert(frame->child->state != PXR_TASK_COMPLETE);
+    pxr_tcp_frame *io = frame->child->frame;
+    tcp_closed_fd = io->fd; assert(tcp_closed_fd >= 0);
+    if (tcp_mode == 1) {
+        assert(io->sent > 0 && io->sent < io->request->len);
+        assert(frame->child->state == PXR_TASK_IO);
+    } else if (tcp_mode == 0) {
+        pxr_gc_collect();
+        assert(frame->child->state == PXR_TASK_IO && io->response.len == 7);
+        assert(!memcmp(io->response.data, "partial", 7));
+    }
+    pxr_async_cancel(frame->child);
+    pxr_task_finish(task, PXR_TAG_INT, 1);
+}
+static void test_tcp_cancel(void) {
+    for (tcp_mode = 0; tcp_mode < 7; tcp_mode++) {
+        int listener = -1;
+        tcp_closed_fd = -1; tcp_cleanup_count = 0;
+        if (tcp_mode < 2 || tcp_mode >= 5) {
+            assert(socketpair(AF_UNIX, SOCK_STREAM, 0, tcp_pair) == 0);
+            assert(fcntl(tcp_pair[0], F_SETFL, O_NONBLOCK) == 0);
+            int small = 4096;
+            assert(setsockopt(tcp_pair[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)) == 0);
+            if (!tcp_mode) assert(send(tcp_pair[1], "partial", 7, 0) == 7);
+            if (tcp_mode == 5) { signal(SIGPIPE, SIG_DFL); assert(close(tcp_pair[1]) == 0); }
+        } else {
+            listener = socket(AF_INET, SOCK_STREAM, 0); assert(listener >= 0);
+            struct sockaddr_in address = {0};
+            address.sin_family = AF_INET;
+            assert(inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
+            assert(bind(listener, (struct sockaddr *)&address, sizeof(address)) == 0);
+            if (tcp_mode != 4) assert(listen(listener, 4) == 0);
+            socklen_t length = sizeof(address);
+            assert(getsockname(listener, (struct sockaddr *)&address, &length) == 0);
+            tcp_pair[1] = ntohs(address.sin_port);
+        }
+        int stdin_flags = fcntl(0, F_GETFD);
+        pxr_async_create(tcp_cancel_parent, (sizeof(tcp_parent_frame) + 7) / 8);
+        fake_clock clock = {0};
+        if (tcp_mode == 6) {
+            pxr_compiler_loop.now = fake_now; pxr_compiler_loop.wait = tcp_deadline_wait;
+            pxr_compiler_loop.clock_context = &clock;
+        }
+        pxr_task_result result = pxr_loop_run(&pxr_compiler_loop);
+        assert(tcp_cleanup_count == 1);
+        if (tcp_mode >= 4) {
+            assert(result.status == PXR_TASK_ERROR);
+            if (tcp_mode == 5) assert(result.error == EPIPE);
+            else if (tcp_mode == 6) assert(result.error == ETIMEDOUT && clock.now == 5000000 && clock.waits == 1);
+            else assert(result.error == ETIMEDOUT || result.error == ECONNREFUSED);
+        } else assert(result.status == PXR_TASK_OK && result.bits == 1);
+        pxr_loop_destroy(&pxr_compiler_loop); pxr_compiler_loop_initialized = 0;
+        if (tcp_mode != 3) {
+            errno = 0; assert(fcntl(tcp_closed_fd, F_GETFD) == -1 && errno == EBADF);
+            int reused = open("/dev/null", O_RDONLY); assert(reused >= 0);
+            pxr_gc_collect(); assert(fcntl(reused, F_GETFD) >= 0);
+            assert(close(reused) == 0);
+        } else assert(fcntl(0, F_GETFD) == stdin_flags);
+        if (listener >= 0) assert(close(listener) == 0);
+        else if (tcp_mode != 5) assert(close(tcp_pair[1]) == 0);
+        pxr_gc_collect();
+        assert(!pxr_heap_blocks && !pxr_heap_bytes && !pxr_async_loops);
+    }
+}
+
 int main(void) {
     alarm(20); /* Turn a scheduler regression into a bounded test failure. */
     test_timers(); test_scope(); test_failure(); test_cancellation();
     test_wait_errors(); test_sockets(); test_deep();
     test_retention(); test_io_cleanup(); test_heap();
-    test_frame_roots(); test_failure_order();
+    test_frame_roots(); test_failure_order(); test_tcp_cancel();
     alarm(0);
     puts("async clean");
 }

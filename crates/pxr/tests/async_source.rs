@@ -280,6 +280,19 @@ async function main(): void { spawn slow(); await sleepAsync(-1); echo "bad"; }
 fn invalid_async_forms_fail_before_codegen() {
     let common = "async function value(): int { await sleepAsync(0); return 1; }\n";
     let cases = [
+        ("io-sync", "function f(): void { tcpExchangeAsync(\"127.0.0.1\", 80, \"\", 10); }".to_string()),
+        ("io-arity", "async function main(): void { await tcpExchangeAsync(\"127.0.0.1\", 80, \"\"); }".to_string()),
+        ("io-type", "async function main(): void { await tcpExchangeAsync(1, 80, \"\", 10); }".to_string()),
+        ("io-timeout-type", "async function main(): void { await tcpExchangeAsync(\"127.0.0.1\", 80, \"\", 10, \"bad\"); }".to_string()),
+        ("await-borrowed-selection", "async function main(): void { $a = value(); $b = value(); await (true ? $a : $b); await $a; }".to_string()),
+        ("spawn-borrowed-selection", "async function main(): void { $a = value(); $b = value(); spawn (true ? $a : $b); }".to_string()),
+        ("cancel-borrowed-selection", "async function main(): void { $a = value(); $b = value(); cancelTask(true ? $a : $b); await $a; }".to_string()),
+        ("cancel-reuse", "async function main(): void { $t = value(); cancelTask($t); await $t; }".to_string()),
+        ("cancel-twice", "async function main(): void { $t = value(); cancelTask($t); cancelTask($t); }".to_string()),
+        ("cancel-value", "async function main(): void { cancelTask(1); }".to_string()),
+        ("cancel-outside", "cancelTask(value());".to_string()),
+        ("reserve-io", "function tcpExchangeAsync(): void {}".to_string()),
+        ("reserve-cancel", "function cancelTask(): void {}".to_string()),
         ("outside", "await value();".to_string()),
         ("sync-call", "function f(): void { value(); }".to_string()),
         ("entry-params", "async function main(int $x): void {}".to_string()),
@@ -383,4 +396,267 @@ fn async_functions_resolve_across_native_modules_and_namespaces() {
     assert_eq!(out.stdout, b"42\n");
     assert!(out.stderr.is_empty());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn accept_tcp(listener: &std::net::TcpListener) -> std::net::TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                return stream;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            Err(error) => panic!("TCP fixture accept: {error}"),
+        }
+    }
+}
+#[test]
+fn tcp_exchange_preserves_binary_payloads_and_makes_concurrent_progress() {
+    use std::io::{Read, Write};
+    if !have_cc() {
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        for _ in 0..4 {
+            let mut slow = None;
+            let mut fast = None;
+            for _ in 0..2 {
+                let mut stream = accept_tcp(&listener);
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                if request == b"fast\0request" {
+                    fast = Some(stream);
+                } else {
+                    assert_eq!(request.len(), 1048576);
+                    assert!(request.iter().all(|b| *b == b's'));
+                    slow = Some(stream);
+                }
+            }
+            let mut fast = fast.unwrap();
+            fast.write_all(b"f\0ast").unwrap();
+            drop(fast);
+            // The source must finish its fast await before it can open this gate.
+            // A blocking read on the slow exchange would deadlock this protocol.
+            let mut gate = accept_tcp(&listener);
+            let mut request = Vec::new();
+            gate.read_to_end(&mut request).unwrap();
+            assert_eq!(request, b"release");
+            let mut slow = slow.unwrap();
+            slow.write_all(b"slow").unwrap();
+            drop(slow);
+            gate.write_all(b"gate").unwrap();
+        }
+    });
+    let source = format!(
+        r#"<?php
+async function main(): void {{
+    $unused = tcpExchangeAsync("invalid address", 0, "", -1); drop($unused);
+    $slow = spawn tcpExchangeAsync("127.0.0.1", {port}, str_repeat("s", 1048576), 4);
+    $fast = spawn tcpExchangeAsync("127.0.0.1", {port}, "fast\0request", 5);
+    echo await $fast, ":";
+    $gate = spawn tcpExchangeAsync("127.0.0.1", {port}, "release", 4);
+    echo await $slow, ":", await $gate, "\n";
+}}
+"#
+    );
+    run_case("tcp-concurrent", &source, "f\0ast:slow:gate\n");
+    server.join().unwrap();
+}
+#[test]
+fn tcp_exchange_handles_ipv4_ipv6_and_empty_eof() {
+    use std::io::Read;
+    if !have_cc() {
+        return;
+    }
+    for address in ["127.0.0.1", "::1"] {
+        let listener = std::net::TcpListener::bind((address, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let mut stream = accept_tcp(&listener);
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                assert!(request.is_empty());
+                // Dropping sends EOF, including an empty response with maxBytes=0.
+            }
+        });
+        let source = format!("<?php async function main(): void {{ echo strlen(await tcpExchangeAsync(\"{address}\", {port}, \"\", 0)), \"\\n\"; }}");
+        run_case(
+            if address == "::1" { "tcp-v6" } else { "tcp-v4" },
+            &source,
+            "0\n",
+        );
+        server.join().unwrap();
+    }
+}
+#[test]
+fn tcp_exchange_rejects_oversized_responses_and_invalid_addresses() {
+    use std::io::{Read, Write};
+    if !have_cc() {
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        for _ in 0..4 {
+            let mut stream = accept_tcp(&listener);
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            // First receive can fill an 8192-byte private buffer; the extra byte
+            // must fail the whole task, release that buffer, and close its fd.
+            let _ = stream.write_all(&vec![b'x'; 8193]);
+        }
+    });
+    for opt in [0, 3] {
+        let source = format!("<?php async function main(): void {{ echo await tcpExchangeAsync(\"127.0.0.1\", {port}, \"\", 8192); }}");
+        let executable = build("tcp-overflow", &source, opt);
+        for stress in [false, true] {
+            let mut command = Command::new(&executable);
+            if stress {
+                command.env("PXR_GC_STRESS", "1");
+            }
+            let out = execute(&mut command);
+            assert_eq!(out.status.code(), Some(255));
+            assert!(out.stdout.is_empty());
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.starts_with("pxr: async task failed:"), "{stderr}");
+            assert!(
+                !stderr.contains("Sanitizer") && !stderr.contains("runtime error:"),
+                "{stderr}"
+            );
+        }
+        std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+    }
+    server.join().unwrap();
+    for timeout in [0, -1] {
+        let source = format!("<?php async function main(): void {{ await tcpExchangeAsync(\"127.0.0.1\", 1, \"\", 1, {timeout}); }}");
+        let executable = build(
+            if timeout == 0 {
+                "deadline-zero"
+            } else {
+                "deadline-negative"
+            },
+            &source,
+            0,
+        );
+        let out = execute(Command::new(&executable).env("PXR_GC_STRESS", "1"));
+        assert_eq!(out.status.code(), Some(255));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.starts_with("pxr: async task failed:"), "{stderr}");
+        assert!(
+            !stderr.contains("Sanitizer") && !stderr.contains("runtime error:"),
+            "{stderr}"
+        );
+        std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+    }
+    for (name, address, port, limit) in [
+        ("hostname", "localhost", 80, 10),
+        ("nul-host", "127.0.0.1\\0bad", 80, 10),
+        ("port-zero", "127.0.0.1", 0, 10),
+        ("port-overflow", "127.0.0.1", 65536, 10),
+        ("negative-limit", "127.0.0.1", 80, -1),
+    ] {
+        for opt in [0, 3] {
+            let source = format!("<?php async function main(): void {{ await tcpExchangeAsync(\"{address}\", {port}, \"\", {limit}); }}");
+            let executable = build(name, &source, opt);
+            let out = execute(Command::new(&executable).env("PXR_GC_STRESS", "1"));
+            assert_eq!(out.status.code(), Some(255), "{name}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.starts_with("pxr: async task failed:"),
+                "{name}: {stderr}"
+            );
+            assert!(
+                !stderr.contains("Sanitizer") && !stderr.contains("runtime error:"),
+                "{name}: {stderr}"
+            );
+            std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+        }
+    }
+}
+#[test]
+fn cancel_task_consumes_lazy_and_started_handles_without_detaching() {
+    run_case(
+        "cancel",
+        r#"<?php
+async function slow(): void { echo "started:"; await sleepAsync(10000000); echo "bad"; }
+async function main(): void {
+    $lazy = slow(); cancelTask($lazy);
+    cancelTask(slow());
+    $running = spawn slow(); await sleepAsync(0); cancelTask($running);
+    $a = sleepAsync(0); $b = sleepAsync(0);
+    await (true ? move($a) : move($b));
+    echo "cancelled\n";
+}
+"#,
+        "started:cancelled\n",
+    );
+}
+
+#[test]
+fn cancelling_tcp_waits_finishes_the_scope_before_the_server_closes() {
+    use std::io::{Read, Write};
+    if !have_cc() {
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (done, finished) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let mut hold = None;
+            let mut gate = None;
+            for _ in 0..2 {
+                let mut stream = accept_tcp(&listener);
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                match request.as_slice() {
+                    b"hold" => hold = Some(stream),
+                    b"gate" => gate = Some(stream),
+                    other => panic!("unexpected gate protocol: {other:?}"),
+                }
+            }
+            let mut gate = gate.unwrap();
+            gate.write_all(b"ready").unwrap();
+            drop(gate);
+            held.push(hold.unwrap()); // Keep response streams open until every client exits.
+        }
+        finished.recv_timeout(Duration::from_secs(15)).unwrap();
+        drop(held);
+    });
+    let source = format!(
+        r#"<?php
+async function pending(): void {{
+    await tcpExchangeAsync("127.0.0.1", {port}, "hold", 100, 10000);
+    echo "bad";
+}}
+async function main(): void {{
+    $pending = spawn pending();
+    echo await tcpExchangeAsync("127.0.0.1", {port}, "gate", 5), ":";
+    cancelTask($pending);
+    echo "cancelled\n";
+}}
+"#
+    );
+    run_case("cancel-tcp", &source, "ready:cancelled\n");
+    done.send(()).unwrap();
+    server.join().unwrap();
 }

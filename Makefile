@@ -10,6 +10,7 @@
 CARGO ?= cargo
 PXR   := ./target/release/pxr
 EXAMPLES := $(wildcard examples/*.php) examples/migration/main.php examples/async/main.php
+CHECK_EXAMPLES := $(EXAMPLES) examples/async/tcp.php
 
 .PHONY: all build release test check examples bench fmt clean
 
@@ -25,7 +26,7 @@ test:
 	$(CARGO) test
 
 check: build
-	@for f in $(EXAMPLES); do \
+	@for f in $(CHECK_EXAMPLES); do \
 		echo "checking $$f"; \
 		./target/debug/pxr check $$f || exit 1; \
 	done

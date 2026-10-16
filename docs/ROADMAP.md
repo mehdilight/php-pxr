@@ -69,8 +69,9 @@ M7.1 is in progress. Free `async function` declarations with explicit results,
 now compile to resumable native frames. M5 generics and M6 ownership/reclamation
 remain foundations; the async compiler extends borrow checks and precise roots
 to captures and suspension. [`ASYNC.md`](ASYNC.md) records runnable syntax and
-current rejected forms. Public socket operations, source cancellation/error
-APIs, async methods/generics and broader task signatures remain pending.
+current rejected forms. Owned TCP exchanges and consuming `cancelTask` are delivered; streaming socket
+resources, recoverable errors, async methods/generics and broader task signatures
+remain pending. See [`ASYNC_IO.md`](ASYNC_IO.md).
 The executor uses one thread; ordinary blocking calls still block it.
 Threaded parallelism remains M7.2.
 

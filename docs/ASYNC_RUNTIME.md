@@ -36,9 +36,10 @@ and unsupported event masks. Readiness is a hint: the operation must retry
 `EAGAIN`/`EWOULDBLOCK`, handle partial transfers, and retry `EINTR`. Hangup/error
 readiness wakes the task so its operation can observe EOF or the actual error;
 `POLLNVAL` fails the task with `EBADF`. The initial backend rebuilds a `poll`
-array from active waits; it does not yet provide an epoll/kqueue backend or
-public socket/connect/DNS/TLS APIs. Ordinary file and legacy PHP operations
-remain blocking.
+array from active waits; it does not yet provide an epoll/kqueue backend,
+streaming socket handles, DNS or TLS. The first source operation,
+`tcpExchangeAsync`, owns one connection and is documented in
+[ASYNC_IO.md](ASYNC_IO.md). Ordinary file and legacy PHP operations remain blocking.
 
 ## Scope, results and errors
 
@@ -131,8 +132,8 @@ A per-process alarm bounds scheduler regressions. The harness checks:
 
 `cargo test -p pxr --test async_source` additionally exercises PHP source through
 parsing, typing, ownership, IR optimization, frame lowering and native execution,
-including forced GC and optional sanitizers. Public source socket operations and
-cancellation/error APIs remain required before M7.1 completes.
+including forced GC and optional sanitizers. Source TCP exchanges and consuming cancellation now use this runtime. Broader
+resource/signature APIs and recoverable errors remain M7.1 work.
 
 ## Generated-code bridge
 
@@ -148,7 +149,14 @@ cell/root helpers. Ordinary generated safepoints still protect the calls.
 `pxr_async_take` exactly once. `pxr_async_finish` records a result and begins the
 structured join. `pxr_async_spawn` starts a lazy child, while `pxr_async_drop`
 releases a handle without detaching started work. `pxr_async_run` drives the CLI
-root and drains errors before closing the executor. The compiler currently emits
-no source operation for explicitly cancelling an awaited child; the bridge's
-successful take assumes the parent was not cancelled or failed, since those
-paths do not resume its body. These symbols are internal, not public FFI APIs.
+root and drains errors before closing the executor. `pxr_async_cancel` consumes an unclaimed lazy/spawned handle and requests
+cancellation. The source checker disallows later awaits of that handle; the
+bridge's successful take assumes the parent was not cancelled or failed, since
+those paths do not resume its body. These symbols are internal, not public FFI APIs.
+
+The TCP operation roots its address, request and private response buffer and owns
+its descriptor until cleanup. Pending I/O can also have an indexed deadline
+timer. Waking for readiness, deadline, error or cancellation removes that timer;
+the next I/O wait rearms the same absolute deadline. Cleanup runs after the wait
+is removed, closes once, and clears/releases the private buffer. No descriptors
+cross the generated value ABI.

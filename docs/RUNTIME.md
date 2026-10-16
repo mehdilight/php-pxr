@@ -358,6 +358,7 @@ runtime and the generated native executable.
 The embedded runtime also includes an internal structured executor with heap
 frames, timers, POSIX readiness waits and precise task roots. Free async
 functions, affine task locals, timers and an async entry now compile to generated
-resumable frames; public source socket/cancellation APIs remain pending. See [`ASYNC_RUNTIME.md`](ASYNC_RUNTIME.md) for lifecycle, result, error,
+resumable frames. Owned TCP exchange tasks and consuming cancellation are
+available; streaming socket/resource and recoverable error APIs remain pending. See [`ASYNC_RUNTIME.md`](ASYNC_RUNTIME.md) for lifecycle, result, error,
 cancellation and descriptor ownership rules. Existing synchronous programs do
 not start an executor.

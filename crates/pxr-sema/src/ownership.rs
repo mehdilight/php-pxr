@@ -129,7 +129,14 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
     for s in &program.items {
         match s {
             Stmt::FnDecl(f) => {
-                if ["move", "drop", "sleepasync"].contains(
+                if [
+                    "move",
+                    "drop",
+                    "sleepasync",
+                    "tcpexchangeasync",
+                    "canceltask",
+                ]
+                .contains(
                     &f.name
                         .rsplit('\\')
                         .next()
@@ -137,7 +144,10 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
                         .to_ascii_lowercase()
                         .as_str(),
                 ) {
-                    c.error(f.name_span, "move/drop/sleepAsync are reserved intrinsics");
+                    c.error(
+                        f.name_span,
+                        "move/drop/sleepAsync/tcpExchangeAsync/cancelTask are reserved intrinsics",
+                    );
                 }
                 c.signatures.insert(
                     f.name.to_ascii_lowercase(),
@@ -1310,12 +1320,22 @@ impl Checker {
             Expr::Var(n, sp) => self.read(n, *sp),
             Expr::Paren(e, _) => self.expr(e),
             Expr::Call {
-                callee, args, span, ..
-            } if callee == "$pxr_await" || callee == "$pxr_spawn" => {
+                callee,
+                fallback,
+                args,
+                span,
+                ..
+            } if callee == "$pxr_await"
+                || callee == "$pxr_spawn"
+                || callee.eq_ignore_ascii_case("canceltask")
+                || fallback
+                    .as_ref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("canceltask")) =>
+            {
                 if !self.loans.is_empty() {
                     self.error(
                         *span,
-                        "await/spawn cannot cross an active call-scoped borrow",
+                        "await/spawn/cancelTask cannot cross an active call-scoped borrow",
                     );
                 }
                 let Some(arg) = args.first() else {
@@ -1329,11 +1349,20 @@ impl Checker {
                 let Some(result) = task_result(value.ty.as_ref()).cloned() else {
                     self.error(
                         *span,
-                        "await/spawn requires a task with a known local lifetime",
+                        "task control requires a task with a known local lifetime",
                     );
                     return Value::plain(None);
                 };
-                if callee == "$pxr_spawn" {
+                if value.mode != Mode::Transfer {
+                    self.error(*span, "task control requires a fresh task expression or an explicit move of a handle selected by an expression");
+                }
+                if callee.eq_ignore_ascii_case("canceltask")
+                    || fallback
+                        .as_ref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case("canceltask"))
+                {
+                    Value::plain(Some(TypeRef::Void))
+                } else if callee == "$pxr_spawn" {
                     if matches!(value.ty, Some(TypeRef::Applied(ref name, _, _)) if name != TASK) {
                         self.error(*span, "spawn requires an unstarted task; a spawned or conditionally started handle cannot be spawned again");
                     }
@@ -1432,11 +1461,19 @@ impl Checker {
                     .cloned()
                     .map(|s| specialize_signature(s, type_args));
                 let name = fallback.as_deref().unwrap_or(callee).to_ascii_lowercase();
-                if name == "sleepasync" && sig.is_none() {
+                if ["sleepasync", "tcpexchangeasync"].contains(&name.as_str()) && sig.is_none() {
                     self.arguments(args, None, false, *span, false);
                     return Value {
                         mode: Mode::Transfer,
-                        ty: Some(task_type(TypeRef::Void, *span, false)),
+                        ty: Some(task_type(
+                            if name == "sleepasync" {
+                                TypeRef::Void
+                            } else {
+                                TypeRef::String
+                            },
+                            *span,
+                            false,
+                        )),
                         fresh: false,
                         origins: BTreeSet::new(),
                     };

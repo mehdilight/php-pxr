@@ -778,9 +778,18 @@ live-root bitmaps, including packed pointer intermediates. Results/locals suppor
 scalars, strings, arrays, shared objects and mixed; native module/name resolution
 and ordinary control flow work around awaits. See `examples/async/main.php`.
 
-**Remaining:** public source socket operations/resources, source cancellation and
-recoverable error APIs, broader task/result ownership signatures, generic async
-functions, async methods and async return inference. Unsupported source forms
+**Delivered I/O slice:** `tcpExchangeAsync` owns a nonblocking numeric IPv4/IPv6
+connection, sends a binary request, half-closes writes, and reads a bounded
+response to EOF. Its optional deadline covers the entire started operation.
+`cancelTask` consumes a handle and requests structured cancellation. Native source
+tests prove progress through protocol gates and cancellation through generated
+frames while the peer holds its response open. C tests verify pending read/write/
+connect cleanup, descriptor reuse, broken pipes and fake-clock I/O deadlines.
+See [`ASYNC_IO.md`](ASYNC_IO.md).
+
+**Remaining:** streaming socket/resource APIs, recoverable error APIs, broader
+task/result ownership signatures, generic async functions, async methods and
+async return inference. Unsupported source forms
 receive diagnostics. The current runtime error envelope does not implement PHP
 exceptions or finally/destructors. Threading remains M7.2.
 
@@ -788,7 +797,7 @@ exceptions or finally/destructors. Threading remains M7.2.
 AddressSanitizer/UndefinedBehaviorSanitizer. They cover scheduling progress,
 ordered awaits, affine handles, joins/cleanup, control-flow suspension, captured
 values, module resolution, failure propagation, bounded memory and invalid forms.
-All 211 workspace tests, async/heap/ownership sanitizer checks, example checks
+All 216 workspace tests, async/heap/ownership sanitizer checks, example checks
 and the release build pass.
 M7.1 and M7 remain incomplete until the remaining I/O/lifecycle APIs and their
 source acceptance checks are delivered.
