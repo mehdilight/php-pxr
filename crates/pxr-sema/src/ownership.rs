@@ -134,6 +134,7 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
                     "drop",
                     "sleepasync",
                     "tcpexchangeasync",
+                    "tcpserveasync",
                     "canceltask",
                 ]
                 .contains(
@@ -146,7 +147,7 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
                 ) {
                     c.error(
                         f.name_span,
-                        "move/drop/sleepAsync/tcpExchangeAsync/cancelTask are reserved intrinsics",
+                        "move/drop/sleepAsync/tcpExchangeAsync/tcpServeAsync/cancelTask are reserved intrinsics",
                     );
                 }
                 c.signatures.insert(
@@ -1461,12 +1462,14 @@ impl Checker {
                     .cloned()
                     .map(|s| specialize_signature(s, type_args));
                 let name = fallback.as_deref().unwrap_or(callee).to_ascii_lowercase();
-                if ["sleepasync", "tcpexchangeasync"].contains(&name.as_str()) && sig.is_none() {
+                if ["sleepasync", "tcpexchangeasync", "tcpserveasync"].contains(&name.as_str())
+                    && sig.is_none()
+                {
                     self.arguments(args, None, false, *span, false);
                     return Value {
                         mode: Mode::Transfer,
                         ty: Some(task_type(
-                            if name == "sleepasync" {
+                            if name != "tcpexchangeasync" {
                                 TypeRef::Void
                             } else {
                                 TypeRef::String

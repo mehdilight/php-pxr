@@ -2,7 +2,7 @@
 
 **Implemented first source slice:** free async functions with explicit result
 types, inferred affine task handles, `await`, `spawn`, nonblocking timers,
-owned TCP exchanges, consuming cancellation and an
+owned TCP exchanges, bounded native TCP servers, consuming cancellation and an
 async CLI entry point. Programs compile to native resumable frames and run
 without PHP. This syntax is a PXR language extension and cannot run in PHP.
 M7.1 remains incomplete: streaming/resource APIs, recoverable errors and broader
@@ -54,6 +54,9 @@ case-insensitive reserved keywords. Await/spawn bind as unary expressions, so
 IPv4/IPv6 addresses and a whole-operation deadline. `cancelTask($handle)` consumes
 a handle and requests cancellation; parent scope exit still joins cleanup. See
 [ASYNC_IO.md](ASYNC_IO.md) for exact signatures, protocol, limits and examples.
+`tcpServeAsync` adds listening/acceptance and concurrent, bounded async string
+handlers using matching EOF framing; see [ASYNC_SERVER.md](ASYNC_SERVER.md) and
+`examples/async/server.php`. HTTP and request superglobals remain unimplemented.
 
 The initial executor is cooperative and single-threaded. Ordinary blocking
 functions and CPU work occupy that thread until they return or await. OS-thread
@@ -149,7 +152,7 @@ forced GC, plus sanitizer builds. They cover timer progress and ordered awaits,
 implicit joins, moved handles, branch joins, control flow around suspension,
 owned captures, arrays/objects/mixed/scalar results, module/name resolution,
 bounded repeated-result retention, failure cancellation and invalid forms.
-Native TCP tests verify concurrent progress, bounded binary transfers, IPv4/IPv6
-and cancellation through generated parent frames. Deterministic C executor tests
+Native TCP client/server tests verify concurrent progress, bounded binary transfers,
+IPv4/IPv6, handler limits/deadlines, and cancellation through generated parent frames. Deterministic C executor tests
 additionally cover readiness/backpressure, descriptor reuse/cleanup, broken pipes
 and I/O deadlines. Streaming resources and broader lifecycle APIs remain M7 work.

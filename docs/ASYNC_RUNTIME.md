@@ -132,7 +132,8 @@ A per-process alarm bounds scheduler regressions. The harness checks:
 
 `cargo test -p pxr --test async_source` additionally exercises PHP source through
 parsing, typing, ownership, IR optimization, frame lowering and native execution,
-including forced GC and optional sanitizers. Source TCP exchanges and consuming cancellation now use this runtime. Broader
+including forced GC and optional sanitizers. Source TCP clients/servers and
+consuming cancellation now use this runtime. Broader
 resource/signature APIs and recoverable errors remain M7.1 work.
 
 ## Generated-code bridge
@@ -160,3 +161,21 @@ timer. Waking for readiness, deadline, error or cancellation removes that timer;
 the next I/O wait rearms the same absolute deadline. Cleanup runs after the wait
 is removed, closes once, and clears/releases the private buffer. No descriptors
 cross the generated value ABI.
+
+
+The bounded server (`pxr_async_tcp_serve`) receives a statically checked native
+async constructor address, not a dynamic callable. Each accepted connection is
+a started, internally released child; its string handler is an awaited child.
+A server at its concurrency limit enters `PXR_TASK_CHILDREN`, a wait for any
+direct child completion. Completion frees a slot and wakes the server once,
+without retaining completed connection handles or polling a full listener.
+
+A connection's absolute deadline can also be registered while awaiting its
+handler in `PXR_TASK_CHILD`. Handler completion, cancellation and timer expiry
+remove that registration through ordinary wakeup coalescing. If the timer wins,
+the connection fails and drains the handler subtree before closing its socket;
+it does not attempt to take an unfinished handler result. The request copy is
+explicitly rooted while its generated constructor can collect. The lazy handler
+then retains its parameter, and a consumed handler response is rooted until the
+last partial write completes. [ASYNC_SERVER.md](ASYNC_SERVER.md) describes source
+configuration, finite joins, fail-fast errors and protocol limitations.

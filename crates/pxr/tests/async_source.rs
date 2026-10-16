@@ -660,3 +660,334 @@ async function main(): void {{
     done.send(()).unwrap();
     server.join().unwrap();
 }
+
+// Reserve only while choosing a port; the PXR process itself owns the listener.
+fn server_port(address: &str) -> u16 {
+    std::net::TcpListener::bind((address, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[test]
+fn native_server_runs_suspended_handlers_concurrently() {
+    use std::io::{Read, Write};
+    if !have_cc() {
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let gate_port = listener.local_addr().unwrap().port();
+    let gate = std::thread::spawn(move || {
+        for _ in 0..4 {
+            let mut hold = None;
+            let mut ready = None;
+            for _ in 0..2 {
+                let mut stream = accept_tcp(&listener);
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                match request.as_slice() {
+                    b"hold" => hold = Some(stream),
+                    b"ready" => ready = Some(stream),
+                    other => panic!("unexpected gate request: {other:?}"),
+                }
+            }
+            // Only now may main send the fast request to the PXR listener.
+            ready.take().unwrap().write_all(b"ok").unwrap();
+            let mut release = accept_tcp(&listener);
+            let mut request = Vec::new();
+            release.read_to_end(&mut request).unwrap();
+            assert_eq!(request, b"release");
+            hold.take().unwrap().write_all(b"unblocked").unwrap();
+            release.write_all(b"ok").unwrap();
+        }
+    });
+    let port = server_port("127.0.0.1");
+    let source = format!(
+        r#"<?php
+async function reply(owned<string> $request): string {{
+    if ($request === "slow") {{
+        return await tcpExchangeAsync("127.0.0.1", {gate_port}, "hold", 9);
+    }}
+    return "reply: " . $request;
+}}
+async function main(): void {{
+    $server = spawn tcpServeAsync("127.0.0.1", {port}, "reply", 2, 4096, 10000, 2);
+    await sleepAsync(0);
+    $slow = spawn tcpExchangeAsync("127.0.0.1", {port}, "slow", 9);
+    $ready = await tcpExchangeAsync("127.0.0.1", {gate_port}, "ready", 2);
+    echo await tcpExchangeAsync("127.0.0.1", {port}, "fast\0", 12), "\n";
+    $released = await tcpExchangeAsync("127.0.0.1", {gate_port}, "release", 2);
+    echo await $slow, "\n";
+    await $server;
+}}
+"#
+    );
+    run_case(
+        "native-server-progress",
+        &source,
+        "reply: fast\0\nunblocked\n",
+    );
+    gate.join().unwrap();
+}
+
+#[test]
+fn native_server_bounds_concurrency_and_resolves_namespaced_handlers() {
+    for address in ["127.0.0.1", "::1"] {
+        let port = server_port(address);
+        let source = format!(
+            r#"<?php
+namespace App {{
+use function tcpServeAsync as serve;
+async function reply(string $request): string {{
+    echo "start:";
+    await sleepAsync(0);
+    echo "end:";
+    return str_repeat($request, 8192);
+}}
+async function serveThree(): void {{
+    await serve("{address}", {port}, "App\\REPLY", 3, 8192, 10000, 1);
+}}
+}}
+namespace {{
+async function main(): void {{
+    $server = spawn \App\serveThree();
+    await sleepAsync(0);
+    $a = spawn tcpExchangeAsync("{address}", {port}, "a", 8192);
+    $b = spawn tcpExchangeAsync("{address}", {port}, "b", 8192);
+    $c = spawn tcpExchangeAsync("{address}", {port}, "c", 8192);
+    $x = await $a; $y = await $b; $z = await $c;
+    echo strlen($x), ":", strlen($y), ":", strlen($z), "\n";
+    await $server;
+}}
+}}
+"#
+        );
+        // A second handler cannot start while the first crosses its await.
+        run_case(
+            &format!("native-server-serial-{}", port),
+            &source,
+            "start:end:start:end:start:end:8192:8192:8192\n",
+        );
+    }
+}
+
+#[test]
+fn native_server_cancellation_drains_handlers_and_releases_listener() {
+    if !have_cc() {
+        return;
+    }
+    let port = server_port("127.0.0.1");
+    let source = format!(
+        r#"<?php
+async function reply(string $request): string {{
+    if ($request === "gate") {{ return "ready"; }}
+    echo "handler:";
+    await sleepAsync(10000000);
+    return "bad";
+}}
+async function session(): void {{
+    $lazy = tcpServeAsync("bad address", 0, "reply", -1, -1);
+    cancelTask($lazy);
+    $server = spawn tcpServeAsync("127.0.0.1", {port}, "reply", 0, 4096);
+    await sleepAsync(0);
+    $client = spawn tcpExchangeAsync("127.0.0.1", {port}, "request", 10);
+    echo await tcpExchangeAsync("127.0.0.1", {port}, "gate", 5), ":";
+    cancelTask($client);
+    cancelTask($server);
+    echo "cancelled\n";
+}}
+async function main(): void {{
+    await session(); // Scope exit joins cancellation before rebinding the port.
+    $server = spawn tcpServeAsync("127.0.0.1", {port}, "reply", 1, 4096);
+    await sleepAsync(0);
+    echo await tcpExchangeAsync("127.0.0.1", {port}, "gate", 5), "\n";
+    await $server;
+}}
+"#
+    );
+    run_case(
+        "native-server-cancel",
+        &source,
+        "handler:ready:cancelled\nready\n",
+    );
+    // Process teardown alone cannot prove listener cleanup; the C harness also
+    // cancels/rebinds inside one process and checks accepted descriptor reuse.
+}
+
+#[test]
+fn native_server_rejects_invalid_handlers_and_call_shapes() {
+    let dir = std::env::temp_dir().join(format!("pxr-m7-server-errors-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cases = [
+        "function tcpServeAsync(): void {}",
+        "namespace X; function TCPServeAsync(): void {}",
+        "async function main(): void { await tcpServeAsync(\"127.0.0.1\", 80, \"missing\", 1, 10); }",
+        "async function reply(int $r): string { return \"\"; } async function main(): void { await tcpServeAsync(\"127.0.0.1\", 80, \"reply\", 1, 10); }",
+        "async function reply(string $r): int { return 1; } async function main(): void { await tcpServeAsync(\"127.0.0.1\", 80, \"reply\", 1, 10); }",
+        "function reply(string $r): string { return $r; } async function main(): void { await tcpServeAsync(\"127.0.0.1\", 80, \"reply\", 1, 10); }",
+        "async function reply(string $r): string { return $r; } function f(): void { tcpServeAsync(\"127.0.0.1\", 80, \"reply\", 1, 10); }",
+        "async function reply(string $r): string { return $r; } async function main(): void { $name = \"reply\"; await tcpServeAsync(\"127.0.0.1\", 80, $name, 1, 10); }",
+        "async function reply(string $r): string { return $r; } async function main(): void { await tcpServeAsync(1, 80, \"reply\", 1, 10); }",
+        "async function reply(string $r): string { return $r; } async function main(): void { await tcpServeAsync(\"127.0.0.1\", 80, \"reply\", 1, 10, \"bad\"); }",
+        "async function reply(string $r): string { return $r; } async function main(): void { await tcpServeAsync(\"127.0.0.1\", 80, \"reply\", 1, 10, 1000, true); }",
+        "async function reply(string $r): string { return $r; } async function main(): void { await tcpServeAsync(\"127.0.0.1\", 80, \"reply\", 1); }",
+        "async function reply(string $r): string { return $r; } async function main(): void { await tcpServeAsync<int>(\"127.0.0.1\", 80, \"reply\", 1, 10); }",
+        "async function reply(string $r): string { return $r; } async function main(): void { $s = spawn tcpServeAsync(\"127.0.0.1\", 80, \"reply\", 1, 10); cancelTask($s); await $s; }",
+    ];
+    for (i, source) in cases.iter().enumerate() {
+        let input = dir.join(format!("invalid-{i}.php"));
+        std::fs::write(&input, format!("<?php {source}")).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_pxr"))
+            .arg("check")
+            .arg(input)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "case {i} unexpectedly accepted");
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            error.contains("error") && !error.contains("panicked"),
+            "case {i}: {error}"
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn native_server_empty_requests_and_repeated_listener_cleanup() {
+    let port = server_port("127.0.0.1");
+    run_case(
+        "native-server-empty",
+        &format!(
+            r#"<?php
+async function reply(string $request): string {{ return $request; }}
+async function cancelledListener(): void {{
+    $s = spawn tcpServeAsync("127.0.0.1", {port}, "reply", 0, 0);
+    await sleepAsync(0);
+    cancelTask($s);
+}}
+async function main(): void {{
+    for ($i = 0; $i < 100; $i++) {{
+        await cancelledListener();
+        $s = spawn tcpServeAsync("127.0.0.1", {port}, "reply", 1, 0, 30000);
+        await sleepAsync(0);
+        $empty = await tcpExchangeAsync("127.0.0.1", {port}, "", 0);
+        if (strlen($empty) !== 0) {{ echo "bad"; }}
+        await $s;
+    }}
+    echo "clean\n";
+}}
+"#
+        ),
+        "clean\n",
+    );
+}
+
+#[test]
+fn native_server_limits_deadlines_and_bind_errors_fail_after_draining() {
+    if !have_cc() {
+        return;
+    }
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let port = server_port("127.0.0.1");
+    let main = |handler: &str, bytes: i32, timeout: i32, request: &str| {
+        format!(
+            r#"<?php
+{handler}
+async function main(): void {{
+    $server = spawn tcpServeAsync("127.0.0.1", {port}, "reply", 1, {bytes}, {timeout});
+    await sleepAsync(0);
+    await tcpExchangeAsync("127.0.0.1", {port}, "{request}", 100);
+    await $server;
+    echo "bad";
+}}
+"#
+        )
+    };
+    let echo = "async function reply(string $r): string { return $r; }";
+    let mut cases = vec![
+        main(echo, 1, 30000, "ab"),
+        main(
+            "async function reply(string $r): string { return \"ab\"; }",
+            1,
+            30000,
+            "",
+        ),
+        main(
+            "async function reply(string $r): string { await sleepAsync(10000000); return $r; }",
+            10,
+            10,
+            "",
+        ),
+        main(
+            "async function reply(string $r): string { await sleepAsync(-1); return $r; }",
+            10,
+            30000,
+            "",
+        ),
+    ];
+    for (address, port, requests, bytes, timeout, concurrent) in [
+        ("localhost", port, 1, 10, 1000, 1),
+        ("127.0.0.1\\0", port, 1, 10, 1000, 1),
+        ("127.0.0.1", 0, 1, 10, 1000, 1),
+        ("127.0.0.1", port, -1, 10, 1000, 1),
+        ("127.0.0.1", port, 1, -1, 1000, 1),
+        ("127.0.0.1", port, 1, 10, 0, 1),
+        ("127.0.0.1", port, 1, 10, -1, 1),
+        ("127.0.0.1", port, 1, 10, 1000, 0),
+        ("127.0.0.1", port, 1, 10, 1000, 1025),
+        ("127.0.0.1", occupied_port, 1, 10, 1000, 1),
+    ] {
+        cases.push(format!("<?php {echo} async function main(): void {{ await tcpServeAsync(\"{address}\", {port}, \"reply\", {requests}, {bytes}, {timeout}, {concurrent}); echo \"bad\"; }}"));
+    }
+    for (i, source) in cases.iter().enumerate() {
+        for opt in [0, 3] {
+            let executable = build(&format!("native-server-failure-{i}"), source, opt);
+            for stress in [false, true] {
+                let mut command = Command::new(&executable);
+                command.env("PXR_PHP", "/pxr-no-php-cli");
+                if stress {
+                    command.env("PXR_GC_STRESS", "1");
+                }
+                let out = execute(&mut command);
+                assert_eq!(out.status.code(), Some(255), "case {i}: {out:?}");
+                assert!(out.stdout.is_empty(), "case {i}: {out:?}");
+                let error = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    error.starts_with("pxr: async task failed:"),
+                    "case {i}: {error}"
+                );
+            }
+            std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+        }
+    }
+}
+
+#[test]
+fn native_server_round_trips_large_binary_requests() {
+    let port = server_port("127.0.0.1");
+    run_case(
+        "native-server-large",
+        &format!(
+            r#"<?php
+async function reply(string $request): string {{
+    await sleepAsync(0);
+    return $request;
+}}
+async function main(): void {{
+    $s = spawn tcpServeAsync("127.0.0.1", {port}, "reply", 8, 1048576);
+    await sleepAsync(0);
+    for ($i = 0; $i < 8; $i++) {{
+        $reply = await tcpExchangeAsync("127.0.0.1", {port}, str_repeat("x\0", 524288), 1048576);
+        if (strlen($reply) !== 1048576 || substr($reply, 0, 4) !== "x\0x\0" || substr($reply, 1048572, 4) !== "x\0x\0") {{ echo "bad"; }}
+    }}
+    await $s;
+    echo "binary clean\n";
+}}
+"#
+        ),
+        "binary clean\n",
+    );
+}

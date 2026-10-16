@@ -33,9 +33,10 @@ accept request EOF and then finish its response by closing its send side. This
 is a request-then-response operation, not a general full-duplex stream API.
 
 Addresses must be numeric IPv4 or IPv6 literals; pass `"::1"` without URL brackets
-for IPv6 loopback. Hostnames, scoped IPv6 addresses, URLs, TLS, DNS, listening,
-accepted socket handles, persistent connections and streaming read/write APIs
-are not supplied by this slice. Invalid addresses and embedded NULs fail with
+for IPv6 loopback. Hostnames, scoped IPv6 addresses, URLs, TLS, DNS, accepted socket
+handles, persistent connections and streaming read/write APIs are not supplied
+by this operation. Native listening/acceptance is now available separately through
+[`tcpServeAsync`](ASYNC_SERVER.md), with the same EOF-delimited protocol. Invalid addresses and embedded NULs fail with
 `EINVAL` when the task starts. Ports must be 1–65535.
 
 `maxBytes` is a nonnegative response-content limit. Exceeding it fails the whole
@@ -96,7 +97,7 @@ work. Other task errors still propagate, drain the structured tree, and cause
 the CLI to report `pxr: async task failed: ...` with exit status 255. Existing
 synchronous fatal errors retain their process-termination behavior.
 
-`sleepAsync`, `tcpExchangeAsync` and `cancelTask` are case-insensitive reserved
+`sleepAsync`, `tcpExchangeAsync`, `tcpServeAsync` and `cancelTask` are case-insensitive reserved
 intrinsics. Their lookup works in native namespaces and through function imports.
 Calls with incorrect arity/types, calls from synchronous source, repeated handle
 use, and borrowed values escaping into an operation fail during compilation.

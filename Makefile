@@ -9,7 +9,7 @@
 
 CARGO ?= cargo
 PXR   := ./target/release/pxr
-EXAMPLES := $(wildcard examples/*.php) examples/migration/main.php examples/async/main.php
+EXAMPLES := $(wildcard examples/*.php) examples/migration/main.php examples/async/main.php examples/async/server.php
 CHECK_EXAMPLES := $(EXAMPLES) examples/async/tcp.php
 
 .PHONY: all build release test check examples bench fmt clean

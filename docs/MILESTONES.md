@@ -787,17 +787,31 @@ frames while the peer holds its response open. C tests verify pending read/write
 connect cleanup, descriptor reuse, broken pipes and fake-clock I/O deadlines.
 See [`ASYNC_IO.md`](ASYNC_IO.md).
 
+**Delivered server slice:** `tcpServeAsync` listens on numeric IPv4/IPv6, accepts
+bounded concurrent connections, and dispatches statically checked native async
+string handlers. Requests use EOF framing with independent request/response byte
+limits and an acceptance-to-response deadline, including handler suspension and
+children. Finite servers join accepted work; cancellation drains handlers before
+socket cleanup. Source tests prove concurrent progress with a protocol gate,
+concurrency limits, large binary transfers, error propagation, repeated port
+rebinding and namespace/import dispatch. C tests inspect pending read/write/
+handler/listener cleanup and use a fake clock for handler deadlines. See
+[`ASYNC_SERVER.md`](ASYNC_SERVER.md) and `examples/async/server.php`.
+
 **Remaining:** streaming socket/resource APIs, recoverable error APIs, broader
 task/result ownership signatures, generic async functions, async methods and
 async return inference. Unsupported source forms
 receive diagnostics. The current runtime error envelope does not implement PHP
-exceptions or finally/destructors. Threading remains M7.2.
+exceptions or finally/destructors. HTTP framing/routing, request/response objects
+and isolated query/form/cookie/upload/header access will build on the TCP
+foundation. Request superglobals and sessions are not implemented. Threading
+remains M7.2.
 
 **Validation:** native source tests run at `-O0`/`-O3`, normal/forced GC, and with
 AddressSanitizer/UndefinedBehaviorSanitizer. They cover scheduling progress,
 ordered awaits, affine handles, joins/cleanup, control-flow suspension, captured
 values, module resolution, failure propagation, bounded memory and invalid forms.
-All 216 workspace tests, async/heap/ownership sanitizer checks, example checks
+All 223 workspace tests, async/heap/ownership sanitizer checks, example checks
 and the release build pass.
 M7.1 and M7 remain incomplete until the remaining I/O/lifecycle APIs and their
 source acceptance checks are delivered.

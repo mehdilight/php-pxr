@@ -543,12 +543,131 @@ static void test_tcp_cancel(void) {
     }
 }
 
+
+/* Server operations keep their resources until structured descendants stop. */
+static int server_mode, server_fds[2], server_closed_fd, server_cleanup_count;
+static pxr_task *server_test_handler(pxr_str *request) {
+    assert(request->len == 0);
+    return new_timer(pxr_compiler_loop.current, 7, 1000000);
+}
+static void server_test_cleanup(pxr_task *task, void *raw) {
+    server_cleanup_count++;
+    server_closed_fd = server_mode >= 4
+        ? ((pxr_server_frame *)raw)->fd : ((pxr_server_connection *)raw)->fd;
+    pxr_gc_collect(); /* All buffer/callback captures must still be rooted. */
+    if (server_mode >= 4) pxr_server_cleanup(task, raw);
+    else pxr_server_connection_cleanup(task, raw);
+    pxr_gc_collect();
+}
+static void server_cancel_parent(pxr_task *task, void *raw) {
+    tcp_parent_frame *frame = raw;
+    if (!frame->pc++) {
+        if (server_mode >= 4) {
+            pxr_str *address = pxr_str_alloc(9); memcpy(address->data, "127.0.0.1", 9);
+            frame->child = pxr_async_tcp_serve(address, server_fds[1], server_test_handler, 0, 10, 30000, 1);
+        } else {
+            frame->child = pxr_task_new(task->loop, task, sizeof(pxr_server_connection),
+                2, pxr_server_connection_resume, pxr_server_connection_cleanup);
+            pxr_server_connection *connection = frame->child->frame;
+            connection->fd = server_fds[0]; connection->max_bytes = 262144;
+            connection->handler = server_test_handler;
+            connection->expires = server_mode == 3 ? 5000000 : UINT64_MAX;
+            pxr_task_roots(frame->child, 2);
+            if (server_mode == 1) {
+                connection->phase = PXR_SERVER_WRITE;
+                connection->response = pxr_str_alloc(262144);
+                memset(connection->response->data, 'x', 262144);
+                frame->child->roots[1] = connection->response;
+            }
+        }
+        frame->child->cleanup = server_test_cleanup;
+        if (server_mode == 4) {
+            pxr_async_cancel(frame->child);
+            pxr_task_finish(task, PXR_TAG_INT, 1); return;
+        }
+        if (server_mode == 3) { pxr_task_await(task, frame->child); return; }
+        pxr_task_start(frame->child);
+        pxr_task_sleep(task, 0); return;
+    }
+    if (server_mode >= 4) {
+        pxr_server_frame *server = frame->child->frame;
+        assert(frame->child->state == PXR_TASK_IO && server->fd >= 0);
+        assert(fcntl(server->fd, F_GETFL) & O_NONBLOCK);
+        assert(fcntl(server->fd, F_GETFD) & FD_CLOEXEC);
+    } else {
+        pxr_server_connection *connection = frame->child->frame;
+        if (server_mode == 2) {
+            assert(connection->phase == PXR_SERVER_HANDLER);
+            assert(frame->child->state == PXR_TASK_CHILD);
+            assert(frame->child->pending_children == 1);
+        } else {
+            assert(frame->child->state == PXR_TASK_IO);
+            if (!server_mode) {
+                assert(connection->request.len == 7);
+                assert(!memcmp(connection->request.data, "partial", 7));
+            } else assert(connection->sent > 0 && connection->sent < connection->response->len);
+        }
+    }
+    pxr_async_cancel(frame->child);
+    pxr_task_finish(task, PXR_TAG_INT, 1);
+}
+static void test_server_cancel(void) {
+    for (server_mode = 0; server_mode < 6; server_mode++) {
+        server_closed_fd = -1; server_cleanup_count = 0;
+        int stdin_flags = fcntl(0, F_GETFD);
+        if (server_mode < 4) {
+            assert(socketpair(AF_UNIX, SOCK_STREAM, 0, server_fds) == 0);
+            assert(pxr_tcp_configure(server_fds[0]) == 0);
+            int small = 4096;
+            assert(setsockopt(server_fds[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)) == 0);
+            if (!server_mode) assert(send(server_fds[1], "partial", 7, 0) == 7);
+            if (server_mode >= 2) assert(shutdown(server_fds[1], SHUT_WR) == 0);
+        } else {
+            int probe = socket(AF_INET, SOCK_STREAM, 0); assert(probe >= 0);
+            struct sockaddr_in address = {0}; address.sin_family = AF_INET;
+            assert(inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
+            assert(bind(probe, (struct sockaddr *)&address, sizeof(address)) == 0);
+            socklen_t length = sizeof(address);
+            assert(getsockname(probe, (struct sockaddr *)&address, &length) == 0);
+            server_fds[1] = ntohs(address.sin_port);
+            assert(close(probe) == 0);
+        }
+        pxr_async_create(server_cancel_parent, (sizeof(tcp_parent_frame) + 7) / 8);
+        fake_clock clock = {0};
+        if (server_mode == 3) {
+            pxr_compiler_loop.now = fake_now; pxr_compiler_loop.wait = fake_wait;
+            pxr_compiler_loop.clock_context = &clock;
+        }
+        cleaned = 0;
+        pxr_task_result result = pxr_loop_run(&pxr_compiler_loop);
+        assert(server_cleanup_count == 1);
+        if (server_mode == 3) {
+            assert(result.status == PXR_TASK_ERROR && result.error == ETIMEDOUT);
+            assert(clock.now == 5000000 && clock.waits == 1 && cleaned == 1);
+        } else {
+            assert(result.status == PXR_TASK_OK && result.bits == 1);
+            if (server_mode == 2) assert(cleaned == 1);
+        }
+        /* Check before destroying the loop: process teardown cannot hide leaks. */
+        if (server_mode != 4) {
+            errno = 0; assert(fcntl(server_closed_fd, F_GETFD) == -1 && errno == EBADF);
+            int reused = open("/dev/null", O_RDONLY); assert(reused >= 0);
+            pxr_gc_collect(); assert(fcntl(reused, F_GETFD) >= 0);
+            assert(close(reused) == 0);
+        } else assert(fcntl(0, F_GETFD) == stdin_flags);
+        if (server_mode < 4) assert(close(server_fds[1]) == 0);
+        pxr_loop_destroy(&pxr_compiler_loop); pxr_compiler_loop_initialized = 0;
+        pxr_gc_collect();
+        assert(!pxr_heap_blocks && !pxr_heap_bytes && !pxr_async_loops);
+    }
+}
+
 int main(void) {
     alarm(20); /* Turn a scheduler regression into a bounded test failure. */
     test_timers(); test_scope(); test_failure(); test_cancellation();
     test_wait_errors(); test_sockets(); test_deep();
     test_retention(); test_io_cleanup(); test_heap();
-    test_frame_roots(); test_failure_order(); test_tcp_cancel();
+    test_frame_roots(); test_failure_order(); test_tcp_cancel(); test_server_cancel();
     alarm(0);
     puts("async clean");
 }

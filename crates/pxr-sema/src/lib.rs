@@ -235,6 +235,8 @@ impl Builtin {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Callee {
+    /// A statically checked async string handler, passed as a native constructor.
+    AsyncServer { handler: String },
     Php {
         name: String,
         fallback: Option<String>,
@@ -3703,9 +3705,14 @@ impl Analyzer {
                     fallback.as_deref().unwrap_or(callee)
                 };
                 if self.php_interop
-                    && !["sleepasync", "tcpexchangeasync", "canceltask"]
-                        .iter()
-                        .any(|n| name.eq_ignore_ascii_case(n))
+                    && ![
+                        "sleepasync",
+                        "tcpexchangeasync",
+                        "tcpserveasync",
+                        "canceltask",
+                    ]
+                    .iter()
+                    .any(|n| name.eq_ignore_ascii_case(n))
                     && !self.is_compiled_function(&callee.to_ascii_lowercase())
                     && fallback
                         .as_ref()
@@ -4927,6 +4934,74 @@ impl Analyzer {
         ctx: &mut FnCtx,
     ) -> Option<TExpr> {
         let key = callee.to_ascii_lowercase();
+        if key == "tcpserveasync" {
+            if !ctx.is_async || !(5..=7).contains(&args.len()) || !type_args.is_empty() {
+                self.diags.emit(Diagnostic::error("tcpServeAsync requires an async context and (string address, int port, literal string handler, int maxRequests, int maxBytes, optional int timeoutMs, optional int maxConcurrent)").with_code("E0300").with_span(span));
+                return None;
+            }
+            let mut handler_arg = &args[2];
+            while let ast::Expr::Paren(inner, _) = handler_arg {
+                handler_arg = inner;
+            }
+            let ast::Expr::StrLit(handler_name, _) = handler_arg else {
+                self.diags.emit(
+                    Diagnostic::error(
+                        "tcpServeAsync handler must be a literal native async function name",
+                    )
+                    .with_code("E0300")
+                    .with_span(args[2].span()),
+                );
+                return None;
+            };
+            let Some(handler) = std::str::from_utf8(handler_name)
+                .ok()
+                .and_then(|name| {
+                    self.funcs
+                        .get(&name.strip_prefix('\\').unwrap_or(name).to_ascii_lowercase())
+                })
+                .filter(|s| s.is_async && s.params == [Ty::String] && s.ret == Ty::String)
+                .cloned()
+            else {
+                self.diags.emit(Diagnostic::error("tcpServeAsync handler must name a native non-generic async function(string): string").with_code("E0300").with_span(args[2].span()));
+                return None;
+            };
+            let mut values = Vec::new();
+            let mut params = Vec::new();
+            for (i, arg) in args.iter().enumerate() {
+                if i == 2 {
+                    continue;
+                }
+                let expected = if i == 0 { Ty::String } else { Ty::Int };
+                let value = self.infer(arg, ctx)?;
+                if value.ty() != expected {
+                    return self.builtin_ty_err(
+                        "tcpServeAsync",
+                        &format!("argument of type `{expected}`"),
+                        &value.ty(),
+                        arg.span(),
+                    );
+                }
+                values.push(value);
+                params.push(expected);
+            }
+            if args.len() == 5 {
+                values.push(TExpr::Int(30000));
+                params.push(Ty::Int);
+            }
+            if args.len() < 7 {
+                values.push(TExpr::Int(64));
+                params.push(Ty::Int);
+            }
+            return Some(TExpr::Call {
+                callee: Callee::AsyncServer {
+                    handler: handler.mangled,
+                },
+                ret: Ty::Task(Box::new(Ty::Void)),
+                args: values,
+                arg_tys: params,
+                span,
+            });
+        }
         if key == "tcpexchangeasync" {
             if !ctx.is_async || !(4..=5).contains(&args.len()) || !type_args.is_empty() {
                 self.diags.emit(Diagnostic::error("tcpExchangeAsync requires an async context and (string address, int port, string request, int maxBytes, optional int timeoutMs)").with_code("E0300").with_span(span));

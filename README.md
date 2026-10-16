@@ -26,10 +26,12 @@ worker when they execute.
 > M6 adds affine `owned<T>` handles, moves, call-scoped borrows, and precise
 > reclamation of dead values and cycles. M7 is in progress: an internal executor
 > supports free async functions, affine task handles, await/spawn, nonblocking
-> timers, owned TCP exchanges, consuming cancellation and an async main entry.
+> timers, owned TCP exchanges, bounded native TCP servers, consuming cancellation
+> and an async main entry.
 > Streaming socket APIs, recoverable errors and broader async signatures remain
 > pending; see
-> [`docs/ASYNC.md`](docs/ASYNC.md) and [`docs/ASYNC_IO.md`](docs/ASYNC_IO.md).
+> [`docs/ASYNC.md`](docs/ASYNC.md), [`docs/ASYNC_IO.md`](docs/ASYNC_IO.md),
+> and [`docs/ASYNC_SERVER.md`](docs/ASYNC_SERVER.md).
 > See [`docs/OWNERSHIP.md`](docs/OWNERSHIP.md), [`docs/GENERICS.md`](docs/GENERICS.md), [`docs/MILESTONES.md`](docs/MILESTONES.md),
 > [`docs/MIXED.md`](docs/MIXED.md), and [`docs/INTEROP.md`](docs/INTEROP.md).
 

@@ -41,3 +41,12 @@ was checked for [nonblocking connect and SO_ERROR](https://man7.org/linux/man-pa
 The PXR operation uses the platform's MSG_NOSIGNAL or SO_NOSIGPIPE facility; it
 does not install a process-wide signal handler. The implementation remains
 original and adds no upstream build dependency.
+
+
+For the native server slice, also studied `uv__server_io`/`uv_accept` in the pinned
+libuv `src/unix/stream.c`: pause acceptance at capacity and explicitly own accepted
+descriptors. Checked [accept semantics and flag inheritance](https://man7.org/linux/man-pages/man2/accept.2.html),
+[listen backlog limits](https://man7.org/linux/man-pages/man2/listen.2.html), and
+[IPV6_V6ONLY](https://man7.org/linux/man-pages/man7/ipv6.7.html). PXR configures
+accepted descriptors itself and requests separate IPv4/IPv6 listeners. The
+server implementation remains original; no upstream code or dependency was added.
