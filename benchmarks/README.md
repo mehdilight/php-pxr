@@ -34,26 +34,28 @@ only and cannot provide an interpreter comparison.
 | `array_copy.php` | 100,000 read-only copies of a 1,000-element array |
 | `array_copy_write.php` | 10,000 copies of a 1,000-element array, with two overwrites per copy |
 | `strings.php` | 50,000 appends, producing a 400,000-byte string |
+| `strings_snapshots.php` | 50,000 appends retaining ten string snapshots |
 | `objects.php` | 2,000,000 object allocations, property reads and method calls |
 
 ## Current reference results
 
-After the copy-on-write array optimization: Apple M3 Max, PHP 8.4.25 CLI, OPcache CLI off /
+After the string append optimization: Apple M3 Max, PHP 8.4.25 CLI, OPcache CLI off /
 JIT disabled, PXR `-O3`, median of nine after two warmups on 2026-10-16:
 
 | Workload | PXR median | PHP median | PXR relative to PHP |
 | --- | ---: | ---: | --- |
-| Startup / print | 2.442 ms | 29.893 ms | 12.24× faster |
-| Recursive fib(30) | 4.468 ms | 89.097 ms | 19.94× faster |
-| Integer loop (5M) | 2.317 ms | 82.416 ms | 35.57× faster |
-| Integer-array append + reads (10k) | 3.112 ms | 29.339 ms | 9.43× faster |
-| String-key array writes + reads (5k) | 4.060 ms | 29.574 ms | 7.28× faster |
-| Read-only array copies (100k × 1k items) | 8.210 ms | 30.405 ms | 3.70× faster |
-| Array copy + two overwrites (10k × 1k items) | 16.834 ms | 40.867 ms | 2.43× faster |
-| String append (50k) | 187.149 ms | 30.197 ms | 6.20× slower |
-| Objects + methods (2M) | 290.750 ms | 189.499 ms | 1.53× slower |
+| Startup / print | 2.539 ms | 30.470 ms | 12.00× faster |
+| Recursive fib(30) | 5.091 ms | 92.238 ms | 18.12× faster |
+| Integer loop (5M) | 2.558 ms | 82.295 ms | 32.17× faster |
+| Integer-array append + reads (10k) | 3.240 ms | 29.655 ms | 9.15× faster |
+| String-key array writes + reads (5k) | 4.293 ms | 30.530 ms | 7.11× faster |
+| Read-only array copies (100k × 1k items) | 8.948 ms | 32.042 ms | 3.58× faster |
+| Array copy + two overwrites (10k × 1k items) | 20.894 ms | 43.549 ms | 2.08× faster |
+| String append (50k) | 3.763 ms | 30.765 ms | 8.18× faster |
+| String append with ten snapshots (50k) | 5.103 ms | 32.056 ms | 6.28× faster |
+| Objects + methods (2M) | 328.313 ms | 198.383 ms | 1.65× slower |
 
-See the [optimization report and before/after samples](results/2026-10-16-array-cow.md).
+See the [optimization report and before/after samples](results/2026-10-16-string-append.md).
 The [original M7 comparison](results/2026-10-16-m7.md) remains available for history.
 
 ## Limits

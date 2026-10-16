@@ -227,6 +227,40 @@ static void test_array_cow(void) {
     pxr_gc_leave(&frame);
 }
 
+static void test_string_append(void) {
+    pxr_gc_frame frame; void *roots[4] = {0};
+    pxr_gc_enter(&frame, roots); pxr_gc_roots(&frame, 4);
+    pxr_str *original = pxr_str_alloc(3); memcpy(original->data, "a\0b", 3); roots[0] = original;
+    pxr_str *value = pxr_str_append_local(original, original); roots[1] = value;
+    assert(value != original && original->len == 3 && value->len == 6);
+    assert(!memcmp(value->data, "a\0ba\0b", 6) && value->data[6] == 0);
+    pxr_str *same = pxr_str_append_local(value, NULL);
+    assert(same == value && same->len == 6);
+    value = pxr_str_append_local(value, value); roots[1] = value;
+    assert(value->len == 12 && !memcmp(value->data, "a\0ba\0ba\0ba\0b", 12));
+    pxr_str_freeze(value); roots[2] = value;
+    pxr_str *snapshot = value;
+    value = pxr_str_append_local(value, original); roots[1] = value;
+    assert(value != snapshot && snapshot->len == 12 && snapshot->data[12] == 0);
+    pxr_str *before_growth = value;
+    roots[3] = before_growth;
+    value = pxr_str_append_local(value, original); roots[1] = value;
+    assert(value != before_growth && before_growth->len == 15 && before_growth->data[15] == 0);
+    size_t growths = 0;
+    for (int i = 0; i < 30000; i++) {
+        pxr_str *next = pxr_str_append_local(value, original);
+        growths += next != value; value = next; roots[1] = value;
+        if (i % 997 == 0) pxr_gc_collect();
+    }
+    assert(growths < 20 && value->len == 90018 && value->data[value->len] == 0);
+    for (size_t i = 0; i < value->len; i += 3) assert(!memcmp(value->data + i, "a\0b", 3));
+    assert(original->len == 3 && !memcmp(original->data, "a\0b", 3));
+    assert(snapshot->len == 12 && before_growth->len == 15);
+    pxr_gc_collect(); assert(pxr_heap_blocks == 4);
+    pxr_gc_roots(&frame, 0); pxr_gc_collect(); assert(!pxr_heap_blocks && !pxr_heap_bytes);
+    pxr_gc_leave(&frame);
+}
+
 static void assert_shutdown(void) {
     assert(pxr_heap_head == NULL);
     assert(pxr_heap_blocks == 0);
@@ -238,6 +272,11 @@ int main(int argc, char **argv) {
     assert(argc == 2);
     /* Registered first so this runs AFTER the heap's exit callback. */
     assert(atexit(assert_shutdown) == 0);
+    if (strcmp(argv[1], "string-append") == 0) { test_string_append(); return 0; }
+    if (strcmp(argv[1], "append-overflow") == 0) {
+        pxr_str a = {.len = SIZE_MAX}, b = {.len = 1};
+        pxr_str_append_local(&a, &b);
+    }
     if (strcmp(argv[1], "array-cow") == 0) { test_array_cow(); return 0; }
     if (strcmp(argv[1], "array-index") == 0) { test_array_index(); return 0; }
     if (strcmp(argv[1], "collection") == 0) { test_collection(); return 0; }

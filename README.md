@@ -172,22 +172,24 @@ Max with PHP 8.4.25 CLI (JIT disabled), nine runs at PXR `-O3` measured:
 
 | Workload | PXR median | PHP median | PXR relative to PHP |
 | --- | ---: | ---: | --- |
-| Startup / print | 2.442 ms | 29.893 ms | 12.24× faster |
-| Recursive fib(30) | 4.468 ms | 89.097 ms | 19.94× faster |
-| Integer loop (5M) | 2.317 ms | 82.416 ms | 35.57× faster |
-| Integer-array append + reads (10k) | 3.112 ms | 29.339 ms | 9.43× faster |
-| String-key array writes + reads (5k) | 4.060 ms | 29.574 ms | 7.28× faster |
-| Read-only array copies (100k × 1k items) | 8.210 ms | 30.405 ms | 3.70× faster |
-| Array copy + two overwrites (10k × 1k items) | 16.834 ms | 40.867 ms | 2.43× faster |
-| String append (50k) | 187.149 ms | 30.197 ms | 6.20× slower |
-| Objects + methods (2M) | 290.750 ms | 189.499 ms | 1.53× slower |
+| Startup / print | 2.539 ms | 30.470 ms | 12.00× faster |
+| Recursive fib(30) | 5.091 ms | 92.238 ms | 18.12× faster |
+| Integer loop (5M) | 2.558 ms | 82.295 ms | 32.17× faster |
+| Integer-array append + reads (10k) | 3.240 ms | 29.655 ms | 9.15× faster |
+| String-key array writes + reads (5k) | 4.293 ms | 30.530 ms | 7.11× faster |
+| Read-only array copies (100k × 1k items) | 8.948 ms | 32.042 ms | 3.58× faster |
+| Array copy + two overwrites (10k × 1k items) | 20.894 ms | 43.549 ms | 2.08× faster |
+| String append (50k) | 3.763 ms | 30.765 ms | 8.18× faster |
+| String append with ten snapshots (50k) | 5.103 ms | 32.056 ms | 6.28× faster |
+| Objects + methods (2M) | 328.313 ms | 198.383 ms | 1.65× slower |
 
 Timings include startup and exclude compilation. PHP startup on this configuration
-is about 30 ms; PXR startup is about 2.4 ms. Copy-on-write arrays improved the
-read-only copying workload by 31.3× and copy-then-mutate by 1.7× relative to the
-previous PXR build. Strings and objects still need optimization. These
+is about 30 ms; PXR startup is about 2.5 ms. The latest optimization improved the
+string append workload by 52.0× and appending with occasional snapshots by 53.0×
+relative to the previous PXR build. Objects still need optimization. These
 microbenchmarks are not a general application speedup claim. See the
-[copy-on-write report and raw samples](benchmarks/results/2026-10-16-array-cow.md),
+[string append report and raw samples](benchmarks/results/2026-10-16-string-append.md),
+[copy-on-write arrays](benchmarks/results/2026-10-16-array-cow.md),
 [earlier array-index optimization](benchmarks/results/2026-10-16-array-index.md),
 [original M7 comparison](benchmarks/results/2026-10-16-m7.md), or re-run
 `./benchmarks/run.sh` on your machine.

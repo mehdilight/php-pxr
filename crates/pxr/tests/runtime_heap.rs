@@ -49,6 +49,7 @@ fn managed_heap_lifecycle_and_overflow() {
         "collection",
         "array-index",
         "array-cow",
+        "string-append",
     ] {
         let out = Command::new(&executable).arg(mode).output().unwrap();
         let fatal = mode.ends_with("fatal");
@@ -70,6 +71,7 @@ fn managed_heap_lifecycle_and_overflow() {
     }
     for mode in [
         "alloc-overflow",
+        "append-overflow",
         "string-overflow",
         "mul-overflow",
         "add-overflow",

@@ -4179,3 +4179,42 @@ echo $d[0], ":", $e[0], "\n";
 "#,
     );
 }
+
+#[test]
+fn string_appends_preserve_snapshots_calls_properties_and_binary_values() {
+    assert_matches_php(
+        "string_append_snapshots",
+        r#"<?php
+class AppendSnapshot {
+    public string $text;
+    public function __construct(string $text) {$this->text = $text;}
+}
+function appendBox(mixed $v): mixed {return $v;}
+function appendIdentity(string $v): string {return $v;}
+function appendBuild(string $prefix, int $n): string {
+    for ($i = 0; $i < $n; $i++) {$prefix .= "a\0b";}
+    return $prefix;
+}
+$seed = str_repeat("x", 4); $text = $seed; $text .= "A";
+$saved = $text; $values = [$text]; $object = new AppendSnapshot($text);
+$mixed = appendBox($text); $returned = appendIdentity($text);
+$independent = $text . "";
+for ($i = 0; $i < 1000; $i++) {$text .= "a\0b";}
+echo $seed, ":", $saved, ":", $values[0], ":", $object->text, ":", strval($mixed), ":", $returned, ":", $independent, ":", strlen($text), ":", bin2hex(substr($text, -3)), "\n";
+$twice = "z"; $twice .= $twice; $twice = $twice . $twice; $twice .= "";
+echo $twice, ":", appendBuild("start:", 3) === "start:a\0ba\0ba\0b", "\n";
+$interpolated = "$text:$saved"; $text .= 42; $text .= false;
+echo strlen($interpolated), ":", strlen($text), ":", substr($text, -2), "\n";
+$branches = ""; $snapshots = [];
+for ($j = 0; $j < 32; $j++) {
+    if ($j % 2 == 0) {$branches .= "A";} else {$branches = $branches . "B";}
+    if ($j % 8 == 0) {$snapshots[] = $branches;}
+}
+echo strlen($branches), ":", $snapshots[0], ":", strlen($snapshots[3]), "\n";
+
+$key = "k"; $key .= "1"; $map = [$key => 11]; $key .= "2";
+echo $map["k1"], ":", array_key_exists($key, $map), ":", $key, "\n";
+
+"#,
+    );
+}

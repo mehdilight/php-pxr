@@ -105,6 +105,8 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     ("pxr_print_str", "void", &["ptr"]),
     ("pxr_print_bool", "void", &["i32"]),
     ("pxr_str_concat", "ptr", &["ptr", "ptr"]),
+    ("pxr_str_append_local", "ptr", &["ptr", "ptr"]),
+    ("pxr_str_freeze", "void", &["ptr"]),
     ("pxr_i64_to_str", "ptr", &["i64"]),
     ("pxr_f64_to_str", "ptr", &["double"]),
     ("pxr_bool_to_str", "ptr", &["i32"]),
@@ -229,7 +231,11 @@ fn align_of(ty: &Ty) -> u32 {
 }
 
 pub fn emit_llvm(module: &Module, opts: &LlvmOptions) -> String {
-    let lowered = crate::async_lower::lower(module);
+    // Establish string snapshot barriers before async lowering moves locals
+    // into frame cells; frame storage itself does not create a source alias.
+    let mut optimized = module.clone();
+    crate::strings::optimize(&mut optimized);
+    let lowered = crate::async_lower::lower(&optimized);
     let module = &lowered;
     let mut out = String::new();
     let _ = writeln!(

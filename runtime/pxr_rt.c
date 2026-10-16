@@ -51,7 +51,7 @@ static _Thread_local size_t pxr_heap_arrays = 0;
 static _Thread_local size_t pxr_heap_bytes = 0;
 static _Thread_local int pxr_heap_initialized = 0;
 static _Thread_local pxr_allocation *pxr_heap_index[4096];
-enum { PXR_HEAP_RAW, PXR_HEAP_ARRAY, PXR_HEAP_OBJECT, PXR_HEAP_MIXED, PXR_HEAP_ARRAY_ENTRIES };
+enum { PXR_HEAP_RAW, PXR_HEAP_ARRAY, PXR_HEAP_OBJECT, PXR_HEAP_MIXED, PXR_HEAP_ARRAY_ENTRIES, PXR_HEAP_APPEND_STRING };
 static void pxr_array_release(void *pointer);
 static _Thread_local uint64_t pxr_heap_serial = 0;
 /* A C runtime operation may hold private temporaries when it calls native
@@ -341,6 +341,39 @@ pxr_str *pxr_str_concat(const pxr_str *a, const pxr_str *b) {
         memcpy(out->data + la, b->data, lb);
     }
     return out;
+}
+
+/* An escaping value or a load that survives an overwrite becomes immutable.
+ * Every alias sees the same allocation kind, so later appends must separate. */
+void pxr_str_freeze(const pxr_str *s) {
+    pxr_allocation *block = pxr_heap_lookup(s);
+    if (block && block->h.kind == PXR_HEAP_APPEND_STRING) block->h.kind = PXR_HEAP_RAW;
+}
+
+/* Only emitted for local accumulators with compiler-inserted freeze barriers.
+ * Ordinary strings (including incoming aliases and literals) first copy into
+ * a private append allocation. Keep the public string layout
+ * unchanged; the allocation size supplies capacity, and GC treats it as a leaf.
+ * Never free a replaced buffer here: generated roots may still refer to it. */
+pxr_str *pxr_str_append_local(pxr_str *a, const pxr_str *b) {
+    size_t la = a ? a->len : 0, lb = b ? b->len : 0;
+    size_t length = pxr_size_add(la, lb);
+    pxr_allocation *block = pxr_heap_lookup(a);
+    size_t capacity = block && block->h.kind == PXR_HEAP_APPEND_STRING
+        ? block->h.size - sizeof(pxr_str) - 1 : 0;
+    if (!block || block->h.kind != PXR_HEAP_APPEND_STRING || length > capacity) {
+        size_t grown = pxr_grow_capacity(capacity, length);
+        pxr_str *out = pxr_heap_alloc(pxr_size_add(sizeof(*out), pxr_size_add(grown, 1)));
+        ((pxr_allocation *)out - 1)->h.kind = PXR_HEAP_APPEND_STRING;
+        if (la) memcpy(out->data, a->data, la);
+        if (lb) memcpy(out->data + la, b->data, lb);
+        out->len = length; out->data[length] = '\0';
+        return out;
+    }
+    /* Self-append is valid; update length only after consuming both operands. */
+    if (lb) memmove(a->data + la, b->data, lb);
+    a->len = length; a->data[length] = '\0';
+    return a;
 }
 
 pxr_str *pxr_i64_to_str(long long v) {

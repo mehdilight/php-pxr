@@ -27,7 +27,8 @@ worker when executed.
 
 ## Memory model
 
-Strings are immutable; array mutations operate on private value copies.
+Strings have immutable value semantics; private append buffers may reuse capacity
+until a snapshot makes them immutable. Array writes separate shared storage.
 All runtime-owned memory now uses a **tracked heap**, replacing the page-list
 bump arena in M6.1. Private headers link allocations and record their sizes;
 returned pointers retain `max_align_t` alignment. Headers stay outside the public
@@ -85,6 +86,38 @@ that is not part of the value. Embedded `\0` bytes are first‑class, matching P
 layout differs from the former bare `const char *`. `data` sits at offset 8,
 mirrored by the `{ i64, [N x i8] }` LLVM constant pool entries the backend emits.
 
+## String append
+
+Before async frame lowering and root calculation, the backend recognizes a
+concatenation of a local string followed immediately by storing its sole result
+back to that local. Both `.=` and `$text = $text . $suffix` can use
+`pxr_str_append_local`. Ordinary concatenation still produces an independent
+immutable string, including concatenations stored somewhere else.
+
+The append helper first copies incoming strings and literals into a private heap
+allocation with geometrically growing capacity. Subsequent appends can reuse that
+allocation. Its heap header records the allocation kind and size; the public
+`{ len, data[] }` layout and binary/NUL handling stay unchanged. Capacity growth
+allocates a replacement; GC reclaims old buffers at safepoints, preserving any
+roots still referring to them.
+
+A slot/value use analysis inserts `pxr_str_freeze` immediately after any load that
+may escape through assignment, arrays, keys, properties, mixed boxing, returns,
+borrows or unknown calls. Freezing changes the shared allocation's kind to an
+ordinary immutable leaf, so every alias keeps a stable snapshot and the next
+append separates. A frozen snapshot retains its reserved capacity until collection;
+freezing does not compact its buffer. The analysis also freezes earlier loads used after a slot
+write and cross-block loads, protecting SSA temporaries around branches and
+loops. Only known non-retaining readers can avoid freezing: scalar conversions,
+comparisons, printing, length and `substr` (which allocates a fresh result).
+The barriers are established before async lowering moves locals into frame
+cells, so task suspension preserves the same value rules.
+
+Repeated appending without escaping snapshots has amortized linear copying cost.
+Taking a retained snapshot before every append still requires copying on the next
+write. Mixed-valued accumulators and targets in properties or array elements keep
+the ordinary concatenation path; this optimization changes no supported syntax.
+
 ## ABI
 
 ```c
@@ -99,6 +132,9 @@ void   pxr_print_bool(int v);        /* 1 -> "1", 0 -> "" */
 
 /* strings — every `pxr_str *` below is NUL/binary-safe */
 pxr_str *pxr_str_concat(const pxr_str *a, const pxr_str *b);
+/* compiler-only local accumulator intrinsics; see string append below */
+pxr_str *pxr_str_append_local(pxr_str *a, const pxr_str *b);
+void pxr_str_freeze(const pxr_str *s);
 pxr_str *pxr_i64_to_str(long long v);
 pxr_str *pxr_f64_to_str(double v);   /* PHP zend_gcvt, precision 14 (see below) */
 pxr_str *pxr_bool_to_str(int v);

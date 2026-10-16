@@ -2470,3 +2470,31 @@ async function main(): void {
         "42:42\n",
     );
 }
+
+#[test]
+fn string_append_snapshots_survive_returns_borrows_and_task_suspension() {
+    run_case(
+        "string_append_tasks",
+        r#"<?php
+function buildAppend(string $text): string {
+    for ($i = 0; $i < 1000; $i++) {$text .= "ab";}
+    return $text;
+}
+function inspectAppend(&string $text): int {return strlen($text);}
+async function holdAppend(string $text): string {await sleepAsync(0); return $text;}
+async function suffixAppend(): string {await sleepAsync(0); return "x";}
+async function main(): void {
+    $text = buildAppend("start"); $copy = $text;
+    $task = spawn holdAppend($text);
+    for ($i = 0; $i < 500; $i++) {$text .= "x";}
+    await sleepAsync(0);
+    $held = await $task;
+    $owned: owned<string> = "owned";
+    $during = "";
+    for ($j = 0; $j < 16; $j++) {$during .= await suffixAppend();}
+    echo strlen($text), ":", strlen($copy), ":", strlen($held), ":", inspectAppend(&$owned), ":", strlen($during), "\n";
+}
+"#,
+        "2505:2005:2005:5:16\n",
+    );
+}
