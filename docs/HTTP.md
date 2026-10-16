@@ -218,10 +218,17 @@ undo handler effects or change ordinary tasks and raw TCP servers' failure rules
 
 Invalid listener configuration, bind/listen/accept/setup errors and executor poll
 failures still fail the server/root task tree, cancel/join its work, and exit 255
-with the existing async diagnostic. General source-level error recovery,
-exceptions and graceful shutdown with a drain budget remain M7 work. Existing
+with the existing async diagnostic. General source-level error recovery and
+exceptions remain M7 work. Existing
 synchronous fatal errors and allocation failure retain their process behavior.
 This slice is not yet a production web-server compatibility claim.
+
+For graceful shutdown, `stopServer($server, $graceMs = 30000)` consumes the HTTP
+server handle, stops acceptance and lets accepted work finish within one grace
+deadline. On expiry, it cancels and joins remaining descendants. It does not
+suspend; the owning scope still joins the server. Connection deadlines retain
+their original bounds. See [the server shutdown contract](ASYNC_SERVER.md#graceful-shutdown)
+for lazy/completed handles, errors and cooperative timing limits.
 
 ## Verification and references
 

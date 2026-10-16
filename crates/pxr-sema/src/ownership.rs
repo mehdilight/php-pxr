@@ -140,6 +140,7 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
                     "header",
                     "httprequestbody",
                     "canceltask",
+                    "stopserver",
                 ]
                 .contains(
                     &f.name
@@ -1341,14 +1342,15 @@ impl Checker {
             } if callee == "$pxr_await"
                 || callee == "$pxr_spawn"
                 || callee.eq_ignore_ascii_case("canceltask")
-                || fallback
-                    .as_ref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case("canceltask")) =>
+                || callee.eq_ignore_ascii_case("stopserver")
+                || fallback.as_ref().is_some_and(|n| {
+                    n.eq_ignore_ascii_case("canceltask") || n.eq_ignore_ascii_case("stopserver")
+                }) =>
             {
                 if !self.loans.is_empty() {
                     self.error(
                         *span,
-                        "await/spawn/cancelTask cannot cross an active call-scoped borrow",
+                        "await/spawn/cancelTask/stopServer cannot cross an active call-scoped borrow",
                     );
                 }
                 let Some(arg) = args.first() else {
@@ -1369,10 +1371,14 @@ impl Checker {
                 if value.mode != Mode::Transfer {
                     self.error(*span, "task control requires a fresh task expression or an explicit move of a handle selected by an expression");
                 }
+                for argument in args.iter().skip(1) {
+                    self.expr(argument);
+                }
                 if callee.eq_ignore_ascii_case("canceltask")
-                    || fallback
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case("canceltask"))
+                    || callee.eq_ignore_ascii_case("stopserver")
+                    || fallback.as_ref().is_some_and(|n| {
+                        n.eq_ignore_ascii_case("canceltask") || n.eq_ignore_ascii_case("stopserver")
+                    })
                 {
                     Value::plain(Some(TypeRef::Void))
                 } else if callee == "$pxr_spawn" {

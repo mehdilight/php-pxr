@@ -179,6 +179,16 @@ A server at its concurrency limit enters `PXR_TASK_CHILDREN`, a wait for any
 direct child completion. Completion frees a slot and wakes the server once,
 without retaining completed connection handles or polling a full listener.
 
+`pxr_async_stop_server` consumes a direct server handle and wakes it into a
+draining phase. That phase closes the listener before waiting for children and
+registers one absolute timer in `PXR_TASK_CHILDREN`. Child completion removes the
+wait/timer and the next visit rearms the same deadline if necessary. Expiry
+requests server cancellation, retaining the ordinary join-before-cleanup rules.
+A finite server already in normal joining can re-enter the draining phase while
+its frame is still alive; existing errors/cancellation are never cleared. Invalid
+arguments queue an error child rather than interrupting a running generated
+callback midway through an ordinary intrinsic call.
+
 A connection's absolute deadline can also be registered while awaiting its
 handler in `PXR_TASK_CHILD`. Handler completion, cancellation and timer expiry
 remove that registration through ordinary wakeup coalescing. If the timer wins,

@@ -670,7 +670,8 @@ void *pxr_async_tcp_exchange(pxr_str *address, int64_t port,
 typedef pxr_task *(*pxr_tcp_handler)(pxr_str *);
 typedef pxr_task *(*pxr_http_handler)(void);
 typedef struct {
-    int fd, started;
+    int fd, started, stopping;
+    uint64_t drain_expires;
     pxr_str *address;
     pxr_tcp_handler handler;
     pxr_http_handler http_handler;
@@ -870,6 +871,16 @@ static int pxr_server_accept_retry(int error) {
 }
 static void pxr_server_resume(pxr_task *task, void *raw) {
     pxr_server_frame *frame = raw;
+    if (frame->stopping) {
+        pxr_server_close(&frame->fd);
+        if (!task->pending_children) { pxr_task_finish(task, 0, 0); return; }
+        if (task->loop->now(task->loop->clock_context) >= frame->drain_expires) {
+            pxr_task_cancel(task); return; /* Join cancellation cleanup. */
+        }
+        task->state = PXR_TASK_CHILDREN;
+        pxr_task_timer_at(task, frame->drain_expires);
+        return;
+    }
     if (!frame->started) {
         int error = pxr_server_open(frame);
         if (error) { pxr_task_fail(task, error); return; }
@@ -913,6 +924,33 @@ static void pxr_server_resume(pxr_task *task, void *raw) {
         if (frame->max_requests) frame->remaining--;
     }
     pxr_task_yield(task);
+}
+static void pxr_server_stop_invalid(pxr_task *task, void *raw) {
+    (void)raw; pxr_task_fail(task, EINVAL);
+}
+/* Consume the handle while retaining the server in its parent's task tree.
+ * Validation errors are queued children, so the current generated callback
+ * remains runnable until its next suspension/completion boundary. */
+void pxr_async_stop_server(void *handle, int64_t grace_ms) {
+    pxr_task *task = handle;
+    assert(task->parent == task->loop->current && task->handle_live && !task->claimed);
+    if (grace_ms < 0 || task->resume != pxr_server_resume) {
+        pxr_task *error = pxr_task_new(task->loop, task->parent, 0, 0, pxr_server_stop_invalid, NULL);
+        pxr_task_start(error); pxr_task_release(error);
+        pxr_task_cancel(task);
+    } else if (task->state == PXR_TASK_NEW) {
+        pxr_task_cancel(task); /* A lazy server must never open its listener. */
+    } else if (task->state != PXR_TASK_COMPLETE && !task->cancel_requested && !task->result.error) {
+        pxr_server_frame *frame = task->frame;
+        uint64_t now = task->loop->now(task->loop->clock_context);
+        frame->stopping = 1;
+        frame->drain_expires = (uint64_t)grace_ms > (UINT64_MAX - now) / 1000000
+            ? UINT64_MAX : now + (uint64_t)grace_ms * 1000000;
+        /* A finite server may already be joining accepted connections. */
+        task->body_done = 0;
+        pxr_task_wake(task);
+    }
+    pxr_task_release(task);
 }
 void *pxr_async_tcp_serve(pxr_str *address, int64_t port, pxr_tcp_handler handler,
                          int64_t max_requests, int64_t max_bytes,

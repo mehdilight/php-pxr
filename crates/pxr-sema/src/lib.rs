@@ -3751,6 +3751,7 @@ impl Analyzer {
                         "header",
                         "httprequestbody",
                         "canceltask",
+                        "stopserver",
                     ]
                     .iter()
                     .any(|n| name.eq_ignore_ascii_case(n))
@@ -5146,6 +5147,45 @@ impl Analyzer {
                 },
                 ret: Ty::Task(Box::new(Ty::String)),
                 args: values,
+                arg_tys: params,
+                span,
+            });
+        }
+        if key == "stopserver" {
+            if !ctx.is_async || !(1..=2).contains(&args.len()) || !type_args.is_empty() {
+                self.diags.emit(
+                    Diagnostic::error("stopServer requires an async context, a server task and optional int grace milliseconds")
+                        .with_code("E0300").with_span(span),
+                );
+                return None;
+            }
+            let server = self.infer(&args[0], ctx)?;
+            let task = Ty::Task(Box::new(Ty::Void));
+            if server.ty() != task {
+                return self.builtin_ty_err("stopServer", "Task<void> server", &server.ty(), span);
+            }
+            let grace = if args.len() == 2 {
+                self.infer(&args[1], ctx)?
+            } else {
+                TExpr::Int(30000)
+            };
+            if grace.ty() != Ty::Int {
+                return self.builtin_ty_err(
+                    "stopServer",
+                    "int grace milliseconds",
+                    &grace.ty(),
+                    span,
+                );
+            }
+            let params = vec![task, Ty::Int];
+            return Some(TExpr::Call {
+                callee: Callee::User {
+                    mangled: "pxr_async_stop_server".into(),
+                    name: callee.into(),
+                    params: params.clone(),
+                },
+                ret: Ty::Void,
+                args: vec![server, grace],
                 arg_tys: params,
                 span,
             });

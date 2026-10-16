@@ -139,6 +139,9 @@ Cancellation is cooperative. The internal runtime removes pending waits and
 cleans children before releasing a parent frame. Source cancellation now consumes
 handles through `cancelTask`; it does not
 synchronously await cleanup or expose a recoverable cancellation result.
+`stopServer` consumes a direct TCP/HTTP server handle and requests graceful
+shutdown with a bounded period for accepted work before cancellation/join;
+see [the server contract](ASYNC_SERVER.md#graceful-shutdown).
 Recoverable task errors/catch, async cleanup, PHP `finally`, native destructors
 and public streaming socket resources remain unimplemented. Heap reclamation
 of captured values does not supply those resource semantics.

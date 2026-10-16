@@ -29,7 +29,8 @@ worker when they execute.
 > timers, owned TCP exchanges, bounded native TCP servers, consuming cancellation
 > and an async main entry. A bounded HTTP adapter adds isolated request globals,
 > PHP-style output, header() and http_response_code(), bounded chunked bodies,
-> 100-continue and isolated connection/handler failures.
+> 100-continue and isolated connection/handler failures. `stopServer` adds
+> graceful TCP/HTTP shutdown with a deadline for accepted work.
 > Streaming socket APIs, general task error recovery and broader async signatures remain
 > pending; see
 > [`docs/ASYNC.md`](docs/ASYNC.md), [`docs/ASYNC_IO.md`](docs/ASYNC_IO.md),

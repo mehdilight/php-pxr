@@ -696,12 +696,80 @@ static void test_server_cancel(void) {
     }
 }
 
+static int stop_mode, stop_fd;
+static void stop_child_clean(pxr_task *task, void *raw) {
+    if (stop_mode <= 2 || stop_mode == 6 || stop_mode == 7) {
+        errno = 0; assert(fcntl(stop_fd, F_GETFD) == -1 && errno == EBADF);
+    }
+    clean(task, raw);
+}
+static void stop_server_clean(pxr_task *task, void *raw) {
+    pxr_server_cleanup(task, raw); clean(task, raw);
+    if (stop_fd >= 0) { errno = 0; assert(fcntl(stop_fd, F_GETFD) == -1 && errno == EBADF); }
+}
+static void stop_server_fixture(pxr_task *task, void *raw) {
+    pxr_server_frame *frame = raw;
+    frame->started = 1; frame->fd = open("/dev/null", O_RDONLY); assert(frame->fd >= 0);
+    stop_fd = frame->fd;
+    task->resume = pxr_server_resume;
+    if (stop_mode != 4 && stop_mode != 8) {
+        pxr_task *a = new_timer(task, 1, 10), *b = new_timer(task, 2, 20);
+        a->cleanup = b->cleanup = stop_child_clean;
+        pxr_task_start(a); pxr_task_release(a);
+        pxr_task_start(b); pxr_task_release(b);
+    }
+    if (stop_mode == 8) {
+        pxr_task_fail(task, EIO);
+    } else if (stop_mode == 2 || stop_mode == 4) {
+        pxr_server_close(&frame->fd);
+        pxr_task_finish(task, 0, 0); /* Finite server already joining. */
+    } else task->state = PXR_TASK_CHILDREN;
+}
+static void stop_parent(pxr_task *task, void *raw) {
+    pair_frame *frame = raw;
+    if (!frame->pc++) {
+        frame->a = pxr_task_new(task->loop, task, sizeof(pxr_server_frame), 0,
+            stop_server_fixture, stop_server_clean);
+        ((pxr_server_frame *)frame->a->frame)->fd = -1;
+        if (stop_mode == 3) {
+            frame->a->resume = pxr_server_resume; /* Lazy server must not run. */
+            pxr_async_stop_server(frame->a, 100); pxr_task_finish(task, 0, 0); return;
+        }
+        pxr_task_start(frame->a);
+        pxr_task_sleep(task, stop_mode == 4 ? 30 : 0); return;
+    }
+    if (stop_mode == 4) assert(frame->a->state == PXR_TASK_COMPLETE);
+    pxr_async_stop_server(frame->a, stop_mode == 0 ? 100 : stop_mode == 5 ? -1 :
+        stop_mode == 6 ? 0 : stop_mode == 7 ? INT64_MAX : 5);
+    /* stopServer consumes the handle, but this scope must still join it. */
+    pxr_task_finish(task, 0, 0);
+}
+static void test_stop_server(void) {
+    for (stop_mode = 0; stop_mode < 9; stop_mode++) {
+        pxr_loop loop; fake_clock clock = {0}; fake_init(&loop, &clock);
+        cleaned = ran = event_count = 0; stop_fd = -1;
+        pxr_task_new(&loop, NULL, sizeof(pair_frame), 0, stop_parent, clean);
+        pxr_task_result result = pxr_loop_run(&loop);
+        assert(result.status == (stop_mode == 5 || stop_mode == 8 ? PXR_TASK_ERROR : PXR_TASK_OK));
+        if (stop_mode == 5) assert(result.error == EINVAL);
+        if (stop_mode == 8) assert(result.error == EIO);
+        assert(cleaned == (stop_mode == 3 || stop_mode == 4 || stop_mode == 8 ? 2 : 4));
+        if (stop_mode == 0 || stop_mode == 7) assert(clock.now == 20000000 && event_count == 4);
+        if (stop_mode == 1 || stop_mode == 2) assert(clock.now == 5000000 && event_count == 2);
+        if (stop_mode == 3) assert(!clock.now && !ran && !event_count && stop_fd == -1);
+        if (stop_mode == 4) assert(clock.now == 30000000);
+        if (stop_mode == 6) assert(!clock.now && event_count == 2);
+        assert(!loop.timer_count);
+        end_loop(&loop);
+    }
+}
+
 int main(void) {
     alarm(20); /* Turn a scheduler regression into a bounded test failure. */
     test_timers(); test_scope(); test_failure(); test_failure_boundaries(); test_cancellation();
     test_wait_errors(); test_sockets(); test_deep();
     test_retention(); test_io_cleanup(); test_heap();
-    test_frame_roots(); test_failure_order(); test_tcp_cancel(); test_server_cancel();
+    test_frame_roots(); test_failure_order(); test_tcp_cancel(); test_server_cancel(); test_stop_server();
     alarm(0);
     puts("async clean");
 }

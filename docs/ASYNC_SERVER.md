@@ -110,9 +110,49 @@ The first observed task error fails the server, cancels remaining work, and
 propagates to its caller. A malformed configuration reports `EINVAL`; timeout
 reports `ETIMEDOUT`; other socket errors keep their errno. The CLI drains the
 tree, prints `pxr: async task failed: ...`, and exits 255. This first slice has
-no per-connection error recovery. Recoverable errors and graceful shutdown with
-a drain deadline are still future work; cancellation stops active handlers.
+no per-connection error recovery. General recoverable errors remain future work;
+cancellation stops active handlers. For graceful shutdown, use `stopServer` below.
 Cancellation cannot retract bytes already transmitted or undo handler effects.
+
+## Graceful shutdown
+
+`stopServer($server, $graceMs = 30000): void` is a reserved global intrinsic in
+async source. It consumes a lazy or spawned `tcpServeAsync`/`httpServeAsync`
+handle. It does not suspend; the enclosing task scope still joins the server.
+To wait for full shutdown before continuing, put server ownership in an async
+helper and await that helper. A consumed handle cannot be awaited, cancelled,
+stopped again or copied. The intrinsic is case-insensitive and supports function
+imports, just like the server constructors.
+
+```php
+async function serveForOneSecond(): void {
+    $server = spawn httpServeAsync("127.0.0.1", 8080, "handle", 0, 1048576);
+    await sleepAsync(1000);
+    stopServer($server, 5000);
+} // joins the accepted work, including cancellation cleanup after the deadline
+```
+
+On the next executor visit the server closes its listener and accepts no more
+connections. Already accepted connections and all their descendants may finish.
+One absolute monotonic grace deadline starts when `stopServer` is called;
+completions wake the draining server without restarting that deadline. Expiry
+requests structured cancellation of remaining work, then joins cleanup. Expiry
+alone does not report a task error. Existing connection deadlines still apply;
+stopping never extends them or clears an already recorded error. Raw TCP errors
+remain fail-fast, while HTTP retains its connection/handler failure boundaries.
+
+Zero grace cancels unfinished accepted work on the server's next visit. A lazy
+server is cancelled without opening a listener. A finite server already joining
+accepted work can also be stopped with a grace deadline; a completed server's
+handle is simply released. Negative grace or a task that is not a direct server
+operation queues an `EINVAL` task error and cancels/joins the supplied task.
+The compiler requires `Task<void>` and an integer grace value; server identity is
+checked at runtime. Wrapper/helper task handles are not server handles.
+
+The budget bounds the time allowed for accepted work, not a hard wall-clock
+promise for process exit: executor delays and descendant cleanup are cooperative.
+No OS signal handler, cross-scope server registry or detached task is introduced.
+`cancelTask` remains available for immediate cancellation of an unconsumed handle.
 
 ## Next server layers
 
@@ -141,3 +181,8 @@ handler trees and idle/lazy listeners. They assert exactly-once cleanup and
 closed descriptors before executor destruction, test descriptor reuse under
 collection, and use a fake clock to expire an awaiting connection's deadline.
 Primary reading is recorded in [ASYNC_REFERENCES.md](ASYNC_REFERENCES.md).
+Shutdown tests use protocol gates to prove accepted TCP/HTTP requests finish
+after listener closure, including finite servers already joining. Zero/expired
+grace cancels handler-owned sockets/listeners before their ports are reused.
+Fake clocks check exact grace timing, early listener closure, rearming without
+deadline extension, saturation, completed/lazy handles and error precedence.

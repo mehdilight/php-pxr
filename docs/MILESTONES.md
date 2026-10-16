@@ -798,6 +798,12 @@ rebinding and namespace/import dispatch. C tests inspect pending read/write/
 handler/listener cleanup and use a fake clock for handler deadlines. See
 [`ASYNC_SERVER.md`](ASYNC_SERVER.md) and `examples/async/server.php`.
 
+**Delivered graceful shutdown:** `stopServer` consumes a direct TCP/HTTP server
+handle, stops acceptance and joins accepted work with one absolute grace deadline.
+Expiry cancels/joins remaining descendants. Tests cover active requests finishing
+after listener closure, finite servers already joining, zero/expired grace,
+resource reuse after cancellation, lazy/completed handles and error precedence.
+
 **Delivered HTTP slice:** `httpServeAsync` frames bounded HTTP/1.x requests
 without waiting for EOF and invokes native async string/void handlers. Isolated
 `$_GET`, `$_POST`, `$_COOKIE`, `$_SERVER`, `$_REQUEST` and empty `$_FILES` arrays
@@ -826,7 +832,7 @@ pending. Threading remains M7.2.
 AddressSanitizer/UndefinedBehaviorSanitizer. They cover scheduling progress,
 ordered awaits, affine handles, joins/cleanup, control-flow suspension, captured
 values, module resolution, failure propagation, bounded memory and invalid forms.
-All 236 workspace tests, async/HTTP/heap/ownership sanitizer checks, example checks
+All 240 workspace tests, async/HTTP/heap/ownership sanitizer checks, example checks
 and the release build pass.
 M7.1 and M7 remain incomplete until the remaining I/O/lifecycle APIs and their
 source acceptance checks are delivered.

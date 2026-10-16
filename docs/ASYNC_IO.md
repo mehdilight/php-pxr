@@ -97,7 +97,10 @@ work. Other task errors still propagate, drain the structured tree, and cause
 the CLI to report `pxr: async task failed: ...` with exit status 255. Existing
 synchronous fatal errors retain their process-termination behavior.
 
-`sleepAsync`, `tcpExchangeAsync`, `tcpServeAsync` and `cancelTask` are case-insensitive reserved
+For TCP/HTTP listener tasks, [stopServer](ASYNC_SERVER.md#graceful-shutdown)
+adds graceful shutdown with a deadline before cancelling unfinished accepted work.
+
+`sleepAsync`, `tcpExchangeAsync`, `tcpServeAsync`, `cancelTask` and `stopServer` are case-insensitive reserved
 intrinsics. Their lookup works in native namespaces and through function imports.
 Calls with incorrect arity/types, calls from synchronous source, repeated handle
 use, and borrowed values escaping into an operation fail during compilation.

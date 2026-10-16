@@ -1625,3 +1625,250 @@ async function main(): void {{
         }
     }
 }
+
+#[test]
+fn stop_server_drains_accepted_http_and_tcp_work_and_closes_the_listener() {
+    use std::io::{Read, Write};
+    if !have_cc() {
+        return;
+    }
+    for http in [false, true] {
+        for finite in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let gate_port = listener.local_addr().unwrap().port();
+            let port = server_port("127.0.0.1");
+            let gate = std::thread::spawn(move || {
+                for _ in 0..4 {
+                    let mut ready = accept_tcp(&listener);
+                    let mut request = Vec::new();
+                    ready.read_to_end(&mut request).unwrap();
+                    assert_eq!(request, b"ready");
+                    let mut client = connect_http(port);
+                    if http {
+                        client
+                            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                            .unwrap();
+                    } else {
+                        client.write_all(b"request").unwrap();
+                        client.shutdown(std::net::Shutdown::Write).unwrap();
+                    }
+                    let mut hold = accept_tcp(&listener);
+                    request.clear();
+                    hold.read_to_end(&mut request).unwrap();
+                    assert_eq!(request, b"hold");
+                    ready.write_all(b"go").unwrap();
+                    drop(ready);
+                    let mut stopped = accept_tcp(&listener);
+                    request.clear();
+                    stopped.read_to_end(&mut request).unwrap();
+                    assert_eq!(request, b"stopped");
+                    assert!(
+                        std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+                        "listener still accepts after stop"
+                    );
+                    stopped.write_all(b"ok").unwrap();
+                    drop(stopped);
+                    hold.write_all(b"done").unwrap();
+                    drop(hold);
+                    if http {
+                        let (headers, body) = read_http(&mut client);
+                        assert!(headers.starts_with("HTTP/1.1 200 "), "{headers}");
+                        assert_eq!(body, b"done");
+                    } else {
+                        request.clear();
+                        client.read_to_end(&mut request).unwrap();
+                        assert_eq!(request, b"done");
+                    }
+                }
+            });
+            let serve = if http {
+                "httpServeAsync"
+            } else {
+                "tcpServeAsync"
+            };
+            let parameters = if http { "" } else { "string $request" };
+            let count = if finite { 1 } else { 0 };
+            let stop = if finite {
+                "halt($server, 10000)"
+            } else {
+                "halt($server)"
+            };
+            let source = format!(
+                r#"<?php
+namespace App {{
+use function stopServer as halt;
+async function reply({parameters}): string {{
+    return await tcpExchangeAsync("127.0.0.1", {gate_port}, "hold", 4, 10000);
+}}
+async function run(): void {{
+    $server = spawn {serve}("127.0.0.1", {port}, "App\\reply", {count}, 64, 10000, 1);
+    await tcpExchangeAsync("127.0.0.1", {gate_port}, "ready", 2, 10000);
+    {stop};
+    await tcpExchangeAsync("127.0.0.1", {gate_port}, "stopped", 2, 10000);
+    echo "stopping\n";
+}}
+}}
+namespace {{ async function main(): void {{ await \App\run(); }} }}
+"#
+            );
+            run_case(
+                &format!("stop-server-drain-{http}-{finite}"),
+                &source,
+                "stopping\n",
+            );
+            gate.join().unwrap();
+        }
+    }
+}
+
+#[test]
+fn stop_server_grace_expiry_joins_handlers_before_reusing_their_resources() {
+    use std::io::{Read, Write};
+    if !have_cc() {
+        return;
+    }
+    for http in [false, true] {
+        for grace in [0, 25] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let gate_port = listener.local_addr().unwrap().port();
+            let port = server_port("127.0.0.1");
+            let resource = server_port("127.0.0.1");
+            let gate = std::thread::spawn(move || {
+                for _ in 0..4 {
+                    let mut ready = accept_tcp(&listener);
+                    let mut request = Vec::new();
+                    ready.read_to_end(&mut request).unwrap();
+                    assert_eq!(request, b"ready");
+                    let mut client = connect_http(port);
+                    if http {
+                        client
+                            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                            .unwrap();
+                    } else {
+                        client.write_all(b"request").unwrap();
+                        client.shutdown(std::net::Shutdown::Write).unwrap();
+                    }
+                    let mut hold = accept_tcp(&listener);
+                    request.clear();
+                    hold.read_to_end(&mut request).unwrap();
+                    assert_eq!(request, b"hold");
+                    ready.write_all(b"go").unwrap();
+                    drop(ready);
+                    request.clear();
+                    client.read_to_end(&mut request).unwrap();
+                    assert!(
+                        request.is_empty(),
+                        "cancelled handler returned output: {request:?}"
+                    );
+                    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+                    drop(hold);
+                }
+            });
+            let serve = if http {
+                "httpServeAsync"
+            } else {
+                "tcpServeAsync"
+            };
+            let parameters = if http { "" } else { "string $request" };
+            let source = format!(
+                r#"<?php
+async function echoBack(string $request): string {{ return $request; }}
+async function reply({parameters}): string {{
+    $resource = spawn tcpServeAsync("127.0.0.1", {resource}, "echoBack", 0, 64);
+    return await tcpExchangeAsync("127.0.0.1", {gate_port}, "hold", 4, 10000);
+}}
+async function scopedServer(): void {{
+    $server = spawn {serve}("127.0.0.1", {port}, "reply", 1, 64, 10000, 1);
+    await tcpExchangeAsync("127.0.0.1", {gate_port}, "ready", 2, 10000);
+    stopServer($server, {grace});
+    echo "requested\n";
+}}
+async function main(): void {{
+    await scopedServer();
+    $replacement = spawn tcpServeAsync("127.0.0.1", {resource}, "echoBack", 0, 64);
+    await sleepAsync(0); cancelTask($replacement);
+    echo "joined\n";
+}}"#
+            );
+            run_case(
+                &format!("stop-server-expiry-{http}-{grace}"),
+                &source,
+                "requested\njoined\n",
+            );
+            gate.join().unwrap();
+        }
+    }
+}
+
+#[test]
+fn stop_server_consumes_lazy_handles_without_opening_or_running_them() {
+    let port = server_port("127.0.0.1");
+    run_case(
+        "stop-server-lazy",
+        &format!(
+            r#"<?php
+async function reply(string $request): string {{ echo "unreachable"; return $request; }}
+async function handle(): string {{ echo "unreachable"; return "ok"; }}
+async function main(): void {{
+    $tcp = tcpServeAsync("127.0.0.1", {port}, "reply", 0, 64);
+    StOpSeRvEr(move($tcp), 0);
+    stopServer(httpServeAsync("127.0.0.1", {port}, "handle", 0, 64));
+    await sleepAsync(0); echo "stopped\n";
+}}"#
+        ),
+        "stopped\n",
+    );
+}
+
+#[test]
+fn stop_server_rejects_invalid_source_and_runtime_targets() {
+    if !have_cc() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("pxr-stop-server-errors-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (i, source) in [
+        "function stopServer(): void {}",
+        "function f(): void { stopServer(sleepAsync(0)); }",
+        "async function main(): void { stopServer(); }",
+        "async function main(): void { stopServer(1); }",
+        "async function main(): void { stopServer(sleepAsync(0), \"10\"); }",
+        "async function f(): string { return \"x\"; } async function main(): void { stopServer(f()); }",
+        "async function main(): void { $s = sleepAsync(0); stopServer($s); await $s; }",
+        "async function main(): void { $s = sleepAsync(0); stopServer($s); cancelTask($s); }",
+        "async function main(): void { stopServer(sleepAsync(0), 1, 2); }",
+        "async function main(): void { stopServer<int>(sleepAsync(0)); }",
+    ].iter().enumerate() {
+        let path = dir.join(format!("{i}.php")); std::fs::write(&path, format!("<?php {source}")).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_pxr")).arg("check").arg(path).output().unwrap();
+        assert!(!out.status.success(), "case {i} accepted");
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+    for (i, body) in [
+        "stopServer(sleepAsync(0));",
+        "$t = spawn sleepAsync(0); await sleepAsync(10); stopServer($t);",
+        "stopServer(tcpServeAsync(\"127.0.0.1\", 8080, \"reply\", 0, 64), -1);",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let source = format!("<?php async function reply(string $r): string {{ return $r; }} async function main(): void {{ {body} await sleepAsync(0); }}");
+        for opt in [0, 3] {
+            let executable = build(&format!("stop-server-runtime-error-{i}"), &source, opt);
+            for stress in [false, true] {
+                let mut command = Command::new(&executable);
+                command.env("PXR_PHP", "/pxr-no-php-cli");
+                if stress {
+                    command.env("PXR_GC_STRESS", "1");
+                }
+                let out = execute(&mut command);
+                assert_eq!(out.status.code(), Some(255), "{out:?}");
+                assert!(String::from_utf8_lossy(&out.stderr).starts_with("pxr: async task failed:"));
+            }
+            std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+        }
+    }
+}
