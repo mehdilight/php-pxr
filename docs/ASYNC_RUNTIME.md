@@ -117,8 +117,10 @@ scope. Free async generic functions specialize to concrete functions before the
 existing resumable lowering, preserving async identity in signatures and wrapping
 call results as tasks. They use the same precise live-root analysis and task ABI;
 no separate generic runtime or boxed dispatch is introduced. The source uses
-inferred task locals and rejects async methods, owned/borrowed async results and
-async result inference.
+inferred task locals, async methods (including generic/virtual methods), inferred
+results and explicit owned results. Owned result qualifiers are preserved by the
+source ownership pass and await transfers the result exactly once. Borrowed
+results and borrowed async parameters/receivers remain rejected.
 OS threads, `Send`/`Sync`, shared tasks and detached tasks remain future work.
 
 ## Validation

@@ -299,16 +299,16 @@ fn invalid_async_forms_fail_before_codegen() {
         ("entry-result", "async function main(): int { return 1; }".to_string()),
         ("entry-top", "echo 1; async function main(): void {}".to_string()),
         ("generic-main", "async function main<T>(): void {}".to_string()),
-        ("inferred", "async function f() { return 1; }".to_string()),
+        ("inferred-recursion", "async function f() { return await f(); }".to_string()),
         ("borrow-capture", "async function f(&int $x): int { return $x; }".to_string()),
-        ("owned-result", "async function f(): owned<int> { return 1; }".to_string()),
+        ("owned-result-copy", "async function f(owned<int> $x): owned<int> { return $x; }".to_string()),
         ("invalid-operand", "async function main(): void { await 1; }".to_string()),
         ("double-await", "async function main(): void { $t = value(); await $t; await $t; }".to_string()),
         ("double-spawn", "async function main(): void { $t = spawn value(); spawn $t; }".to_string()),
         ("respun-after-reassignment", "async function main(): void { $t = value(); await $t; $t = spawn value(); spawn $t; }".to_string()),
         ("conditional-respawn", "async function main(): void { if (true) { $t = value(); } else { $t = spawn value(); } spawn $t; }".to_string()),
         ("void-value", "async function main(): void { $x = await sleepAsync(0); }".to_string()),
-        ("async-method", "class X { public async function f(): int { return 1; } }".to_string()),
+        ("async-constructor", "class X { public async function __construct() {} }".to_string()),
         ("borrowed-after-move", "class X {} async function f(owned<X> $x): void {} async function main(): void { $x: owned<X> = new X(); $t = f(move($x)); $x; }".to_string()),
         ("overwrite-live-task", "async function main(): void { $t = value(); $t = value(); }".to_string()),
         ("bare-task", "async function main(): void { $t = value(); $t; }".to_string()),
@@ -338,6 +338,114 @@ fn invalid_async_forms_fail_before_codegen() {
         assert!(!out.status.success(), "{name} unexpectedly accepted");
         assert!(!stderr.contains("panicked"), "{name}: {stderr}");
         assert!(stderr.contains("error"), "{name}: {stderr}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn async_methods_inference_dispatch_and_owned_results_work_together() {
+    run_case(
+        "async-methods-inference",
+        r#"<?php
+interface Service { public async function value(int $x): string; }
+class Base implements Service {
+    public async function value(int $x): string { await sleepAsync(0); return "base" . $x; }
+    public static async function id<T>(T $x) { await sleepAsync(0); return $x; }
+}
+class Child extends Base {
+    public async function value(int $x): string { return "child:" . await parent::value($x); }
+}
+class Box<T> {
+    public T $value;
+    public function __construct(T $value) { $this->value = $value; }
+    public async function read() { await sleepAsync(0); return $this->value; }
+}
+async function object() { await sleepAsync(0); return new Child(); }
+async function make<T>(T $x): owned<Box<T>> { await sleepAsync(0); return new Box<T>($x); }
+async function transfer<T>(owned<T> $x): owned<T> { await sleepAsync(0); return move($x); }
+async function main() {
+    $s: Service = new Child(); $task = $s->value(4); echo await $task, ":";
+    echo await Base::id("static"), ":";
+    $obj = await object(); echo await $obj->value(5), ":";
+    $owner = await make(42); $job = spawn transfer(move($owner));
+    $next = await $job; echo await move($next)->read(), "\n";
+}"#,
+        "child:base4:static:child:base5:42\n",
+    );
+}
+
+#[test]
+fn generic_async_methods_dispatch_through_interfaces_traits_and_inheritance() {
+    run_case(
+        "async-generic-methods",
+        r#"<?php
+interface Echoer { public async function echoValue<T>(T $x): T; }
+trait DelayedEcho {
+    public async function echoValue<U>(U $x): U { await sleepAsync(0); return $x; }
+}
+class First implements Echoer { use DelayedEcho; }
+class Second extends First {
+    public async function echoValue<V>(V $x): V { return await parent::echoValue<V>($x); }
+}
+class Factory {
+    public static async function create() { await sleepAsync(0); return new Second(); }
+}
+async function main(): void {
+    $a: Echoer = new First(); $b: Echoer = new Second();
+    $one = spawn $a->echoValue(41); $two = spawn $b->echoValue<string>("two");
+    echo await $one, ":", await $two, ":";
+    $created = await Factory::create(); echo await $created->echoValue("three"), "\n";
+}"#,
+        "41:two:three\n",
+    );
+}
+
+#[test]
+fn async_return_inference_handles_recursive_anchors_widening_and_arrays() {
+    run_case(
+        "async-return-inference",
+        r#"<?php
+async function later<T>(T $x) { await sleepAsync(0); return $x; }
+async function recursive(int $n) { if ($n === 0) { return 7; } return await recursive($n - 1); }
+async function number(bool $int) { if ($int) { return 1; } return await later(2.5); }
+class Values {
+    public async function get(bool $empty) {
+        await sleepAsync(0); if ($empty) { return []; } return ["value"];
+    }
+}
+async function main() {
+    $v = new Values();
+    echo await recursive(4), ":", await number(true) + 0.5, ":", await number(false), ":";
+    $a = await $v->get(false); echo $a[0], ":", count(await $v->get(true)), "\n";
+}"#,
+        "7:1.5:2.5:value:0\n",
+    );
+}
+
+#[test]
+fn invalid_async_method_contracts_and_receiver_escapes_are_diagnosed() {
+    let dir = std::env::temp_dir().join(format!("pxr-async-method-errors-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (i, source) in [
+        "class X { public async function __construct() {} }",
+        "class X { public async function __toString(): string { return \"x\"; } }",
+        "class A { public async function f(): int { return 1; } } class B extends A { public function f(): int { return 1; } }",
+        "interface A { public async function f(): int; } class B implements A { public function f(): int { return 1; } }",
+        "class X { public async function f(&int $x): int { return $x; } }",
+        "class X { public async function f(): int { return 1; } } $x = new X(); $x->f();",
+        "class X { public static async function f(): int { return 1; } } X::f();",
+        "class X { public async function f(): int { return 1; } } async function main(): void { $x: owned<X> = new X(); await $x->f(); }",
+        "class X { public async function f(): int { return 1; } } async function main(): void { $x: owned<X> = new X(); $t = move($x)->f(); echo $x; }",
+        "class X { public async function f(): int { return 1; } } async function main(): void { $x = new X(); $t = $x->f(); await $t; await $t; }",
+        "async function make(): owned<int> { return 1; } async function main(): void { $x = await make(); $a = move($x); echo $x; }",
+        "async function f() { return await f(); }",
+        "class X { public async function f() { return await $this->f(); } }",
+        "async function main() { return 1; }",
+    ].iter().enumerate() {
+        let path = dir.join(format!("{i}.php")); std::fs::write(&path, format!("<?php {source}")).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_pxr")).arg("check").arg(path).output().unwrap();
+        assert!(!out.status.success(), "case {i} accepted");
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"));
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -479,10 +587,10 @@ fn generic_async_invalid_calls_captures_and_specializations_are_diagnosed() {
         ("async function f<T>(T $x): T { return $x; } function g(): void { f(1); }", "E0300"),
         ("async function f<T>(T $x): T { return $x; } $t = f(1);", "E0300"),
         ("async function main<T>(): void {}", "E0300"),
-        ("async function f<T>(T $x) { return $x; }", "E0300"),
+        ("async function f<T>(T $x) { return await f($x); } async function main(): void { await f(1); }", "E0284"),
         ("async function f<T>(&T $x): T { return $x; }", "call-scoped borrows"),
         ("async function f<T>(&mut array<T> $x): void {}", "call-scoped borrows"),
-        ("async function f<T>(owned<T> $x): owned<T> { return move($x); }", "async results"),
+        ("async function f<T>(owned<T> $x): owned<T> { return $x; }", "owned return"),
         ("async function f<T>(T $x): T { return $x; } async function main(): void { $t = f(1); await $t; await $t; }", "error"),
         ("async function f<T>(T $x): T { return $x; } async function main(): void { $a = [f(1)]; }", "error"),
         ("async function f<T>(T $x): T { return $x; } async function main(): void { echo await f(sleepAsync(0)); }", "error"),

@@ -828,9 +828,12 @@ isolation, open-client-write-side framing, large binary bodies, limits, nested
 parameters and cancellation/GC roots. See [`HTTP.md`](HTTP.md),
 `examples/async/http.php` and the finite `examples/async/http_demo.php`.
 
-**Remaining:** streaming socket/resource APIs, recoverable error APIs, broader
-task/result ownership signatures, async methods and
-async return inference. Unsupported source forms
+**Delivered signatures:** async instance/static and generic methods, trait and
+interface dispatch, bounded return inference, and explicit owned task results.
+Moved receivers and results preserve affine ownership; borrowed frame captures
+and borrowed results receive diagnostics.
+
+**Remaining:** streaming socket/resource APIs and recoverable error APIs. Unsupported source forms
 receive diagnostics. The current runtime error envelope does not implement PHP
 exceptions or finally/destructors. Request/response objects, router classes,
 streaming HTTP, uploads, sessions and full PHP web SAPI compatibility remain

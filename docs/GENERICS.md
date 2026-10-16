@@ -75,7 +75,7 @@ are checked before accepting an instantiation.
 
 ## Async generic functions
 
-Free generic functions can be async with an explicit completed-result type:
+Generic functions and methods can be async with explicit or inferred completed-result types:
 
 ```php
 async function delayed<T>(T $value): T {
@@ -91,9 +91,10 @@ Inference, bounds, contextual argument conversion and specialization reuse follo
 the rules above. Each concrete async specialization has a lazy task constructor
 and a resumable body; arrays preserve value semantics and shared objects keep
 their identity across suspension. Owned captures must be moved, while borrowed
-captures, owned/borrowed results and task arguments remain rejected. Calls require
-an async context, and the global async main cannot be generic. Async methods and
-async return inference remain pending. See [ASYNC.md](ASYNC.md).
+captures, borrowed results and task arguments remain rejected. Explicit owned
+results transfer through await. Calls require
+an async context, and the global async main cannot be generic. Overrides and
+interface implementations must preserve the async modifier. See [ASYNC.md](ASYNC.md).
 
 ## Generic classes and interfaces
 

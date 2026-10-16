@@ -755,10 +755,15 @@ impl Parser {
         let start = self.peek().span;
         let mut is_abstract = false;
         let mut is_static = false;
+        let mut is_async = false;
         let mut vis = Visibility::Public;
         let mut has_vis = false;
         loop {
             match self.peek().kind {
+                TokenKind::Async if !is_async => {
+                    is_async = true;
+                    self.advance();
+                }
                 TokenKind::Abstract if !is_abstract => {
                     is_abstract = true;
                     self.advance();
@@ -783,11 +788,12 @@ impl Parser {
             return Err(());
         }
         if self.at(&TokenKind::Function) {
-            let m = self.parse_method(start, vis, is_abstract || is_interface, is_static)?;
+            let mut m = self.parse_method(start, vis, is_abstract || is_interface, is_static)?;
+            m.is_async = is_async;
             return Ok(ClassMember::Method(m));
         }
 
-        if is_abstract || is_interface {
+        if is_abstract || is_interface || is_async {
             self.error(
                 start,
                 "expected an interface method signature or class method",
@@ -908,6 +914,7 @@ impl Parser {
         };
         let end = self.peek().span;
         Ok(MethodDecl {
+            is_async: false,
             type_params,
             bounds,
             is_static,

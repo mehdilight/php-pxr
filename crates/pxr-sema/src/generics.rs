@@ -233,7 +233,7 @@ impl Analyzer {
         virtual_call: bool,
     ) -> Option<TExpr> {
         let declaration = ast::FnDecl {
-            is_async: false,
+            is_async: method.ast_method.is_async,
             bounds: method.ast_method.bounds.clone(),
             type_params: method.ast_method.type_params.clone(),
             name: format!("{}::{}", method.declaring_class, method.name),
@@ -318,7 +318,11 @@ impl Analyzer {
                 name: prepared.signature.display,
                 params,
             },
-            ret: prepared.signature.ret,
+            ret: if prepared.signature.is_async {
+                Ty::Task(Box::new(prepared.signature.ret))
+            } else {
+                prepared.signature.ret
+            },
             args: values,
             arg_tys,
             span,

@@ -64,6 +64,7 @@ fn copy_safe(t: Option<&TypeRef>) -> bool {
 }
 #[derive(Clone)]
 struct Signature {
+    is_static: bool,
     is_async: bool,
     type_params: Vec<String>,
     params: Vec<Option<TypeRef>>,
@@ -82,6 +83,28 @@ struct Value {
     ty: Option<TypeRef>,
     fresh: bool,
     origins: BTreeSet<String>,
+}
+fn call_result(s: Signature, bindings: &BTreeMap<String, TypeRef>, span: Span) -> Value {
+    let ret = s.ret.as_ref().map(|t| substitute(t, bindings));
+    if s.is_async {
+        Value {
+            mode: Mode::Transfer,
+            ty: Some(task_type(ret.unwrap_or(TypeRef::Mixed), span, false)),
+            fresh: false,
+            origins: BTreeSet::new(),
+        }
+    } else {
+        Value {
+            mode: if mode(ret.as_ref()) == Mode::Owned {
+                Mode::Transfer
+            } else {
+                Mode::Shared
+            },
+            ty: ret.as_ref().map(inner),
+            fresh: false,
+            origins: BTreeSet::new(),
+        }
+    }
 }
 impl Value {
     fn plain(ty: Option<TypeRef>) -> Self {
@@ -110,6 +133,7 @@ struct Checker {
     class: Option<String>,
     borrow_argument: Option<Span>,
     task_drops: BTreeSet<Span>,
+    return_types: Vec<Option<TypeRef>>,
 }
 
 pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
@@ -125,6 +149,7 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
         class: None,
         borrow_argument: None,
         task_drops: BTreeSet::new(),
+        return_types: Vec::new(),
     };
     for s in &program.items {
         match s {
@@ -158,6 +183,7 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
                 c.signatures.insert(
                     f.name.to_ascii_lowercase(),
                     Signature {
+                        is_static: true,
                         is_async: f.is_async,
                         type_params: f.type_params.iter().map(|(n, _)| n.clone()).collect(),
                         params: f.params.iter().map(|p| p.ty.clone()).collect(),
@@ -182,7 +208,8 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
                         m.name.to_ascii_lowercase()
                     ),
                     Signature {
-                        is_async: false,
+                        is_static: m.is_static,
+                        is_async: m.is_async,
                         type_params: m.type_params.iter().map(|(n, _)| n.clone()).collect(),
                         params: m.params.iter().map(|p| p.ty.clone()).collect(),
                         ret: m.ret.clone(),
@@ -233,6 +260,71 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
             }
         }
     }
+    let mut inference = Vec::new();
+    for item in &program.items {
+        match item {
+            Stmt::FnDecl(f) if f.ret.is_none() => inference.push((
+                f.name.to_ascii_lowercase(),
+                f.params.clone(),
+                f.body.clone(),
+                None,
+            )),
+            Stmt::ClassDecl(class) => {
+                for member in &class.members {
+                    if let a::ClassMember::Method(m) = member {
+                        if m.ret.is_none() {
+                            inference.push((
+                                format!(
+                                    "{}::{}",
+                                    class.name.to_ascii_lowercase(),
+                                    m.name.to_ascii_lowercase()
+                                ),
+                                m.params.clone(),
+                                m.body.clone(),
+                                if m.is_static {
+                                    None
+                                } else {
+                                    Some(class.name.clone())
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let saved_diags = std::mem::take(&mut c.diags);
+    for _ in 0..64 {
+        let mut changed = false;
+        for (key, params, body, class) in &inference {
+            c.function(params, None, body, class.as_deref(), false);
+            let result = if c.return_types.is_empty() {
+                Some(TypeRef::Void)
+            } else if c.return_types.iter().any(Option::is_none) {
+                None
+            } else {
+                let first = c.return_types[0].clone().unwrap();
+                Some(
+                    if c.return_types.iter().all(|t| t.as_ref() == Some(&first)) {
+                        first
+                    } else {
+                        TypeRef::Mixed
+                    },
+                )
+            };
+            if c.signatures[key].ret != result {
+                c.signatures.get_mut(key).unwrap().ret = result;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    c.diags = saved_diags;
+    c.audited.clear();
+    c.task_drops.clear();
     // Validate qualifier positions even in unused declarations/templates.
     let mut output = program.clone();
     for s in &mut output.items {
@@ -250,12 +342,6 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
                             "call-scoped borrows cannot be captured by lazy async tasks",
                         );
                     }
-                }
-                if mode(f.ret.as_ref()) != Mode::Shared {
-                    c.error(
-                        f.name_span,
-                        "owned or borrowed async results are not supported yet",
-                    );
                 }
             }
             c.function(&f.params, f.ret.as_ref(), &f.body, None, false);
@@ -383,6 +469,11 @@ impl Checker {
                                 self.error(m.span, "native destructors are not supported; use explicit cleanup functions (M6 reclaims memory without user destructor callbacks)");
                             }
                             for p in &m.params {
+                                if m.is_async
+                                    && matches!(mode(p.ty.as_ref()), Mode::Read | Mode::Write)
+                                {
+                                    self.error(p.span, "call-scoped borrows cannot be captured by lazy async methods");
+                                }
                                 if let Some(t) = &p.ty {
                                     self.validate_type(
                                         t,
@@ -417,6 +508,7 @@ impl Checker {
         class: Option<&str>,
         audited: bool,
     ) {
+        self.return_types.clear();
         self.env.clear();
         self.loans.clear();
         self.exits.clear();
@@ -710,6 +802,7 @@ impl Checker {
                 let want = mode(self.ret.as_ref());
                 if let Some(e) = value {
                     let v = self.expr(e);
+                    self.return_types.push(v.ty.clone());
                     if want == Mode::Owned {
                         if v.mode != Mode::Transfer && !(v.fresh && v.mode == Mode::Shared) {
                             self.error(
@@ -721,6 +814,8 @@ impl Checker {
                     } else {
                         self.escape(&v, *span);
                     }
+                } else {
+                    self.return_types.push(Some(TypeRef::Void));
                 }
                 return false;
             }
@@ -1392,7 +1487,16 @@ impl Checker {
                         origins: BTreeSet::new(),
                     }
                 } else {
-                    Value::plain(Some(result))
+                    Value {
+                        mode: if mode(Some(&result)) == Mode::Owned {
+                            Mode::Transfer
+                        } else {
+                            Mode::Shared
+                        },
+                        ty: Some(inner(&result)),
+                        fresh: false,
+                        origins: BTreeSet::new(),
+                    }
                 }
             }
             Expr::Call {
@@ -1554,27 +1658,7 @@ impl Checker {
                     );
                 let bindings = self.arguments(args, sig.as_ref(), reading, *span, name == "strval");
                 if let Some(s) = sig {
-                    Value {
-                        mode: if s.is_async || mode(s.ret.as_ref()) == Mode::Owned {
-                            Mode::Transfer
-                        } else {
-                            Mode::Shared
-                        },
-                        ty: if s.is_async {
-                            Some(task_type(
-                                s.ret
-                                    .as_ref()
-                                    .map(|t| substitute(&inner(t), &bindings))
-                                    .unwrap_or(TypeRef::Mixed),
-                                *span,
-                                false,
-                            ))
-                        } else {
-                            s.ret.as_ref().map(|t| substitute(&inner(t), &bindings))
-                        },
-                        fresh: false,
-                        origins: BTreeSet::new(),
-                    }
+                    call_result(s, &bindings, *span)
                 } else {
                     let ty = match name.as_str() {
                         "strlen" | "count" | "intval" | "substr_count" => Some(TypeRef::Int),
@@ -1618,6 +1702,22 @@ impl Checker {
                     self.validate_type(t, &[], *span);
                 }
                 let receiver = self.expr(base);
+                let async_receiver = receiver
+                    .ty
+                    .as_ref()
+                    .and_then(|t| self.method_for_type(t, name))
+                    .is_some_and(|s| s.is_async);
+                if async_receiver
+                    && (matches!(receiver.mode, Mode::Read | Mode::Write | Mode::Owned)
+                        || !self.loans.is_empty())
+                {
+                    self.error(*span, "async receivers must be shared values or moved owners; call-scoped receiver borrows cannot escape into a task");
+                }
+                if async_receiver && receiver.mode == Mode::Transfer {
+                    if let Some(class) = nominal(receiver.ty.as_ref()) {
+                        self.audited.insert(class);
+                    }
+                }
                 let base_loans = self.loans.len();
                 if receiver.mode == Mode::Read {
                     self.error(*span, "method calls require an exclusive receiver borrow; use a free function for shared reads");
@@ -1651,16 +1751,7 @@ impl Checker {
                 let bindings = self.arguments(args, sig.as_ref(), false, *span, false);
                 self.loans.truncate(base_loans);
                 if let Some(s) = sig {
-                    Value {
-                        mode: if mode(s.ret.as_ref()) == Mode::Owned {
-                            Mode::Transfer
-                        } else {
-                            Mode::Shared
-                        },
-                        ty: s.ret.as_ref().map(|t| substitute(&inner(t), &bindings)),
-                        fresh: false,
-                        origins: BTreeSet::new(),
-                    }
+                    call_result(s, &bindings, *span)
                 } else {
                     Value::plain(None)
                 }
@@ -1680,18 +1771,17 @@ impl Checker {
                 let sig = self
                     .method_for_type(&self.class_type(class_name, type_args, *span), method)
                     .map(|s| specialize_signature(s, method_type_args));
+                if sig.as_ref().is_some_and(|s| s.is_async && !s.is_static)
+                    && self.env.get("this").is_some_and(|b| b.mode != Mode::Shared)
+                {
+                    self.error(
+                        *span,
+                        "class-qualified async calls cannot capture an owned receiver borrow",
+                    );
+                }
                 let bindings = self.arguments(args, sig.as_ref(), false, *span, false);
                 if let Some(s) = sig {
-                    Value {
-                        mode: if mode(s.ret.as_ref()) == Mode::Owned {
-                            Mode::Transfer
-                        } else {
-                            Mode::Shared
-                        },
-                        ty: s.ret.as_ref().map(|t| substitute(&inner(t), &bindings)),
-                        fresh: false,
-                        origins: BTreeSet::new(),
-                    }
+                    call_result(s, &bindings, *span)
                 } else {
                     Value::plain(None)
                 }
@@ -1706,18 +1796,17 @@ impl Checker {
                 let sig = self
                     .method("parent", method)
                     .map(|s| specialize_signature(s, type_args));
+                if sig.as_ref().is_some_and(|s| s.is_async && !s.is_static)
+                    && self.env.get("this").is_some_and(|b| b.mode != Mode::Shared)
+                {
+                    self.error(
+                        *span,
+                        "class-qualified async calls cannot capture an owned receiver borrow",
+                    );
+                }
                 let bindings = self.arguments(args, sig.as_ref(), false, *span, false);
                 if let Some(s) = sig {
-                    Value {
-                        mode: if mode(s.ret.as_ref()) == Mode::Owned {
-                            Mode::Transfer
-                        } else {
-                            Mode::Shared
-                        },
-                        ty: s.ret.as_ref().map(|t| substitute(&inner(t), &bindings)),
-                        fresh: false,
-                        origins: BTreeSet::new(),
-                    }
+                    call_result(s, &bindings, *span)
                 } else {
                     Value::plain(None)
                 }

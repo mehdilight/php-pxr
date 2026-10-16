@@ -334,6 +334,7 @@ pub struct PropertyDecl {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MethodDecl {
+    pub is_async: bool,
     pub type_params: Vec<(String, Span)>,
     pub bounds: Vec<(String, Vec<TypeRef>)>,
     pub is_static: bool,

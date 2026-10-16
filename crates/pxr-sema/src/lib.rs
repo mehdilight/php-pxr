@@ -1088,6 +1088,11 @@ impl Analyzer {
     }
 
     fn synthesize_dispatcher(&self, root_class: &ClassInfo, method: &MethodInfo) -> TFunc {
+        let result = if method.ast_method.is_async {
+            Ty::Task(Box::new(method.ret.clone()))
+        } else {
+            method.ret.clone()
+        };
         let mkey = method.name.to_ascii_lowercase();
         let disp_mangled = mangle_dispatcher(&root_class.name, &method.name);
         let disp_display = format!("{}::{}$dispatch", root_class.name, method.name);
@@ -1164,7 +1169,7 @@ impl Analyzer {
                     name: target_mangled.to_string(),
                     params: p.clone(),
                 },
-                ret: method.ret.clone(),
+                ret: result.clone(),
                 args: call_args,
                 arg_tys: p,
                 span: Span::synthetic(),
@@ -1173,7 +1178,7 @@ impl Analyzer {
 
         let make_return_stmts = |target_mangled: &str| -> Vec<TStmt> {
             let call = make_call(target_mangled);
-            if method.ret == Ty::Void {
+            if result == Ty::Void {
                 vec![
                     TStmt::Expr(call),
                     TStmt::Return {
@@ -1184,7 +1189,7 @@ impl Analyzer {
             } else {
                 vec![TStmt::Return {
                     value: Some(call),
-                    ret: method.ret.clone(),
+                    ret: result.clone(),
                 }]
             }
         };
@@ -1240,7 +1245,7 @@ impl Analyzer {
             name: disp_mangled,
             display: disp_display,
             params: param_tys,
-            ret: method.ret.clone(),
+            ret: result.clone(),
             slots,
             body,
         }
@@ -1710,6 +1715,15 @@ impl Analyzer {
                             );
                         }
                         let mkey = m.name.to_ascii_lowercase();
+                        if m.is_async && mkey.starts_with("__") {
+                            self.diags.emit(
+                                Diagnostic::error(
+                                    "constructors and magic methods must be synchronous",
+                                )
+                                .with_code("E0300")
+                                .with_span(m.name_span),
+                            );
+                        }
                         if !m.type_params.is_empty() && mkey.starts_with("__") {
                             self.diags.emit(
                                 Diagnostic::error(
@@ -1829,6 +1843,13 @@ impl Analyzer {
                                     .with_span(m.name_span),
                                 );
                             }
+                            if m.is_async != existing.ast_method.is_async {
+                                self.diags.emit(
+                                    Diagnostic::error("overrides must preserve the async modifier")
+                                        .with_code("E0300")
+                                        .with_span(m.name_span),
+                                );
+                            }
                             // Overriding inherited method
                             if (!m.type_params.is_empty()
                                 || !existing.ast_method.type_params.is_empty())
@@ -1944,6 +1965,15 @@ impl Analyzer {
                 .collect();
             for (key, requirement) in contracts {
                 if let Some(implementation) = methods.get(&key) {
+                    if implementation.ast_method.is_async != requirement.ast_method.is_async {
+                        self.diags.emit(
+                            Diagnostic::error(
+                                "interface implementations must preserve the async modifier",
+                            )
+                            .with_code("E0300")
+                            .with_span(implementation.name_span),
+                        );
+                    }
                     if (!implementation.ast_method.type_params.is_empty()
                         || !requirement.ast_method.type_params.is_empty())
                         && !self.generic_method_compatible(
@@ -2067,13 +2097,6 @@ impl Analyzer {
                 continue;
             }
 
-            if f.is_async && f.ret.is_none() {
-                self.diags.emit(
-                    Diagnostic::error("async functions currently require an explicit result type")
-                        .with_code("E0300")
-                        .with_span(f.name_span),
-                );
-            }
             if f.is_async && key == "main" && !f.type_params.is_empty() {
                 self.diags.emit(
                     Diagnostic::error("async main cannot be generic")
@@ -2292,6 +2315,7 @@ impl Analyzer {
 
     fn analyze_method_inner(&mut self, class_name: &str, method: &MethodInfo) -> Option<TFunc> {
         let mut ctx = FnCtx::new(method.ret.clone(), false);
+        ctx.is_async = method.ast_method.is_async;
         ctx.infer_return = method.ast_method.ret.is_none()
             && method.name != "__construct"
             && !method.ast_method.is_abstract;
@@ -2330,7 +2354,7 @@ impl Analyzer {
         if !method.ast_method.is_abstract && method.name != "__construct" && method.ret != Ty::Void
         {
             let sig = Signature {
-                is_async: false,
+                is_async: method.ast_method.is_async,
                 mangled: method.mangled.clone(),
                 display: format!("{class_name}::{}", method.name),
                 params: method.params.clone(),
@@ -2357,7 +2381,7 @@ impl Analyzer {
         );
 
         Some(TFunc {
-            is_async: false,
+            is_async: method.ast_method.is_async,
             name: method.mangled.clone(),
             display: format!("{class_name}::{}", method.name),
             params: all_params,
@@ -2405,7 +2429,7 @@ impl Analyzer {
         }
         if let Some(entry) = self.funcs.get("main").filter(|f| f.is_async).cloned() {
             if !entry.params.is_empty()
-                || entry.ret != Ty::Void
+                || (entry.ret != Ty::Void && entry.ret != Ty::Infer)
                 || stmts.iter().any(|s| {
                     !matches!(
                         s,
@@ -3934,6 +3958,14 @@ impl Analyzer {
                     }
                 };
 
+                if method.ast_method.is_async && !ctx.is_async {
+                    self.diags.emit(
+                        Diagnostic::error("async methods require an async context")
+                            .with_code("E0300")
+                            .with_span(*span),
+                    );
+                    return None;
+                }
                 if !self.check_member_visibility(
                     &method.declaring_class,
                     method.visibility,
@@ -4032,7 +4064,11 @@ impl Analyzer {
                         name: format!("{}::{name}", class.name),
                         params: formal_params,
                     },
-                    ret: method.ret,
+                    ret: if method.ast_method.is_async {
+                        Ty::Task(Box::new(method.ret))
+                    } else {
+                        method.ret
+                    },
                     args: typed_args,
                     arg_tys: actual_tys,
                     span: *span,
@@ -4380,6 +4416,14 @@ impl Analyzer {
             );
             return None;
         };
+        if method.ast_method.is_async && !ctx.is_async {
+            self.diags.emit(
+                Diagnostic::error("async methods require an async context")
+                    .with_code("E0300")
+                    .with_span(span),
+            );
+            return None;
+        }
         if method.ast_method.is_abstract {
             self.diags.emit(
                 Diagnostic::error("cannot call an abstract method using class-qualified access")
@@ -4473,7 +4517,11 @@ impl Analyzer {
                 name: format!("{}::{name}", class.name),
                 params: formal,
             },
-            ret: method.ret,
+            ret: if method.ast_method.is_async {
+                Ty::Task(Box::new(method.ret))
+            } else {
+                method.ret
+            },
             args: typed,
             arg_tys: actual,
             span,
