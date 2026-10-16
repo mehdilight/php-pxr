@@ -148,6 +148,85 @@ static void test_array_index(void) {
     pxr_gc_leave(&frame);
 }
 
+static void test_array_cow(void) {
+    pxr_gc_frame frame; void *roots[5] = {0};
+    pxr_gc_enter(&frame, roots); pxr_gc_roots(&frame, 5);
+    pxr_array *original = pxr_array_new(); roots[0] = original;
+    for (int i = 0; i < 1000; i++) pxr_array_push(original, PXR_TAG_INT, i + 1);
+    pxr_ent *backing = original->ents;
+    size_t bytes = pxr_heap_bytes;
+    pxr_array *copy = pxr_array_copy(original); roots[1] = copy;
+    assert(copy != original && copy->ents == backing);
+    assert(pxr_heap_bytes == bytes + sizeof(pxr_array));
+    assert(((pxr_allocation *)backing - 1)->h.array_owners == 2);
+    pxr_array_set(copy, PXR_TAG_INT, 0, NULL, PXR_TAG_INT, 99);
+    assert(copy->ents != backing && original->ents == backing);
+    assert(pxr_array_get_bits(original, PXR_TAG_INT, 0, NULL) == 1);
+    assert(pxr_array_get_bits(copy, PXR_TAG_INT, 0, NULL) == 99);
+    assert(((pxr_allocation *)backing - 1)->h.array_owners == 1);
+
+    /* Reclaiming dead headers restores exclusive ownership without making the
+     * surviving array pay an unnecessary separation on its next mutation. */
+    copy = pxr_array_copy(original); roots[1] = NULL;
+    assert(((pxr_allocation *)backing - 1)->h.array_owners == 2);
+    pxr_gc_collect();
+    assert(((pxr_allocation *)backing - 1)->h.array_owners == 1);
+    pxr_array_push(original, PXR_TAG_INT, 1001);
+    assert(original->ents == backing);
+
+    /* A header/value graph with nested arrays and mixed boxes must retain its
+     * descendants when only the shallow copy remains rooted. */
+    pxr_array *child = pxr_array_new(); roots[2] = child;
+    pxr_array_push(child, PXR_TAG_INT, 7);
+    pxr_array *parent = pxr_array_new(); roots[0] = parent;
+    pxr_array_push(parent, PXR_TAG_ARR, (intptr_t)pxr_array_copy(child));
+    pxr_array_push(parent, PXR_TAG_MIXED, (intptr_t)pxr_mixed_box(PXR_TAG_ARR, (intptr_t)child));
+    copy = pxr_array_copy(parent); roots[1] = copy;
+    pxr_array_prepare_write(copy);
+    pxr_array *inner = (void *)(intptr_t)pxr_array_get_bits(copy, PXR_TAG_INT, 0, NULL);
+    pxr_array_set(inner, PXR_TAG_INT, 0, NULL, PXR_TAG_INT, 42);
+    pxr_array *old_inner = (void *)(intptr_t)pxr_array_get_bits(parent, PXR_TAG_INT, 0, NULL);
+    assert(pxr_array_get_bits(old_inner, PXR_TAG_INT, 0, NULL) == 7);
+    assert(pxr_array_get_bits(inner, PXR_TAG_INT, 0, NULL) == 42);
+    pxr_mixed *mixed = (void *)(intptr_t)pxr_array_get_bits(copy, PXR_TAG_INT, 1, NULL);
+    pxr_array *mixed_child = (void *)(intptr_t)mixed->bits;
+    pxr_array_set(mixed_child, PXR_TAG_INT, 0, NULL, PXR_TAG_MIXED, (intptr_t)pxr_mixed_box(PXR_TAG_INT, 99));
+    pxr_mixed *old_mixed = (void *)(intptr_t)pxr_array_get_bits(parent, PXR_TAG_INT, 1, NULL);
+    pxr_mixed *old_value = (void *)(intptr_t)pxr_array_get_bits((void *)(intptr_t)old_mixed->bits, PXR_TAG_INT, 0, NULL);
+    assert(old_value->tag == PXR_TAG_INT && old_value->bits == 7);
+    roots[0] = roots[2] = NULL; pxr_gc_collect();
+    assert(pxr_array_get_bits(inner, PXR_TAG_INT, 0, NULL) == 42);
+    pxr_mixed *new_value = (void *)(intptr_t)pxr_array_get_bits(mixed_child, PXR_TAG_INT, 0, NULL);
+    assert(new_value->bits == 99);
+
+    /* Copies share an existing string-key index and separate it before growth.
+     * Objects stay shared, as PHP requires, even when array buffers separate. */
+    original = pxr_array_new(); roots[0] = original;
+    pxr_str *key = pxr_str_alloc(3); memcpy(key->data, "k\0x", 3);
+    pxr_object *object = pxr_object_new(1, NULL, 0); roots[2] = object;
+    pxr_array_set(original, PXR_TAG_STR, 0, key, PXR_TAG_OBJ, (intptr_t)object);
+    copy = pxr_array_copy(original); roots[1] = copy;
+    assert(copy->index == original->index && copy->ents == original->ents);
+    pxr_array_push(copy, PXR_TAG_INT, 10);
+    assert(copy->index != original->index && copy->ents != original->ents);
+    assert(pxr_array_get_bits(copy, PXR_TAG_STR, 0, key) == (intptr_t)object);
+    assert(original->len == 1 && copy->len == 2);
+    pxr_gc_collect();
+    assert(pxr_array_get_bits(original, PXR_TAG_STR, 0, key) == (intptr_t)object);
+
+    /* An allocation guard can root a backing buffer independently of the
+     * header: backing buffers themselves must trace all live entry payloads. */
+    pxr_gc_guard guard = {pxr_gc_guards, pxr_heap_serial, NULL}; pxr_gc_guards = &guard;
+    pxr_array *late = pxr_array_new(); pxr_array_push(late, PXR_TAG_INT, 123);
+    pxr_array_push(copy, PXR_TAG_ARR, (intptr_t)late);
+    roots[0] = roots[1] = roots[2] = NULL;
+    pxr_gc_collect();
+    assert(pxr_array_get_bits(late, PXR_TAG_INT, 0, NULL) == 123);
+    pxr_gc_guards = guard.previous;
+    pxr_gc_roots(&frame, 0); pxr_gc_collect(); assert(!pxr_heap_bytes && !pxr_heap_blocks);
+    pxr_gc_leave(&frame);
+}
+
 static void assert_shutdown(void) {
     assert(pxr_heap_head == NULL);
     assert(pxr_heap_blocks == 0);
@@ -159,6 +238,7 @@ int main(int argc, char **argv) {
     assert(argc == 2);
     /* Registered first so this runs AFTER the heap's exit callback. */
     assert(atexit(assert_shutdown) == 0);
+    if (strcmp(argv[1], "array-cow") == 0) { test_array_cow(); return 0; }
     if (strcmp(argv[1], "array-index") == 0) { test_array_index(); return 0; }
     if (strcmp(argv[1], "collection") == 0) { test_collection(); return 0; }
     if (strcmp(argv[1], "alloc-overflow") == 0) pxr_heap_alloc(SIZE_MAX);
@@ -206,7 +286,7 @@ int main(int argc, char **argv) {
     /* Resizing must release every obsolete buffer. */
     assert(pxr_heap_blocks == 3); /* string, array header, current entries */
     pxr_array *copy = pxr_array_copy(array);
-    assert(copy != array && copy->ents != ((pxr_array *)array)->ents);
+    assert(copy != array && copy->ents == ((pxr_array *)array)->ents);
 
     pxr_object *object = pxr_object_new(1, s, 1);
     pxr_object_set_bits(object, 0, PXR_TAG_OBJ, (intptr_t)object); /* cycle */

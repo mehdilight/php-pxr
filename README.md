@@ -172,20 +172,23 @@ Max with PHP 8.4.25 CLI (JIT disabled), nine runs at PXR `-O3` measured:
 
 | Workload | PXR median | PHP median | PXR relative to PHP |
 | --- | ---: | ---: | --- |
-| Recursive fib(30) | 4.42 ms | 87.54 ms | 19.78× faster |
-| Integer loop (5M) | 2.21 ms | 81.42 ms | 36.81× faster |
-| Integer-array append + reads (10k) | 2.99 ms | 28.80 ms | 9.63× faster |
-| String-key array writes + reads (5k) | 4.32 ms | 29.34 ms | 6.79× faster |
-| Read-only array copies (100k × 1k items) | 256.50 ms | 30.54 ms | 8.40× slower |
-| String append (50k) | 187.13 ms | 29.93 ms | 6.25× slower |
-| Objects + methods (2M) | 282.04 ms | 187.63 ms | 1.50× slower |
+| Startup / print | 2.442 ms | 29.893 ms | 12.24× faster |
+| Recursive fib(30) | 4.468 ms | 89.097 ms | 19.94× faster |
+| Integer loop (5M) | 2.317 ms | 82.416 ms | 35.57× faster |
+| Integer-array append + reads (10k) | 3.112 ms | 29.339 ms | 9.43× faster |
+| String-key array writes + reads (5k) | 4.060 ms | 29.574 ms | 7.28× faster |
+| Read-only array copies (100k × 1k items) | 8.210 ms | 30.405 ms | 3.70× faster |
+| Array copy + two overwrites (10k × 1k items) | 16.834 ms | 40.867 ms | 2.43× faster |
+| String append (50k) | 187.149 ms | 30.197 ms | 6.20× slower |
+| Objects + methods (2M) | 290.750 ms | 189.499 ms | 1.53× slower |
 
 Timings include startup and exclude compilation. PHP startup on this configuration
-is about 29 ms; PXR startup is about 2.5 ms. The first array optimization improved
-the dense integer workload by 28.9× and string-key workload by 10.5× relative to
-the previous PXR build. Array copies, strings and objects still need optimization.
-These microbenchmarks are not a general application speedup claim. See the
-[before/after report and raw samples](benchmarks/results/2026-10-16-array-index.md),
+is about 30 ms; PXR startup is about 2.4 ms. Copy-on-write arrays improved the
+read-only copying workload by 31.3× and copy-then-mutate by 1.7× relative to the
+previous PXR build. Strings and objects still need optimization. These
+microbenchmarks are not a general application speedup claim. See the
+[copy-on-write report and raw samples](benchmarks/results/2026-10-16-array-cow.md),
+[earlier array-index optimization](benchmarks/results/2026-10-16-array-index.md),
 [original M7 comparison](benchmarks/results/2026-10-16-m7.md), or re-run
 `./benchmarks/run.sh` on your machine.
 

@@ -220,6 +220,31 @@ async function main(): void {
     );
 }
 #[test]
+fn cow_arrays_keep_task_captures_and_results_independent() {
+    run_case(
+        "cow_tasks",
+        r#"<?php
+async function change(array<array<int>> $values): array<array<int>> {
+    await sleepAsync(0);
+    $child = $values[0]; $child[0] = 42; $values[0] = $child;
+    return $values;
+}
+async function main(): void {
+    $original = [[7, 8], [9]];
+    $task = spawn change($original);
+    $child = $original[0]; $child[0] = 10; $original[0] = $child;
+    await sleepAsync(0);
+    $result = await $task; $copy = $result;
+    $child = $result[0]; $child[0] = 99; $result[0] = $child;
+    $before = $original[0]; $after = $copy[0]; $changed = $result[0];
+    echo $before[0], ":", $after[0], ":", $changed[0], "\n";
+}
+"#,
+        "10:42:99\n",
+    );
+}
+
+#[test]
 fn repeated_awaits_reclaim_frame_values_and_results() {
     if !have_cc() {
         return;

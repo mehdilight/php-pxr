@@ -251,8 +251,9 @@ Rules and limitations:
   keyed form `foreach ($a as $k => $v)` is rejected (`E0242`); iterate with an
   explicit index and `count()` instead.
 * Arrays have PHP **value semantics**: `$b = $a`, passing `$a` to a function,
-  returning an array, and `foreach` all operate on a copy (realised as an eager
-  deep copy), so mutating a copy never affects the original.
+  returning an array, and `foreach` all operate on a copy. Copies share storage
+  until mutation separates it, including nested arrays, so mutating a copy never
+  affects the original. Objects stored inside arrays keep reference identity.
 * Canonical decimal‑integer string keys **are** the integer key (`$a["1"]` is
   `$a[1]`), exactly as in PHP; `"01"`, `"1.5"`, `"+1"` and `" 1"` stay strings.
 

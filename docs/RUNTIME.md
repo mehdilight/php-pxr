@@ -144,9 +144,9 @@ void    *pxr_str_split(const pxr_str *s, long long length);
        /* -> array<string>; length<1 -> fatal ValueError; "" -> [] */
 void    *pxr_array_values(void *a);                   /* reindexed, keys dropped */
 void    *pxr_array_reverse(void *a, long long preserve_keys);
-       /* int keys renumbered unless preserve_keys; deep-copies nested arrays */
+       /* int keys renumbered unless preserve_keys; copies nested array values */
 void    *pxr_array_merge(void *a, void *b);           /* b appended onto a */
-       /* int keys renumbered, string keys overwrite in place, deep copies */
+       /* int keys renumbered, string keys overwrite in place, value copies */
 void    *pxr_array_slice(void *a, long long offset, long long length,
                          long long has_length, long long preserve_keys);
        /* has_length==0 => to the end; string keys always kept */
@@ -192,7 +192,7 @@ long long pxr_array_get_bits(void *a, long long ktag, long long ki, const char *
 long long pxr_array_has(void *a, long long ktag, long long ki, const char *ks); /* for `??` */
 long long pxr_array_count(void *a);
 long long pxr_array_val_bits_at(void *a, long long i);   /* foreach */
-void  *pxr_array_copy(void *a);                /* deep copy (value semantics) */
+void  *pxr_array_copy(void *a);                /* copy-on-write header (value semantics) */
 
 /* objects — allocated on the tracked heap, properties indexed by slot, inheritance */
 void      *pxr_object_new(long long class_id, const pxr_str *class_name, long long num_props);
@@ -255,8 +255,8 @@ order in a contiguous entry buffer. Dense `0..n-1` integer lists use direct
 indexing; sparse integer and string keys use an open-addressed hash index of entry
 positions, with expected constant-time lookup for fixed-length keys. Hash tables
 stay at most half full and are traced through the array header by GC. Overwriting
-an existing key preserves insertion order. Copied non-packed arrays rebuild their
-private index lazily on the first key lookup.
+an existing key preserves insertion order. Copies share both entries and the
+hash index until mutation.
 
 `pxr_array_push` caches the next integer key instead of scanning. The cache copies
 with the array and follows PHP 8.3+ negative-key progression; a string-only array
@@ -264,9 +264,19 @@ starts at zero. Reaching INT64_MAX makes further appends fail without signed
 overflow. Key normalization preserves `"-0"` as a string, while `"0"` is integer zero.
 
 PHP array **value semantics** are enforced at compile time: the backend emits a
-`pxr_array_copy` (a deep copy, recursing into nested arrays) at every store,
-function argument, array-literal element and `foreach` base, so mutation through
-one name is never visible through another. Strings are immutable and shared.
+`pxr_array_copy` at every store, function argument, array-literal element and
+`foreach` base. Copies allocate a small header and share entry/index buffers. The
+first write to shared storage separates those buffers and copies nested array
+headers; nested payload buffers remain shared until their own mutation. Objects
+keep reference identity, and strings remain immutable and shared. Copying is
+constant time; separating an array costs time proportional to its capacity.
+
+Backing allocations track how many array headers own them. GC traces each shared
+entry buffer once, including nested values, and releases dead array headers before
+sweeping any buffers. Dead copies therefore stop forcing separation after
+collection. Unused entry capacity is zeroed so buffer tracing cannot retain stale
+values. Helpers that mutate nested request data separate the parent before
+descending into a child.
 Canonical decimal‑integer string keys are normalised to integer keys inside
 `pxr_array_set`/`_get_bits`/`_has`, matching PHP (`$a["1"]` ≡ `$a[1]`).
 
@@ -298,8 +308,8 @@ into the per‑build temporary directory instead.
 `pxr_mixed_box(tag, bits)` allocates a tag/payload pair. Tags 0–6 identify null,
 int, float, bool, byte string, array, and object. Storage tag 7 denotes a box
 pointer in an array/property slot. Scalars and strings share immutable boxes;
-arrays normalize their entries to mixed boxes and deep-copy through storage,
-arguments, returns, foreach, constructors, and array transforms. Objects retain
+arrays initially normalize their entries to mixed boxes and use copy-on-write
+through storage, arguments, returns, foreach, constructors, and array transforms. Objects retain
 reference identity. Array copies carry comparison lineage until mutation,
 preserving PHP copy-on-write equality shortcuts even with NaN elements.
 

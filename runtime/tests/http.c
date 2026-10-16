@@ -31,6 +31,16 @@ static void inspect_request(pxr_http_context *context) {
     const pxr_mixed *merged = field(context->globals[4], "user"); assert(merged->tag == PXR_TAG_ARR);
     text_equals(text_field((void *)(intptr_t)merged->bits, "first"), "get");
     text_equals(text_field((void *)(intptr_t)merged->bits, "last"), "post");
+    const pxr_mixed *get_user = field(context->globals[0], "user");
+    const pxr_mixed *post_user = field(context->globals[1], "user");
+    assert(!pxr_array_has((void *)(intptr_t)get_user->bits, PXR_TAG_STR, 0, pxr_http_string("last", 4)));
+    assert(!pxr_array_has((void *)(intptr_t)post_user->bits, PXR_TAG_STR, 0, pxr_http_string("first", 5)));
+    /* Mutating a nested request snapshot must not change GET or POST. */
+    assert(pxr_http_register(context->globals[4], pxr_http_string("user[first]", 11), pxr_http_string("changed", 7), 0));
+    text_equals(text_field((void *)(intptr_t)get_user->bits, "first"), "get");
+    text_equals(text_field((void *)(intptr_t)post_user->bits, "last"), "post");
+    merged = field(context->globals[4], "user");
+    text_equals(text_field((void *)(intptr_t)merged->bits, "first"), "changed");
     assert(!pxr_array_has(context->globals[2], PXR_TAG_STR, 0, pxr_http_string("__Host-forged", 13)));
     /* REQUEST and copied GET must not share mutable nested array identities. */
     pxr_http_literal(context->globals[0], "x", "changed");

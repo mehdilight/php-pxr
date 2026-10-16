@@ -48,6 +48,7 @@ fn managed_heap_lifecycle_and_overflow() {
         "format-fatal",
         "collection",
         "array-index",
+        "array-cow",
     ] {
         let out = Command::new(&executable).arg(mode).output().unwrap();
         let fatal = mode.ends_with("fatal");

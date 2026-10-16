@@ -32,26 +32,28 @@ only and cannot provide an interpreter comparison.
 | `arrays.php` | Append 10,000 integers, then read each index |
 | `array_keys.php` | Build and look up 5,000 dynamic string keys |
 | `array_copy.php` | 100,000 read-only copies of a 1,000-element array |
+| `array_copy_write.php` | 10,000 copies of a 1,000-element array, with two overwrites per copy |
 | `strings.php` | 50,000 appends, producing a 400,000-byte string |
 | `objects.php` | 2,000,000 object allocations, property reads and method calls |
 
 ## Current reference results
 
-After the first array optimization: Apple M3 Max, PHP 8.4.25 CLI, OPcache CLI off /
+After the copy-on-write array optimization: Apple M3 Max, PHP 8.4.25 CLI, OPcache CLI off /
 JIT disabled, PXR `-O3`, median of nine after two warmups on 2026-10-16:
 
 | Workload | PXR median | PHP median | PXR relative to PHP |
 | --- | ---: | ---: | --- |
-| Startup / print | 2.461 ms | 29.153 ms | 11.85× faster |
-| Recursive fib(30) | 4.425 ms | 87.536 ms | 19.78× faster |
-| Integer loop (5M) | 2.212 ms | 81.419 ms | 36.81× faster |
-| Integer-array append + reads (10k) | 2.991 ms | 28.795 ms | 9.63× faster |
-| String-key array writes + reads (5k) | 4.323 ms | 29.344 ms | 6.79× faster |
-| Read-only array copies (100k × 1k items) | 256.500 ms | 30.538 ms | 8.40× slower |
-| String append (50k) | 187.133 ms | 29.931 ms | 6.25× slower |
-| Objects + methods (2M) | 282.038 ms | 187.631 ms | 1.50× slower |
+| Startup / print | 2.442 ms | 29.893 ms | 12.24× faster |
+| Recursive fib(30) | 4.468 ms | 89.097 ms | 19.94× faster |
+| Integer loop (5M) | 2.317 ms | 82.416 ms | 35.57× faster |
+| Integer-array append + reads (10k) | 3.112 ms | 29.339 ms | 9.43× faster |
+| String-key array writes + reads (5k) | 4.060 ms | 29.574 ms | 7.28× faster |
+| Read-only array copies (100k × 1k items) | 8.210 ms | 30.405 ms | 3.70× faster |
+| Array copy + two overwrites (10k × 1k items) | 16.834 ms | 40.867 ms | 2.43× faster |
+| String append (50k) | 187.149 ms | 30.197 ms | 6.20× slower |
+| Objects + methods (2M) | 290.750 ms | 189.499 ms | 1.53× slower |
 
-See the [optimization report and before/after samples](results/2026-10-16-array-index.md).
+See the [optimization report and before/after samples](results/2026-10-16-array-cow.md).
 The [original M7 comparison](results/2026-10-16-m7.md) remains available for history.
 
 ## Limits

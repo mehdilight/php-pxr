@@ -15,6 +15,7 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#include <assert.h>
 #include <errno.h>
 #include <math.h>
 #include <stddef.h>
@@ -36,7 +37,7 @@ typedef union pxr_allocation pxr_allocation;
 union pxr_allocation {
     struct {
         pxr_allocation *prev, *next, *hash_next, *gray;
-        size_t size;
+        size_t size, array_owners;
         unsigned kind, marked;
         uint64_t serial;
     } h;
@@ -46,10 +47,12 @@ union pxr_allocation {
 static _Thread_local int pxr_worker_thread;
 static _Thread_local pxr_allocation *pxr_heap_head = NULL;
 static _Thread_local size_t pxr_heap_blocks = 0;
+static _Thread_local size_t pxr_heap_arrays = 0;
 static _Thread_local size_t pxr_heap_bytes = 0;
 static _Thread_local int pxr_heap_initialized = 0;
 static _Thread_local pxr_allocation *pxr_heap_index[4096];
-enum { PXR_HEAP_RAW, PXR_HEAP_ARRAY, PXR_HEAP_OBJECT, PXR_HEAP_MIXED };
+enum { PXR_HEAP_RAW, PXR_HEAP_ARRAY, PXR_HEAP_OBJECT, PXR_HEAP_MIXED, PXR_HEAP_ARRAY_ENTRIES };
+static void pxr_array_release(void *pointer);
 static _Thread_local uint64_t pxr_heap_serial = 0;
 /* A C runtime operation may hold private temporaries when it calls native
  * __toString. Protect its allocation snapshot, while allowing the callback's
@@ -99,6 +102,7 @@ static void pxr_heap_shutdown(void) {
         pxr_heap_head = next;
     }
     pxr_heap_blocks = 0;
+    pxr_heap_arrays = 0;
     pxr_heap_bytes = 0;
     memset(pxr_heap_index, 0, sizeof(pxr_heap_index));
 }
@@ -115,6 +119,7 @@ static void *pxr_heap_alloc(size_t n) {
     block->h.prev = NULL;
     block->h.next = pxr_heap_head;
     block->h.size = n;
+    block->h.array_owners = 0;
     block->h.kind = PXR_HEAP_RAW;
     block->h.marked = 0;
     if (pxr_heap_serial == UINT64_MAX) pxr_oom();
@@ -136,6 +141,7 @@ static void *pxr_heap_alloc(size_t n) {
 static void pxr_heap_free(void *ptr) {
     if (!ptr) return;
     pxr_allocation *block = (pxr_allocation *)ptr - 1;
+    if (block->h.kind == PXR_HEAP_ARRAY) { pxr_array_release(ptr); pxr_heap_arrays--; }
     if (block->h.prev) block->h.prev->h.next = block->h.next;
     else pxr_heap_head = block->h.next;
     if (block->h.next) block->h.next->h.prev = block->h.prev;
@@ -646,6 +652,57 @@ static void pxr_array_share(pxr_array *source, pxr_array *copy) {
     source->shared = 1;
     copy->identity = source->identity; copy->shared = 1;
 }
+void *pxr_array_copy(void *p);
+void *pxr_mixed_copy(void *p);
+static void pxr_array_retain_buffer(void *pointer) {
+    if (!pointer) return;
+    pxr_allocation *block = (pxr_allocation *)pointer - 1;
+    block->h.array_owners = pxr_size_add(block->h.array_owners, 1);
+}
+static void pxr_array_release_buffer(void *pointer) {
+    if (!pointer) return;
+    pxr_allocation *block = (pxr_allocation *)pointer - 1;
+    assert(block->h.array_owners);
+    block->h.array_owners--;
+}
+static void pxr_array_release(void *pointer) {
+    pxr_array *array = pointer;
+    pxr_array_release_buffer(array->ents);
+    pxr_array_release_buffer(array->index);
+}
+/* Header copies share entry/index buffers. Separating a parent also copies
+ * nested array headers, so a later child write cannot affect its old snapshot.
+ * Payload buffers and immutable strings remain shared until their own write. */
+static void pxr_array_make_writable(pxr_array *a) {
+    if (!a->ents || ((pxr_allocation *)a->ents - 1)->h.array_owners == 1) return;
+    pxr_ent *old = a->ents;
+    size_t bytes = pxr_size_mul(a->cap, sizeof(pxr_ent));
+    a->ents = pxr_heap_alloc(bytes);
+    pxr_allocation *block = (pxr_allocation *)a->ents - 1;
+    block->h.kind = PXR_HEAP_ARRAY_ENTRIES; block->h.array_owners = 1;
+    memset(a->ents, 0, bytes);
+    for (size_t i = 0; i < a->len; i++) {
+        a->ents[i] = old[i];
+        if (old[i].vt == PXR_TAG_ARR && old[i].bits)
+            a->ents[i].bits = (intptr_t)pxr_array_copy((void *)(intptr_t)old[i].bits);
+        else if (old[i].vt == PXR_TAG_MIXED && old[i].bits)
+            a->ents[i].bits = (intptr_t)pxr_mixed_copy((void *)(intptr_t)old[i].bits);
+    }
+    pxr_array_release_buffer(old);
+    if (a->index && ((pxr_allocation *)a->index - 1)->h.array_owners > 1) {
+        size_t *previous = a->index;
+        size_t index_bytes = pxr_size_mul(a->index_cap, sizeof(size_t));
+        a->index = pxr_heap_alloc(index_bytes);
+        ((pxr_allocation *)a->index - 1)->h.array_owners = 1;
+        memcpy(a->index, previous, index_bytes);
+        pxr_array_release_buffer(previous);
+    }
+}
+static void pxr_array_prepare_write(pxr_array *a) {
+    if (a->shared || a->identity > 0) { a->identity = pxr_array_fresh_identity(); a->shared = 0; }
+    pxr_array_make_writable(a);
+}
+
 static int pxr_array_is_list(const pxr_array *array) {
     return array->packed;
 }
@@ -739,8 +796,10 @@ static void pxr_array_reindex(pxr_array *a) {
     size_t capacity = 8;
     while (capacity / 2 < a->len) capacity = pxr_size_mul(capacity, 2);
     size_t bytes = pxr_size_mul(capacity, sizeof(size_t));
+    assert(!a->index || ((pxr_allocation *)a->index - 1)->h.array_owners == 1);
     pxr_heap_free(a->index);
     a->index = pxr_heap_alloc(bytes); a->index_cap = capacity;
+    ((pxr_allocation *)a->index - 1)->h.array_owners = 1;
     memset(a->index, 0, bytes);
     for (size_t i = 0; i < a->len; i++) pxr_array_index_insert(a, i);
 }
@@ -765,7 +824,12 @@ static long pxr_array_find(pxr_array *a, long long ktag, long long ki,
 
 static void pxr_array_grow(pxr_array *a, size_t at_least) {
     size_t ncap = pxr_grow_capacity(a->cap, at_least);
+    assert(!a->ents || ((pxr_allocation *)a->ents - 1)->h.array_owners == 1);
     pxr_ent *ne = pxr_heap_resize(a->ents, pxr_size_mul(ncap, sizeof(pxr_ent)));
+    /* GC traces backing buffers once; unused capacity must contain no roots. */
+    memset(ne + a->cap, 0, pxr_size_mul(ncap - a->cap, sizeof(pxr_ent)));
+    pxr_allocation *block = (pxr_allocation *)ne - 1;
+    block->h.kind = PXR_HEAP_ARRAY_ENTRIES; block->h.array_owners = 1;
     a->ents = ne;
     a->cap = ncap;
 }
@@ -773,6 +837,7 @@ static void pxr_array_grow(pxr_array *a, size_t at_least) {
 void *pxr_array_new(void) {
     pxr_array *a = (pxr_array *)pxr_heap_alloc(sizeof(pxr_array));
     ((pxr_allocation *)a - 1)->h.kind = PXR_HEAP_ARRAY;
+    pxr_heap_arrays++;
     a->ents = NULL;
     a->len = 0;
     a->cap = 0;
@@ -785,7 +850,7 @@ void *pxr_array_new(void) {
 void pxr_array_set(void *p, long long ktag, long long ki, const pxr_str *ks,
                    long long vt, long long bits) {
     pxr_array *a = (pxr_array *)p;
-    if (a->shared || a->identity > 0) { a->identity = pxr_array_fresh_identity(); a->shared = 0; }
+    pxr_array_prepare_write(a);
     pxr_norm_key(&ktag, &ki, &ks);
     long idx = pxr_array_find(a, ktag, ki, ks);
     if (idx >= 0) {
@@ -856,40 +921,17 @@ long long pxr_array_val_bits_at(void *p, long long i) {
     return a->ents[(size_t)i].bits;
 }
 
-/*
- * PHP arrays are value types: assignment, passing and returning all copy, and
- * `foreach` iterates a snapshot. PXR realises this with an eager deep copy at
- * every place an array value is stored, passed, returned or iterated over.
- * String keys and string values are immutable, so they are shared; nested
- * arrays are copied recursively. Cycles cannot occur because PXR has no
- * references.
- */
-void *pxr_mixed_copy(void *p);
-
+/* Value copies allocate only a header. Mutation separates shared backing
+ * storage; GC releases dead headers' buffer ownership before sweeping buffers. */
 void *pxr_array_copy(void *p) {
-    pxr_array *s = (pxr_array *)p;
-    pxr_array *d = (pxr_array *)pxr_array_new();
-    if (s->len) {
-        pxr_array_grow(d, s->len);
-    }
-    for (size_t i = 0; i < s->len; i++) {
-        pxr_ent *src = &s->ents[i];
-        int64_t bits = src->bits;
-        if (src->vt == PXR_TAG_ARR && bits) {
-            bits = (int64_t)(intptr_t)pxr_array_copy((void *)(intptr_t)bits);
-        } else if (src->vt == PXR_TAG_MIXED && bits) {
-            bits = (int64_t)(intptr_t)pxr_mixed_copy((void *)(intptr_t)bits);
-        }
-        d->ents[d->len].vt = src->vt;
-        d->ents[d->len].bits = bits;
-        d->ents[d->len].ks = src->ks;
-        d->ents[d->len].ki = src->ki;
-        d->len++;
-    }
-    d->packed = s->packed; d->has_integer = s->has_integer;
-    d->next_index = s->next_index; d->append_overflow = s->append_overflow;
-    pxr_array_share(s, d);
-    return d;
+    pxr_array *source = p;
+    pxr_array *copy = pxr_heap_alloc(sizeof(*copy));
+    ((pxr_allocation *)copy - 1)->h.kind = PXR_HEAP_ARRAY;
+    pxr_heap_arrays++;
+    *copy = *source;
+    pxr_array_retain_buffer(copy->ents); pxr_array_retain_buffer(copy->index);
+    pxr_array_share(source, copy);
+    return copy;
 }
 
 /* ------------------------------------------------- M2 string builtins ----
@@ -1307,7 +1349,7 @@ void *pxr_str_split(const pxr_str *s, long long length) {
 }
 
 /* `array_values`: drop keys, keep insertion order, reindex 0..n-1. Nested
- * arrays are deep-copied so value semantics hold. */
+ * arrays use copy-on-write value copies. */
 void *pxr_array_values(void *p) {
     pxr_array *s = (pxr_array *)p;
     if (pxr_array_is_list(s)) return pxr_array_copy(s);
@@ -1357,10 +1399,10 @@ void *pxr_array_reverse(void *p, long long preserve_keys) {
  *
  * `array_merge`, `array_slice`, `array_pad` and `array_fill` all share the same
  * value semantics as `array_values`/`array_reverse`: nested arrays are
- * deep-copied, scalars and (immutable) strings are shared.
+ * copied with copy-on-write storage; scalars and immutable strings are shared.
  */
 
-/* Copy an array element payload, deep-copying a nested array if needed. */
+/* Copy an array element payload, sharing nested array storage until a write. */
 static int64_t pxr_val_bits_copy(long long vt, int64_t bits) {
     if (vt == PXR_TAG_ARR && bits) {
         return (int64_t)(intptr_t)pxr_array_copy((void *)(intptr_t)bits);
@@ -1397,7 +1439,7 @@ void *pxr_array_merge(void *pa, void *pb) {
 }
 
 /* PHP's two-argument merge can reuse a packed nonempty input when the other
- * is empty. Keep that comparison lineage even though storage copies eagerly. */
+ * is empty. Preserve that comparison lineage alongside shared storage. */
 void *pxr_array_merge_pair(void *pa, void *pb) {
     pxr_array *a = pa, *b = pb, *source = NULL;
     if (!a->len && pxr_array_is_list(b)) source = b;
@@ -2363,7 +2405,13 @@ void *pxr_array_to_mixed(void *p) {
 
 void *pxr_mixed_copy(void *p) {
     const pxr_mixed *value = pxr_mixed_checked(p);
-    return value->tag == PXR_TAG_ARR ? pxr_mixed_box(value->tag, value->bits) : p;
+    if (value->tag != PXR_TAG_ARR) return p;
+    /* An already boxed array has mixed entries: preserve that representation
+     * without recursively normalizing its elements on every value copy. */
+    pxr_mixed *copy = pxr_heap_alloc(sizeof(*copy));
+    ((pxr_allocation *)copy - 1)->h.kind = PXR_HEAP_MIXED;
+    copy->tag = PXR_TAG_ARR; copy->bits = (intptr_t)pxr_array_copy((void *)(intptr_t)value->bits);
+    return copy;
 }
 
 static void *pxr_mixed_payload(const void *p, int tag) {
@@ -3001,9 +3049,13 @@ void pxr_gc_collect(void) {
                 pxr_array *a = ptr;
                 pxr_gc_mark(a->ents);
                 pxr_gc_mark(a->index);
-                for (size_t i = 0; i < a->len; i++) {
-                    pxr_gc_mark(a->ents[i].ks);
-                    pxr_gc_mark_value(a->ents[i].vt, a->ents[i].bits);
+                break;
+            }
+            case PXR_HEAP_ARRAY_ENTRIES: {
+                pxr_ent *entries = ptr;
+                for (size_t i = 0; i < block->h.size / sizeof(*entries); i++) {
+                    pxr_gc_mark(entries[i].ks);
+                    pxr_gc_mark_value(entries[i].vt, entries[i].bits);
                 }
                 break;
             }
@@ -3056,7 +3108,18 @@ void pxr_gc_collect(void) {
             *handle = (*handle)->next;
         }
     }
-    pxr_allocation *block = pxr_heap_head;
+    /* Shared buffers may precede their dead headers in allocation order.
+     * Release all dead array headers while every backing buffer is still alive. */
+    pxr_allocation *block;
+    if (pxr_heap_arrays) {
+        block = pxr_heap_head;
+        while (block) {
+            pxr_allocation *next = block->h.next;
+            if (!block->h.marked && block->h.kind == PXR_HEAP_ARRAY) pxr_heap_free(block + 1);
+            block = next;
+        }
+    }
+    block = pxr_heap_head;
     while (block) {
         pxr_allocation *next = block->h.next;
         if (!block->h.marked) pxr_heap_free(block + 1);

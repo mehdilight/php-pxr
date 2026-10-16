@@ -103,7 +103,9 @@ stringified; their methods/properties are accessed inside PHP helpers. Native
 objects cannot cross into PHP. See [interop rules](INTEROP.md).
 
 Boxes and copies use the tracked heap and precise live-root collection, including
-cyclic object graphs. Affine handles and call-scoped borrows are described in
+cyclic object graphs. Copying an already boxed array shares its backing storage
+until mutation; initial conversion from a typed array still normalizes entries
+to mixed boxes. Affine handles and call-scoped borrows are described in
 [`OWNERSHIP.md`](OWNERSHIP.md).
 Mixed programs that do not execute a PHP boundary run without PHP. See
 [`examples/containers.php`](../examples/containers.php),

@@ -1441,7 +1441,7 @@ impl Lowerer {
 
     /// PHP arrays are value types: assigning, passing, returning and iterating
     /// all work on a copy, so a later mutation can never be observed through
-    /// another name. PXR realises this with an eager deep copy (`pxr_array_copy`)
+    /// another name. PXR realises this with a copy-on-write header (`pxr_array_copy`)
     /// at every place an array value is stored into a location, passed to a
     /// function, embedded in another array, or taken as a `foreach` value.
     fn maybe_copy_array(&mut self, v: Value, ty: &Ty) -> Value {

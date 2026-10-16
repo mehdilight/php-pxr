@@ -4135,3 +4135,47 @@ fn appending_after_the_largest_integer_key_fails_without_overflow() {
         result.stderr
     );
 }
+
+#[test]
+fn cow_arrays_preserve_nested_values_and_shared_objects() {
+    assert_matches_php(
+        "cow_nested",
+        r#"<?php
+function cowBox(mixed $value): mixed {return $value;}
+class CowItem {public int $value = 1;}
+$object = new CowItem(); $inner = [7, 8];
+$a = [$inner, [9]]; $b = $a;
+$first = $b[0]; $first[0] = 42; $b[0] = $first;
+$fromA = $a[0]; $fromB = $b[0];
+echo $fromA[0], ":", $fromB[0], ":", $inner[0], "\n";
+$objects = [$object]; $objectCopies = $objects; $objectCopies[] = new CowItem();
+$alias = $objectCopies[0]; $alias->value = 5;
+echo $object->value, ":", count($objects), ":", count($objectCopies), "\n";
+$m = cowBox(["nested" => [7, 8]]); $n = $m;
+if (is_array($n)) {
+    $v = $n["nested"]; if (is_array($v)) {$v[0] = 99; $n["nested"] = $v;}
+}
+if (is_array($m)) {$v = $m["nested"]; if (is_array($v)) {echo $v[0], ":";}}
+if (is_array($n)) {$v = $n["nested"]; if (is_array($v)) {echo $v[0], "\n";}}
+"#,
+    );
+}
+
+#[test]
+fn cow_arrays_keep_foreach_and_transform_results_independent() {
+    assert_matches_php(
+        "cow_snapshots",
+        r#"<?php
+$a = [1, 2, 3]; $b = $a; $total = 0;
+foreach ($a as $v) {$total += $v; $a[] = 99; $a[0] = 10;}
+echo $total, ":", count($a), ":", count($b), ":", $b[0], "\n";
+$nested = ["x" => [7], "y" => [8]];
+$values = array_values($nested); $child = $values[0]; $child[0] = 42; $values[0] = $child;
+$old = $nested["x"]; $new = $values[0]; echo $old[0], ":", $new[0], "\n";
+$c = array_reverse($nested, true); $child = $c["y"]; $child[0] = 99; $c["y"] = $child;
+$old = $nested["y"]; $new = $c["y"]; echo $old[0], ":", $new[0], "\n";
+$d = array_merge([1, 2], []); $e = $d; $e[0] = 9;
+echo $d[0], ":", $e[0], "\n";
+"#,
+    );
+}

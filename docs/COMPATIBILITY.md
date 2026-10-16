@@ -30,13 +30,13 @@ and whose output the test suite asserts is byte‑identical.
 | **Double‑quoted interpolation** `"$name"`, `"{$name}"` | equivalent to `"" . $name`; `$` not followed by a name start stays literal (`"$"`, `"$1"`, `"foo$"`, `"$$x"`); the array, property and `${...}` forms are rejected (see below) |
 | Infrastructure: typed params, return types, recursion | parameter annotations required; concrete-body returns inferred when omitted |
 | Arrays `[...]` / `array(...)` | ordered maps, `int`/`string` keys, insertion order |
-| **Array value semantics** | assignment, function arguments, returns and `foreach` all operate on copies (copy‑on‑write, realised as an eager deep copy) |
+| **Array value semantics** | assignment, function arguments, returns and `foreach` all operate on copies (copy-on-write storage) |
 | **Array key unification** | a canonical decimal‑integer string key *is* the integer key: `$a["1"]` ≡ `$a[1]` (`"01"`, `"1.5"`, `"+1"`, `" 1"` stay strings) |
 | `count`, `strlen`, `intval`, `floatval`, `strval`, `abs` | |
 | **String builtins** `strtoupper`, `strtolower`, `trim`/`ltrim`/`rtrim`, `substr`, `str_repeat`, `str_replace`, `implode`, `explode`, `str_contains`, `str_starts_with`, `str_ends_with`, `strrev`, `ucfirst`, `lcfirst`, `ucwords`, `str_split`, `str_pad`, `substr_count` | byte-exact vs PHP, embedded NULs safe; see notes below |
 | **Escaping & encoding** `addslashes`, `stripslashes`, `bin2hex`, `base64_encode`, `urlencode`, `rawurlencode`, `urldecode`, `rawurldecode` | byte-exact vs PHP over all 256 byte values, including NULs; see notes below |
 | **Formatted printing** `sprintf`, `printf` | byte-exact vs PHP; supports `%s`, `%d`/`%i`, `%u`, `%f`/`%F`, `%e`/`%E`, `%g`/`%G`, `%x`/`%X`, `%o`, `%b`, `%c`, `%%`, widths, precision, padding, alignment, positional arguments; see notes below |
-| **Array transforms** `array_values`, `array_reverse`, `array_merge`, `array_slice`, `array_pad`, `array_fill`, `array_key_exists` | byte-exact vs PHP; deep-copy nested arrays (value semantics); see notes below |
+| **Array transforms** `array_values`, `array_reverse`, `array_merge`, `array_slice`, `array_pad`, `array_fill`, `array_key_exists` | byte-exact vs PHP; copy nested array values with copy-on-write storage; see notes below |
 | Division `/` is always `float`; `%` is integer remainder | a zero divisor is a fatal `DivisionByZeroError` (exit 255), exactly as in PHP — not IEEE infinity |
 | **Float stringification** (`echo`, `.`, `strval`) | PHP's `zend_gcvt` with precision 14: `0.1+0.2` → `"0.3"`, `1e15` → `"1.0E+15"`, `1e-5` → `"1.0E-5"`, `1.0` → `"1"`, `-0.0` → `"-0"`, `INF`/`-INF`/`NAN` | |
 | `echo true` → `1`, `echo false` → *(nothing)*; `.` on `bool` → `"1"`/`""` | |
@@ -94,10 +94,10 @@ behavioural divergence.
 
 **Array value semantics.** PHP arrays are value types: `$b = $a`, passing `$a`
 to a function, returning and `foreach` all operate on a copy. PXR realises this
-with an eager deep copy at every store/pass/return/iteration, so mutation
-through one name is never visible through another. The current implementation
-copies eagerly (not lazily); the observable result is identical. Strings are
-immutable and shared, so they need no copy.
+with a copy-on-write array header at every store/pass/return/iteration. Copies
+share backing storage until a write separates it, so mutation through one name
+is never visible through another. Nested array values follow the same rule;
+objects keep reference identity. Strings are immutable and shared.
 
 **Integer overflow.** `PHP_INT_MAX + 1` yields a `float` in PHP (and so does
 negating `PHP_INT_MIN` — e.g. `abs(1 << 63)` — which PHP also promotes to
@@ -161,8 +161,8 @@ delimiters `" \t\n\r\f\v"`. `str_split` chunks into at-most-`length` byte pieces
 raises PHP's fatal `ValueError` (exit 255). `array_values` drops keys and
 reindexes; `array_reverse` reverses order, renumbering integer keys and keeping
 string keys (or keeping all keys when the second argument is `true`). Both
-deep-copy nested arrays so value semantics hold. All of these are verified
-byte‑for‑byte against PHP 8.4, including embedded-NUL cases.
+copy nested array values with copy-on-write storage so value semantics hold. All
+of these are verified byte‑for‑byte against PHP 8.4, including embedded-NUL cases.
 
 **Escaping & encoding.** `addslashes` backslash-escapes `'`, `"` and `\` and
 turns a NUL byte into the two characters `\0`; `stripslashes` is PHP's exact

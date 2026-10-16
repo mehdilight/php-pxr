@@ -125,6 +125,7 @@ void pxr_http_header(pxr_str *line, int64_t replace, int64_t code) {
         pxr_http_equal(line->data, name, "connection") || pxr_http_equal(line->data, name, "trailer") ||
         pxr_http_equal(line->data, name, "upgrade")) { context->error = EINVAL; return; }
     pxr_array *headers = context->response_headers;
+    pxr_array_prepare_write(headers);
     if (replace) for (size_t i = 0; i < headers->len;) {
         pxr_str *old = (void *)(intptr_t)headers->ents[i].bits;
         const char *old_colon = memchr(old->data, ':', old->len);
@@ -134,6 +135,13 @@ void pxr_http_header(pxr_str *line, int64_t replace, int64_t code) {
         if (!same) { i++; continue; }
         memmove(headers->ents + i, headers->ents + i + 1, (headers->len - i - 1) * sizeof(pxr_ent)); headers->len--;
     }
+    /* Response header keys are private. Compact to a packed list after removal
+     * and clear the vacated GC slot before appending the replacement. */
+    for (size_t i = 0; i < headers->len; i++) { headers->ents[i].ks = NULL; headers->ents[i].ki = (int64_t)i; }
+    if (headers->ents) memset(headers->ents + headers->len, 0, (headers->cap - headers->len) * sizeof(pxr_ent));
+    pxr_heap_free(headers->index); headers->index = NULL; headers->index_cap = 0;
+    headers->packed = 1; headers->has_integer = headers->len != 0;
+    headers->next_index = (int64_t)headers->len; headers->append_overflow = 0;
     size_t length = line->len;
     for (size_t i = 0; i < headers->len; i++) length = pxr_size_add(length, ((pxr_str *)(intptr_t)headers->ents[i].bits)->len + 2);
     if (headers->len >= 100 || length > 16384) { context->error = EMSGSIZE; return; }
@@ -256,6 +264,7 @@ static int pxr_http_register(pxr_array *array, pxr_str *name, pxr_str *value, in
         if (at < end && name->data[at] != '[') return 0;
     }
     for (size_t i = 0; i < count; i++) {
+        pxr_array_prepare_write(array);
         pxr_str *key = keys[i];
         long long ktag = PXR_TAG_STR, ki = 0; const pxr_str *ks = key;
         if (append[i]) {
@@ -453,6 +462,7 @@ static int pxr_http_parse_headers(pxr_http_context *context, const char *data) {
     return 0;
 }
 static void pxr_http_merge(pxr_array *destination, pxr_array *source) {
+    pxr_array_prepare_write(destination);
     for (size_t i = 0; i < source->len; i++) {
         pxr_ent *entry = &source->ents[i];
         long old = pxr_array_find(destination, entry->ks ? PXR_TAG_STR : PXR_TAG_INT, entry->ki, entry->ks);

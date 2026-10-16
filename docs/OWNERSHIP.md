@@ -116,7 +116,8 @@ Ownership modes survive source checking across modules, namespace aliases,
 traits, generics, interfaces, inheritance, and virtual calls. Overrides and
 interface implementations preserve parameter/result modes. A validated argument
 marker tells lowering when array transfer/borrowing must avoid a PHP argument
-copy; the qualifiers otherwise erase to existing native value representations.
+copy; ordinary array value copies share backing storage until mutation. The
+qualifiers otherwise erase to existing native value representations.
 Generic ownership operations are checked even in unused template bodies. A final
 check against concrete specialized types prevents ordinary coercion wrappers
 from changing the storage representation of a borrow.
