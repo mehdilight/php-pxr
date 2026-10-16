@@ -265,6 +265,7 @@ impl LValue {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FnDecl {
+    pub is_async: bool,
     pub type_params: Vec<(String, Span)>,
     pub bounds: Vec<(String, Vec<TypeRef>)>,
     pub name: String,

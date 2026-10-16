@@ -16,7 +16,10 @@ pub(crate) enum Root {
 }
 
 pub(crate) fn pointer(ty: &Ty) -> bool {
-    matches!(ty, Ty::String | Ty::Array(_) | Ty::Named(_) | Ty::Mixed)
+    matches!(
+        ty,
+        Ty::String | Ty::Array(_) | Ty::Named(_) | Ty::Task(_) | Ty::Mixed
+    )
 }
 
 pub(crate) fn safepoint(inst: &Inst) -> bool {

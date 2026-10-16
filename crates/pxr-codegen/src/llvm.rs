@@ -22,6 +22,17 @@ pub struct LlvmOptions {
 /// Runtime entry points and their C signatures.
 const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     ("abort", "void", &[]),
+    ("pxr_async_create", "ptr", &["ptr", "i64"]),
+    ("pxr_async_get", "i64", &["ptr", "i64"]),
+    ("pxr_async_set", "void", &["ptr", "i64", "i64", "i64"]),
+    ("pxr_async_publish", "void", &["ptr", "ptr"]),
+    ("pxr_async_await", "void", &["ptr", "ptr"]),
+    ("pxr_async_take", "i64", &["ptr"]),
+    ("pxr_async_finish", "void", &["ptr", "i64", "i64"]),
+    ("pxr_async_spawn", "ptr", &["ptr"]),
+    ("pxr_async_sleep_task", "ptr", &["i64"]),
+    ("pxr_async_run", "void", &["ptr"]),
+    ("pxr_async_drop", "void", &["ptr"]),
     ("pxr_gc_enter", "void", &["ptr", "ptr"]),
     ("pxr_gc_roots", "void", &["ptr", "i64"]),
     ("pxr_gc_leave", "void", &["ptr"]),
@@ -157,7 +168,7 @@ pub fn llty(ty: &Ty) -> &'static str {
         // literal itself is otherwise rejected at compile time.
         Ty::Null => "ptr",
         Ty::Array(_) => "ptr",
-        Ty::Named(_) => "ptr",
+        Ty::Named(_) | Ty::Task(_) => "ptr",
     }
 }
 
@@ -169,6 +180,8 @@ fn align_of(ty: &Ty) -> u32 {
 }
 
 pub fn emit_llvm(module: &Module, opts: &LlvmOptions) -> String {
+    let lowered = crate::async_lower::lower(module);
+    let module = &lowered;
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -404,6 +417,12 @@ impl<'a> FnGen<'a> {
 
     fn emit_inst(&mut self, inst: &Inst) {
         match inst {
+            Inst::FunctionAddr { dst, name } => {
+                self.set(*dst, Ty::Named("__pxr_callback".into()));
+                self.line(&format!(
+                    "%v{dst} = select i1 true, ptr @{name}, ptr @{name}"
+                ));
+            }
             Inst::Label(l) => {
                 let _ = writeln!(self.out, "bb{l}:");
             }
@@ -477,13 +496,17 @@ impl<'a> FnGen<'a> {
                     (Ty::Mixed, Ty::Int)
                     | (Ty::String, Ty::Int)
                     | (Ty::Array(_), Ty::Int)
-                    | (Ty::Named(_), Ty::Int) => {
+                    | (Ty::Named(_), Ty::Int)
+                    | (Ty::Task(_), Ty::Int)
+                    | (Ty::Null, Ty::Int) => {
                         format!("%v{dst} = ptrtoint ptr %v{src} to i64")
                     }
                     (Ty::Int, Ty::Mixed)
                     | (Ty::Int, Ty::String)
                     | (Ty::Int, Ty::Array(_))
-                    | (Ty::Int, Ty::Named(_)) => {
+                    | (Ty::Int, Ty::Named(_))
+                    | (Ty::Int, Ty::Task(_))
+                    | (Ty::Int, Ty::Null) => {
                         format!("%v{dst} = inttoptr i64 %v{src} to ptr")
                     }
                     _ => format!("%v{dst} = bitcast i64 %v{src} to i64"),

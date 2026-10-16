@@ -27,8 +27,8 @@ PXR deliberately makes its own choices. The first executor is single-threaded,
 uses POSIX `poll` without a libuv dependency, has no detached children, and uses
 an internal status/error envelope rather than adopting Swift exceptions or Rust
 traits. Managed frame roots integrate with PXR's collector. The compiler's
-future task types and consumption checker must enforce this runtime contract;
+task types and consumption checker enforce the first source slice of this runtime contract;
 these references do not establish PHP compatibility or source support.
 
 See [ASYNC_RUNTIME.md](ASYNC_RUNTIME.md) for the implemented internal contract and
-[ASYNC.md](ASYNC.md) for the pending source language work.
+[ASYNC.md](ASYNC.md) for supported source syntax and remaining work.

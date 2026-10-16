@@ -189,6 +189,11 @@ pub enum Inst {
         args: Vec<Value>,
         ret: Ty,
     },
+    /// Address of a generated resume callback.
+    FunctionAddr {
+        dst: Value,
+        name: String,
+    },
     SlotAlloc {
         slot: Slot,
         ty: Ty,
@@ -243,7 +248,8 @@ impl Inst {
             | Inst::Un { dst, .. }
             | Inst::Cast { dst, .. }
             | Inst::BitCast { dst, .. }
-            | Inst::SlotGet { dst, .. } => Some(*dst),
+            | Inst::SlotGet { dst, .. }
+            | Inst::FunctionAddr { dst, .. } => Some(*dst),
             Inst::Call { dst, .. } => *dst,
             _ => None,
         }
@@ -273,6 +279,7 @@ pub struct Function {
     pub display: String,
     pub params: Vec<Ty>,
     pub ret: Ty,
+    pub is_async: bool,
     pub slots: Vec<Ty>,
     pub body: Vec<Inst>,
     next_value: Value,
@@ -292,6 +299,7 @@ impl Function {
             display: display.into(),
             params,
             ret,
+            is_async: false,
             slots: Vec::new(),
             body: Vec::new(),
             next_value,
@@ -359,7 +367,12 @@ impl Function {
             .map(|(i, t)| format!("%v{i}: {t}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let _ = writeln!(out, "func {}({}) -> {} {{", self.name, params, self.ret);
+        let prefix = if self.is_async { "async " } else { "" };
+        let _ = writeln!(
+            out,
+            "{prefix}func {}({}) -> {} {{",
+            self.name, params, self.ret
+        );
         for (i, ty) in self.slots.iter().enumerate() {
             let _ = writeln!(out, "  slot %s{i}: {ty}");
         }
@@ -394,6 +407,7 @@ fn fmt_bytes_lit(s: &[u8]) -> String {
 
 fn fmt_inst(inst: &Inst) -> String {
     match inst {
+        Inst::FunctionAddr { dst, name } => format!("%v{dst} = function @{name}"),
         Inst::Label(l) => format!("bb{l}:"),
         Inst::Const { dst, lit } => {
             let v = match lit {

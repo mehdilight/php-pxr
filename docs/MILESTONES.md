@@ -728,12 +728,12 @@ remain shared. These rejected forms are documented in [`OWNERSHIP.md`](OWNERSHIP
 M6 does not claim full PHP reference support or `Send`/`Sync` guarantees.
 **Next:** M7.1 — async functions and structured tasks.
 
-## ⛔ M7 — Async I/O & concurrency
+## 🚧 M7 — Async I/O & concurrency
 
 **Sequencing.** M5 generics and M6 affine ownership/live-root reclamation are
-complete. The internal structured executor foundation is delivered below. Async
-syntax, typing and lowering remain unavailable in the compiler.
-See [`ASYNC.md`](ASYNC.md) for the proposed syntax and execution contract.
+complete. The structured runtime and first native source slice are delivered
+below. See [`ASYNC.md`](ASYNC.md) for runnable syntax, current boundaries and
+the execution contract.
 
 ### 🚧 M7.1 — Async functions & structured tasks
 
@@ -768,14 +768,30 @@ completed-task retention at `-O0`/`-O3`, including forced GC and sanitizer build
 See [`ASYNC_RUNTIME.md`](ASYNC_RUNTIME.md) for the contract and
 [`ASYNC_REFERENCES.md`](ASYNC_REFERENCES.md) for cloned primary references.
 
-**Remaining:** lexer/parser syntax, `Task<T>` and handle typing/consumption,
-borrow-capture checks, typed-IR suspension lowering and generated frame roots,
-source error/cancellation APIs, async CLI entry and public I/O operations.
-**Validation:** 203 workspace tests pass; async/heap/ownership sanitizer checks,
-example checks and the release build pass.
+**Delivered source slice:** free async functions with explicit results,
+`await`/`spawn`, `sleepAsync`, and automatic global async main. `Task<T>` is a
+concrete internal type; inferred task locals are affine, cannot escape their
+creating scope, and cannot be boxed into mixed. Moved owned captures survive
+suspension, and call-borrow capture/cross-suspension is rejected. The LLVM backend
+lowers optimized async IR to constructors and resumable heap frames with precise
+live-root bitmaps, including packed pointer intermediates. Results/locals support
+scalars, strings, arrays, shared objects and mixed; native module/name resolution
+and ordinary control flow work around awaits. See `examples/async/main.php`.
 
-Hand-written C frames do not satisfy the compiler end-to-end acceptance checks;
-M7.1 and M7 remain incomplete.
+**Remaining:** public source socket operations/resources, source cancellation and
+recoverable error APIs, broader task/result ownership signatures, generic async
+functions, async methods and async return inference. Unsupported source forms
+receive diagnostics. The current runtime error envelope does not implement PHP
+exceptions or finally/destructors. Threading remains M7.2.
+
+**Validation:** native source tests run at `-O0`/`-O3`, normal/forced GC, and with
+AddressSanitizer/UndefinedBehaviorSanitizer. They cover scheduling progress,
+ordered awaits, affine handles, joins/cleanup, control-flow suspension, captured
+values, module resolution, failure propagation, bounded memory and invalid forms.
+All 211 workspace tests, async/heap/ownership sanitizer checks, example checks
+and the release build pass.
+M7.1 and M7 remain incomplete until the remaining I/O/lifecycle APIs and their
+source acceptance checks are delivered.
 
 ### ⛔ M7.2 — Threaded parallelism
 

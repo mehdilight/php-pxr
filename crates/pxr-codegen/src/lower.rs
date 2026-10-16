@@ -103,6 +103,8 @@ fn lower_func(tf: &TFunc) -> Function {
         tf.ret.clone(),
     ));
 
+    lw.f.is_async = tf.is_async;
+
     // Slots live in the entry block so LLVM can promote them to registers.
     // Registering them through `alloc_slot` keeps the slot table in sync so
     // that compiler-private temporaries (short-circuit results) get fresh ids.
@@ -276,7 +278,10 @@ impl Lowerer {
                 self.emit(Inst::Print { ty, src: v });
             }
             TStmt::Expr(e) => {
-                let _ = self.lower_expr(e);
+                let value = self.lower_expr(e);
+                if matches!(e.ty(), Ty::Task(_)) {
+                    self.rt_call("pxr_async_drop", vec![value], Ty::Void);
+                }
             }
             TStmt::Assign { target, ty, value } => {
                 let mut v = self.lower_expr(value);

@@ -34,6 +34,11 @@ pub(super) fn type_ref(ty: &Ty) -> ast::TypeRef {
         Ty::Null => R::EmptyElement,
         Ty::Array(element) => R::Array(Box::new(type_ref(element))),
         Ty::Named(name) => R::Named(name.clone()),
+        Ty::Task(result) => R::Applied(
+            "$pxr_task".into(),
+            vec![type_ref(result)],
+            Span::synthetic(),
+        ),
     }
 }
 

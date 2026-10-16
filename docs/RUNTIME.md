@@ -356,8 +356,8 @@ runtime and the generated native executable.
 ## Async foundation
 
 The embedded runtime also includes an internal structured executor with heap
-frames, timers, POSIX readiness waits and precise task roots. It is currently
-exercised by native C integration tests; compiler async syntax/lowering is still
-pending. See [`ASYNC_RUNTIME.md`](ASYNC_RUNTIME.md) for lifecycle, result, error,
+frames, timers, POSIX readiness waits and precise task roots. Free async
+functions, affine task locals, timers and an async entry now compile to generated
+resumable frames; public source socket/cancellation APIs remain pending. See [`ASYNC_RUNTIME.md`](ASYNC_RUNTIME.md) for lifecycle, result, error,
 cancellation and descriptor ownership rules. Existing synchronous programs do
 not start an executor.

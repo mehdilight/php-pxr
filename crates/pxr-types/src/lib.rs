@@ -30,11 +30,14 @@ pub enum Ty {
     Array(Box<Ty>),
     /// A named type (class, struct or future generic instantiation).
     Named(String),
+    /// A single-consumer structured asynchronous computation.
+    Task(Box<Ty>),
 }
 
 impl Ty {
     pub fn contains_infer(&self) -> bool {
-        matches!(self, Ty::Infer) || matches!(self, Ty::Array(element) if element.contains_infer())
+        matches!(self, Ty::Infer)
+            || matches!(self, Ty::Array(element) | Ty::Task(element) if element.contains_infer())
     }
     /// Construct `array<elem>`.
     pub fn array(elem: Ty) -> Ty {
@@ -71,7 +74,7 @@ impl Ty {
             return true;
         }
         match (self, to) {
-            (from, Ty::Mixed) if *from != Ty::Void => true,
+            (from, Ty::Mixed) if *from != Ty::Void && !matches!(from, Ty::Task(_)) => true,
             (Ty::Int, Ty::Float) => true,
             // An empty array literal (element type `null`) is assignable to any
             // array type; the element type is refined at the assignment site.
@@ -92,6 +95,7 @@ impl Ty {
             Ty::Null => "null",
             Ty::Array(_) => "array",
             Ty::Named(n) => n.as_str(),
+            Ty::Task(_) => "Task",
         }
     }
 }
@@ -100,6 +104,7 @@ impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Ty::Array(e) => write!(f, "array<{e}>"),
+            Ty::Task(e) => write!(f, "Task<{e}>"),
             other => f.write_str(other.name()),
         }
     }

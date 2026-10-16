@@ -1,10 +1,10 @@
 # Async runtime foundation — M7.1 in progress
 
 `runtime/pxr_async.c` implements a single-thread executor tested with native,
-hand-written resumable frames. The driver embeds it alongside `pxr_rt.c`, so
-standalone programs need no checkout or external async library. **The compiler
-does not yet accept or lower async syntax.** These internal C interfaces are not
-a public FFI or a stable generated-code ABI.
+hand-written and compiler-generated resumable frames. The driver embeds it
+alongside `pxr_rt.c`, so standalone programs need no checkout or external async
+library. The first compiler source slice is documented in [ASYNC.md](ASYNC.md).
+These internal C interfaces are not a public FFI or a stable generated-code ABI.
 
 ## Execution and suspension
 
@@ -101,9 +101,10 @@ The runtime does not support abandoning an active loop; its root must be driven
 through completion/cancellation before destruction. Process aborts/signals keep
 the existing terminal cleanup limitations.
 
-The source checker must still prevent call-scoped borrows from entering lazy
-frames, enforce affine task/result consumption and reject escaping child handles.
-The existing synchronous checker does not provide those async guarantees yet.
+The source checker rejects call-scoped borrows entering lazy frames, checks
+affine task/result consumption and prevents child handles escaping their creating
+scope. The first slice uses inferred task locals and rejects generic async
+functions, async methods, owned/borrowed async results and async result inference.
 OS threads, `Send`/`Sync`, shared tasks and detached tasks remain future work.
 
 ## Validation
@@ -128,5 +129,26 @@ A per-process alarm bounds scheduler regressions. The harness checks:
 * 2,000 repeated await/take operations with bounded retained frame memory and
   immediate release of completed child control records.
 
-These are runtime integration tests. Compiler end-to-end tests for the syntax,
-types, ownership, entry point and lowering remain required before M7.1 completes.
+`cargo test -p pxr --test async_source` additionally exercises PHP source through
+parsing, typing, ownership, IR optimization, frame lowering and native execution,
+including forced GC and optional sanitizers. Public source socket operations and
+cancellation/error APIs remain required before M7.1 completes.
+
+## Generated-code bridge
+
+The constructor passes its resume callback to `pxr_async_create`. Frames store
+program counter, SSA values and local slots in 64-bit cells. `pxr_async_set`
+registers a stored pointer immediately; `pxr_async_publish` atomically replaces
+the root table using a compiler liveness bitmap. The backend preserves packed
+pointer annotations through frame reloads and stores, so stack safepoints in
+mixed/array operations retain those values too. No collection occurs inside the
+cell/root helpers. Ordinary generated safepoints still protect the calls.
+
+`pxr_async_await` suspends the current parent; its continuation uses
+`pxr_async_take` exactly once. `pxr_async_finish` records a result and begins the
+structured join. `pxr_async_spawn` starts a lazy child, while `pxr_async_drop`
+releases a handle without detaching started work. `pxr_async_run` drives the CLI
+root and drains errors before closing the executor. The compiler currently emits
+no source operation for explicitly cancelling an awaited child; the bridge's
+successful take assumes the parent was not cancelled or failed, since those
+paths do not resume its body. These symbols are internal, not public FFI APIs.

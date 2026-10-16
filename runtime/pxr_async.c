@@ -383,3 +383,80 @@ static void pxr_loop_destroy(pxr_loop *loop) {
     free(loop->timers); free(loop->poll_fds); free(loop->poll_tasks);
     memset(loop, 0, sizeof(*loop));
 }
+
+/* Generated-code bridge. Cells are 64-bit ABI payloads; a pointer bitmap
+ * atomically replaces the frame's live root view. Storing a new pointer roots
+ * it immediately, before a following generated safepoint can collect it. */
+static pxr_loop pxr_compiler_loop;
+static int pxr_compiler_loop_initialized;
+void *pxr_async_create(pxr_task_callback callback, int64_t cells) {
+    assert(cells > 0);
+    if (!pxr_compiler_loop_initialized) {
+        pxr_loop_init(&pxr_compiler_loop);
+        pxr_compiler_loop_initialized = 1;
+    }
+    pxr_task *task = pxr_task_new(&pxr_compiler_loop, pxr_compiler_loop.current,
+        pxr_size_mul((size_t)cells, sizeof(int64_t)), (size_t)cells, callback, NULL);
+    pxr_task_roots(task, (size_t)cells);
+    return task;
+}
+int64_t pxr_async_get(void *handle, int64_t cell) {
+    pxr_task *task = handle;
+    assert(task->frame && cell >= 0 && (uint64_t)cell < task->root_capacity);
+    return ((int64_t *)task->frame)[cell];
+}
+void pxr_async_set(void *handle, int64_t cell, int64_t bits, int64_t pointer) {
+    pxr_task *task = handle;
+    assert(task->frame && cell >= 0 && (uint64_t)cell < task->root_capacity);
+    ((int64_t *)task->frame)[cell] = bits;
+    task->roots[cell] = pointer ? (void *)(intptr_t)bits : NULL;
+}
+void pxr_async_publish(void *handle, pxr_str *mask) {
+    pxr_task *task = handle;
+    assert(mask->len == task->root_capacity / 8 + (task->root_capacity % 8 != 0));
+    for (size_t i = 0; i < task->root_capacity; i++)
+        task->roots[i] = (mask->data[i / 8] & (1u << (i % 8)))
+            ? (void *)(intptr_t)((int64_t *)task->frame)[i] : NULL;
+}
+void pxr_async_await(void *parent, void *child) { pxr_task_await(parent, child); }
+int64_t pxr_async_take(void *child) {
+    pxr_task_result result = pxr_task_take(child);
+    assert(result.status == PXR_TASK_OK);
+    return result.bits;
+}
+void pxr_async_finish(void *task, int64_t tag, int64_t bits) { pxr_task_finish(task, tag, bits); }
+void *pxr_async_spawn(void *handle) {
+    pxr_task *task = handle;
+    assert(task->parent == task->loop->current && !task->claimed);
+    pxr_task_start(task);
+    return task;
+}
+typedef struct { int pc; uint64_t delay; } pxr_async_timer_frame;
+static void pxr_async_timer_resume(pxr_task *task, void *raw) {
+    pxr_async_timer_frame *frame = raw;
+    if (frame->pc < 0) { pxr_task_fail(task, EINVAL); return; }
+    if (!frame->pc++) pxr_task_sleep(task, frame->delay);
+    else pxr_task_finish(task, 0, 0);
+}
+void *pxr_async_sleep_task(int64_t milliseconds) {
+    assert(pxr_compiler_loop_initialized && pxr_compiler_loop.current);
+    pxr_task *task = pxr_task_new(&pxr_compiler_loop, pxr_compiler_loop.current,
+        sizeof(pxr_async_timer_frame), 0, pxr_async_timer_resume, NULL);
+    if (milliseconds < 0) {
+        /* Preserve laziness: report the invalid duration when the task starts. */
+        ((pxr_async_timer_frame *)task->frame)->pc = -1;
+    } else ((pxr_async_timer_frame *)task->frame)->delay = (uint64_t)milliseconds;
+    return task;
+}
+void pxr_async_run(void *handle) {
+    assert(pxr_compiler_loop_initialized && pxr_compiler_loop.root == handle);
+    pxr_task_result result = pxr_loop_run(&pxr_compiler_loop);
+    pxr_loop_destroy(&pxr_compiler_loop);
+    pxr_compiler_loop_initialized = 0;
+    if (result.status != PXR_TASK_OK) {
+        fprintf(stderr, "pxr: async task failed: %s\n",
+            result.status == PXR_TASK_CANCELLED ? "cancelled" : strerror(result.error));
+        exit(255);
+    }
+}
+void pxr_async_drop(void *task) { pxr_task_release(task); }

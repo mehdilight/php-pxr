@@ -20,6 +20,9 @@ fn infer_bindings(
     classes: &class_generics::ClassExpander,
     class_infos: &HashMap<String, ClassInfo>,
 ) -> Result<(), String> {
+    if matches!(actual, Ty::Task(_)) {
+        return Err("task handles cannot enter generic functions yet".into());
+    }
     match pattern {
         ast::TypeRef::Param(name, _) => {
             if let Some(previous) = bindings.get(name) {
@@ -89,6 +92,7 @@ fn encode_type(ty: &Ty) -> String {
         Ty::Null => "z".into(),
         Ty::Array(element) => format!("a{}", encode_type(element)),
         Ty::Named(name) => format!("n{}", hex_name(name)),
+        Ty::Task(result) => format!("task{}", encode_type(result)),
     }
 }
 
@@ -113,6 +117,7 @@ impl GenericCall {
             deferred: true,
             key: (String::new(), Vec::new()),
             signature: Signature {
+                is_async: false,
                 mangled: String::new(),
                 display: String::new(),
                 params: Vec::new(),
@@ -224,6 +229,7 @@ impl Analyzer {
         virtual_call: bool,
     ) -> Option<TExpr> {
         let declaration = ast::FnDecl {
+            is_async: false,
             bounds: method.ast_method.bounds.clone(),
             type_params: method.ast_method.type_params.clone(),
             name: format!("{}::{}", method.declaring_class, method.name),
@@ -494,6 +500,7 @@ impl Analyzer {
                 None => self.class_expander.inferred_return(&mangled),
             };
             Signature {
+                is_async: false,
                 mangled,
                 display: format!(
                     "{}<{}>",

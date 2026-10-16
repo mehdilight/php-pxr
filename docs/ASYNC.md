@@ -1,16 +1,17 @@
-# Async/await design — M7.1 in progress
+# Async/await — M7.1 in progress
 
-**Status: the internal executor foundation is implemented and tested; async
-syntax, typing and lowering are not implemented.** This is a PXR
-language extension. The examples below are proposed syntax, not runnable PHP or
-current PXR programs. Milestone tracking lives in [`MILESTONES.md`](MILESTONES.md).
-The delivered internal lifecycle, timer, readiness and GC contract is documented
-in [`ASYNC_RUNTIME.md`](ASYNC_RUNTIME.md); cloned upstream references and exact
-revisions are recorded in [`ASYNC_REFERENCES.md`](ASYNC_REFERENCES.md).
+**Implemented first source slice:** free async functions with explicit result
+types, inferred affine task handles, `await`, `spawn`, nonblocking timers and an
+async CLI entry point. Programs compile to native resumable frames and run
+without PHP. This syntax is a PXR language extension and cannot run in PHP.
+M7.1 remains incomplete: public socket operations and source cancellation/error
+APIs are still pending. See [MILESTONES.md](MILESTONES.md), the internal
+[runtime contract](ASYNC_RUNTIME.md) and [primary references](ASYNC_REFERENCES.md).
 
-## Syntax and result types
+## Runnable syntax
 
 ```php
+<?php
 async function delayedValue(int $value): int {
     await sleepAsync(100);
     return $value;
@@ -26,79 +27,118 @@ async function main(): void {
 }
 ```
 
-`sleepAsync` is a proposed nonblocking timer API, with delay in milliseconds.
-The exact standard-library name is not finalized. It is not an existing builtin.
+Run the checked-in example with `pxr run examples/async/main.php`.
 
 An async declaration's return annotation describes its completed result. Calling
-`delayedValue(10)` creates a lazy `Task<int>` without running its body. Awaiting
-that task starts execution and produces an `int`; `spawn` schedules execution
-and returns a typed join handle whose awaited result is also an `int`. Scheduling
-makes the task ready; execution proceeds when the executor runs it.
+`delayedValue(10)` captures its arguments and creates a lazy `Task<int>`; it does
+not execute the body. Argument expressions run when the call is made, in ordinary
+call order. Arrays retain PHP value semantics; moved owned arguments transfer
+into the task. Await starts a lazy task and produces its completed result.
 
-`await` is allowed inside async functions. Two consecutive direct awaits are
-sequential; spawning two tasks before awaiting their handles permits overlap.
-The initial executor is cooperative and runs on one thread. Awaiting a pending
-operation suspends that task and lets other ready tasks progress. CPU-heavy work
-and ordinary blocking functions occupy the executor thread until they yield or
-return. Threaded CPU parallelism is a separate M7.2 feature.
+`spawn` consumes an unstarted task and schedules it, returning a handle whose
+awaited result has the same type. Scheduling makes it ready; its body executes
+when the executor next runs it. Spawning two tasks before awaiting their handles
+permits overlap. Direct consecutive awaits are sequential. Already-started
+handles cannot be spawned again. A conditional merge of lazy and started handles
+can be awaited, but cannot be spawned because its start state is uncertain.
 
-The CLI runs `async function main(): void` using the executor. Declarations can
-accompany it, but executable top-level statements cannot. Existing synchronous
-programs retain their top-level entry point.
+`sleepAsync(int $milliseconds)` creates a lazy `Task<void>`. Awaiting it suspends
+without blocking other ready tasks. Zero milliseconds still yields to the
+executor. Negative durations fail when the task starts. `sleepAsync` is reserved
+as a PXR intrinsic, including in namespaces; `async`, `await` and `spawn` are
+case-insensitive reserved keywords. Await/spawn bind as unary expressions, so
+`await value() + 1` adds one to the completed result.
 
-## Task lifetime and failure
+The initial executor is cooperative and single-threaded. Ordinary blocking
+functions and CPU work occupy that thread until they return or await. OS-thread
+parallelism remains M7.2 work.
 
-The initial design uses structured concurrency: spawned tasks belong to the
-parent async invocation. There are no detached tasks in M7.1. A parent waits for
-its children before completing normally. On failure or cancellation, it requests
-cancellation of remaining children and waits for their cleanup before finishing.
+## Entry and current source boundaries
 
-Awaiting transfers a task's result or failure to its caller. An unobserved child
-failure must reach the parent rather than disappearing. Task and handle
-consumption, result ownership, and the treatment of dropped unawaited tasks must
-be enforced by the compiler before source support ships. The implemented internal
-contract uses one consumer per result and discards unused lazy tasks without
-running them; dropped started handles stay in the parent scope. Shared tasks are
-outside the initial scope.
+The CLI runs global `async function main(): void` automatically. It must have no
+parameters. Other declarations and native required modules may accompany it,
+but executable top-level statements cannot. Namespace-qualified async functions
+are ordinary helpers, not CLI entry points. Synchronous programs retain their
+existing top-level entry. Calling an async function, awaiting, spawning or
+constructing a timer from synchronous source receives a diagnostic.
 
-Cancellation is cooperative. Suspension points are candidates for cancellation
-checks; tight CPU loops cannot be assumed to stop immediately. The internal
-executor runs synchronous cleanup after children finish, and preserves the first
-error observed by that executor. The source error API and generated cleanup
-remain compiler work; the runtime does not add PHP exceptions or finally blocks.
+The first slice requires explicit async result annotations and supports free
+functions. Async generic functions, inferred async results and async methods are
+rejected. Ordinary synchronous generic functions/methods may still be called
+inside an async body. Successful results may be scalar, string, array, shared
+native object, mixed, or void; owned/borrowed async result annotations are
+rejected until result ownership contracts are extended.
 
-## Dependencies and implementation order
+Task locals currently use inferred types. Source `Task<T>` annotations, task
+parameters/returns, task fields/arrays, shared tasks, escaping handles and detached
+tasks are not supported. This keeps every child in its creating async scope.
+Task handles cannot be boxed into `mixed`, printed, compared, used as conditions,
+or passed to ordinary builtins/generic functions. Rejected forms fail during
+checking rather than generating placeholder code.
 
-1. M1–M6 are complete, including generics, affine owned handles, call-scoped
-   borrows, and precise memory reclamation. M7 must extend synchronous stack
-   roots to resumable task frames and reject call borrows escaping into lazy or
-   spawned tasks. M6 does not yet supply async syntax, task types, cancellation,
-   or cross-thread transfer guarantees. General generics and ownership are
-   project sequencing choices; basic async execution alone does not inherently
-   require a complete generics system.
-2. Specify structured errors and resource cleanup, cancellation propagation,
-   task consumption, and parent/child lifetimes. The existing compiler has no
-   exception model; async must not silently invent incompatible failure rules.
-3. Implement async typing and lowering to resumable frames that preserve locals
-   across suspension points, plus the single-thread executor and nonblocking
-   timers. Add syntax only as part of a working end-to-end slice.
-4. Verify scheduling and lifecycle behavior with deterministic executor tests,
-   native CLI tests, and observable timer overlap. Avoid relying solely on tight
-   elapsed-time thresholds.
-5. Add nonblocking socket readiness and resource cleanup tests. HTTP helpers are
-   a later library concern, not an implicit part of the initial syntax feature.
-6. Add threaded parallelism under M7.2 with explicit transfer and sharing rules.
+## Ownership and lifetime
 
-## Acceptance checks
+Every task result has one consumer. Await, spawn, move and drop consume a task
+variable; later use fails until it is reinitialized. Consume or drop an existing
+handle before reinitializing its binding. Moving between locals in
+the same scope is supported; ordinary assignment cannot duplicate a handle.
 
-* Awaited result types are checked; invalid operands and await outside async
-  contexts receive compile-time diagnostics.
-* Sequential awaits preserve order; spawned pending timers allow other tasks to
-  progress, including when handles are awaited in creation order.
-* Locals and owned values survive suspension and are released on completion,
-  cancellation, and failure.
-* Parents cannot finish while child tasks are still running; child failures are
-  observable and cancellation cannot silently leak children or I/O resources.
-* Async entry points run without PHP; ambiguous entry points are rejected.
-* Socket operations wait for readiness without blocking unrelated tasks.
-* Existing synchronous programs and their tests continue to pass.
+```php
+$t = delayedValue(1);
+$next = move($t);
+$joined = spawn $next;
+echo await $joined;
+// await $joined; // rejected: result already consumed
+```
+
+Call-scoped borrowed parameters cannot be captured by async functions, even if
+an immediate await would appear safe. Await/spawn also cannot cross an active
+call borrow during argument evaluation. Owned locals and explicitly moved owned
+parameters can survive suspension; synchronous borrow calls are allowed once no
+suspension crosses their call lifetime.
+
+A parent joins its started children before completing and releasing its frame.
+Unused lazy children are discarded without running. Discarded task-producing
+expression statements automatically drop their result; a bare task variable
+statement is rejected, so it cannot silently invalidate a live handle.
+`drop($lazy)` schedules its
+cleanup without executing its body. Dropping a started handle leaves its child
+in the parent's scope, where completion and failures are still observed.
+Unconsumed successful results are discarded when the parent's scope closes.
+
+## Failure, cancellation and cleanup
+
+An async operation failure propagates to the parent, cancels remaining children,
+and waits for their cleanup. A failed awaited child prevents the parent body
+from resuming. The first error observed by the executor wins. The CLI reports
+`pxr: async task failed: ...` and exits with status 255 after draining the tree.
+This currently covers errors reported through the task runtime, such as an
+invalid timer duration. Existing synchronous runtime fatal errors retain their
+process-termination behavior; they are not silently converted into task errors.
+
+Cancellation is cooperative. The internal runtime removes pending waits and
+cleans children before releasing a parent frame. Source-level explicit
+cancellation, recoverable task errors/catch, async cleanup, PHP `finally`, native
+destructors and public socket resources remain unimplemented. Heap reclamation
+of captured values does not supply those resource semantics.
+
+## Lowering and validation
+
+After ordinary IR optimization, the backend creates a lazy constructor and a
+resume callback for each async function. A program counter selects an await
+continuation. The initial implementation stores SSA values and mutable slots
+in 64-bit frame cells; it prioritizes correctness over minimal frame size.
+Precise liveness bitmaps publish roots for lazy captures, suspended locals and
+intermediates. Newly stored pointers are rooted immediately. Packed pointer
+payloads keep their pointer markers when reloaded, including array/mixed boxing.
+Dead call arguments hand retention to the callee; taking a result releases its
+completed child record during the parent's lifetime.
+
+Native CLI acceptance tests exercise actual syntax at `-O0` and `-O3`, normal and
+forced GC, plus sanitizer builds. They cover timer progress and ordered awaits,
+implicit joins, moved handles, branch joins, control flow around suspension,
+owned captures, arrays/objects/mixed/scalar results, module/name resolution,
+bounded repeated-result retention, failure cancellation and invalid forms.
+Deterministic C executor tests additionally cover readiness/backpressure,
+descriptor cleanup and cancellation. Public socket I/O through PXR source is
+still required before the async I/O portion of M7.1 is complete.

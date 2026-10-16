@@ -6,6 +6,22 @@ use pxr_diag::{Diagnostic, Diagnostics, Span};
 pub(super) use representation::check as check_representation;
 use std::collections::{BTreeMap, BTreeSet};
 
+const TASK: &str = "$pxr_task";
+const JOIN: &str = "$pxr_join";
+const ANY_TASK: &str = "$pxr_any_task";
+fn task_result(t: Option<&TypeRef>) -> Option<&TypeRef> {
+    match t {
+        Some(TypeRef::Applied(name, args, _))
+            if [TASK, JOIN, ANY_TASK].contains(&name.as_str()) && args.len() == 1 =>
+        {
+            Some(&args[0])
+        }
+        _ => None,
+    }
+}
+fn task_type(result: TypeRef, span: Span, spawned: bool) -> TypeRef {
+    TypeRef::Applied(if spawned { JOIN } else { TASK }.into(), vec![result], span)
+}
 const OWN: &str = "$pxr_owned";
 const READ: &str = "$pxr_borrow";
 const WRITE: &str = "$pxr_borrow_mut";
@@ -48,6 +64,7 @@ fn copy_safe(t: Option<&TypeRef>) -> bool {
 }
 #[derive(Clone)]
 struct Signature {
+    is_async: bool,
     type_params: Vec<String>,
     params: Vec<Option<TypeRef>>,
     ret: Option<TypeRef>,
@@ -92,6 +109,7 @@ struct Checker {
     ret: Option<TypeRef>,
     class: Option<String>,
     borrow_argument: Option<Span>,
+    task_drops: BTreeSet<Span>,
 }
 
 pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
@@ -106,11 +124,12 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
         ret: None,
         class: None,
         borrow_argument: None,
+        task_drops: BTreeSet::new(),
     };
     for s in &program.items {
         match s {
             Stmt::FnDecl(f) => {
-                if ["move", "drop"].contains(
+                if ["move", "drop", "sleepasync"].contains(
                     &f.name
                         .rsplit('\\')
                         .next()
@@ -118,11 +137,12 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
                         .to_ascii_lowercase()
                         .as_str(),
                 ) {
-                    c.error(f.name_span, "move/drop are reserved ownership intrinsics");
+                    c.error(f.name_span, "move/drop/sleepAsync are reserved intrinsics");
                 }
                 c.signatures.insert(
                     f.name.to_ascii_lowercase(),
                     Signature {
+                        is_async: f.is_async,
                         type_params: f.type_params.iter().map(|(n, _)| n.clone()).collect(),
                         params: f.params.iter().map(|p| p.ty.clone()).collect(),
                         ret: f.ret.clone(),
@@ -146,6 +166,7 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
                         m.name.to_ascii_lowercase()
                     ),
                     Signature {
+                        is_async: false,
                         type_params: m.type_params.iter().map(|(n, _)| n.clone()).collect(),
                         params: m.params.iter().map(|p| p.ty.clone()).collect(),
                         ret: m.ret.clone(),
@@ -205,6 +226,22 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
     // classes whose constructors/methods must preserve their receiver identity.
     for s in &program.items {
         if let Stmt::FnDecl(f) = s {
+            if f.is_async {
+                for param in &f.params {
+                    if matches!(mode(param.ty.as_ref()), Mode::Read | Mode::Write) {
+                        c.error(
+                            param.span,
+                            "call-scoped borrows cannot be captured by lazy async tasks",
+                        );
+                    }
+                }
+                if mode(f.ret.as_ref()) != Mode::Shared {
+                    c.error(
+                        f.name_span,
+                        "owned or borrowed async results are not supported yet",
+                    );
+                }
+            }
             c.function(&f.params, f.ret.as_ref(), &f.body, None, false);
         }
     }
@@ -247,6 +284,7 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
         }
     }
     for s in &mut output.items {
+        rewrite_task_drops(s, &c.task_drops);
         erase_stmt(s);
     }
     (output, c.diags)
@@ -441,6 +479,12 @@ impl Checker {
         }
     }
     fn escape(&mut self, v: &Value, span: Span) {
+        if task_result(v.ty.as_ref()).is_some() {
+            self.error(
+                span,
+                "task handles cannot escape their creating async scope",
+            );
+        }
         if matches!(v.mode, Mode::Owned | Mode::Transfer)
             || (matches!(v.mode, Mode::Read | Mode::Write) && !copy_safe(v.ty.as_ref()))
         {
@@ -453,6 +497,13 @@ impl Checker {
         for env in it {
             for (n, b) in &mut result {
                 b.alive &= env.get(n).is_some_and(|b| b.alive);
+                if let Some(other) = env.get(n) {
+                    if task_result(b.ty.as_ref()).is_some()
+                        || task_result(other.ty.as_ref()).is_some()
+                    {
+                        b.ty = join_type(b.ty.as_ref(), other.ty.as_ref());
+                    }
+                }
                 if env.get(n).is_some_and(|other| other.mode != b.mode) {
                     b.mode = Mode::Conflict;
                 }
@@ -514,7 +565,10 @@ impl Checker {
                 }
                 if args.len() == 1 {
                     if let Expr::Var(n, sp) = unparen(&args[0]) {
-                        self.consume(n, *sp);
+                        let v = self.consume(n, *sp);
+                        if task_result(v.ty.as_ref()).is_some() {
+                            self.task_drops.insert(*span);
+                        }
                     } else {
                         self.error(*span, "drop requires one owned variable");
                     }
@@ -524,6 +578,12 @@ impl Checker {
             }
             Stmt::Expr(e, _) => {
                 let v = self.expr(e);
+                if task_result(v.ty.as_ref()).is_some() && v.mode != Mode::Transfer {
+                    self.error(
+                        e.span(),
+                        "discarding a task variable requires drop($task) or move($task)",
+                    );
+                }
                 if matches!(v.mode, Mode::Read | Mode::Write) {
                     self.error(
                         e.span(),
@@ -540,6 +600,29 @@ impl Checker {
                 let v = self.expr(value);
                 if let LValue::Var { name, .. } = target {
                     let old = self.env.get(name).cloned();
+                    if old
+                        .as_ref()
+                        .is_some_and(|b| b.alive && task_result(b.ty.as_ref()).is_some())
+                    {
+                        self.error(
+                            *span,
+                            "consume or drop the existing task before reinitializing its binding",
+                        );
+                    }
+                    if task_result(v.ty.as_ref()).is_some() && ty.is_some() {
+                        self.error(*span, "task bindings currently use inferred types; explicit task annotations are not supported yet");
+                    }
+                    if old
+                        .as_ref()
+                        .is_some_and(|b| task_result(b.ty.as_ref()).is_some())
+                        != task_result(v.ty.as_ref()).is_some()
+                        && old.is_some()
+                    {
+                        self.error(
+                            *span,
+                            "a task binding cannot change between task and ordinary value types",
+                        );
+                    }
                     if old
                         .as_ref()
                         .is_some_and(|b| matches!(b.mode, Mode::Read | Mode::Write))
@@ -570,11 +653,14 @@ impl Checker {
                         name.clone(),
                         Binding {
                             mode: want,
-                            ty: ty
-                                .as_ref()
-                                .map(inner)
-                                .or_else(|| old.as_ref().and_then(|b| b.ty.clone()))
-                                .or(v.ty),
+                            ty: if task_result(v.ty.as_ref()).is_some() {
+                                v.ty
+                            } else {
+                                ty.as_ref()
+                                    .map(inner)
+                                    .or_else(|| old.as_ref().and_then(|b| b.ty.clone()))
+                                    .or(v.ty)
+                            },
                             alive: true,
                         },
                     );
@@ -1142,6 +1228,12 @@ impl Checker {
         value
     }
     fn check_stringification(&mut self, value: &Value, span: Span) {
+        if task_result(value.ty.as_ref()).is_some() {
+            self.error(
+                span,
+                "task handles cannot be printed or converted to ordinary values",
+            );
+        }
         let object_possible = matches!(
             value.ty.as_ref(),
             None | Some(
@@ -1218,6 +1310,44 @@ impl Checker {
             Expr::Var(n, sp) => self.read(n, *sp),
             Expr::Paren(e, _) => self.expr(e),
             Expr::Call {
+                callee, args, span, ..
+            } if callee == "$pxr_await" || callee == "$pxr_spawn" => {
+                if !self.loans.is_empty() {
+                    self.error(
+                        *span,
+                        "await/spawn cannot cross an active call-scoped borrow",
+                    );
+                }
+                let Some(arg) = args.first() else {
+                    return Value::plain(None);
+                };
+                let value = if let Expr::Var(name, sp) = unparen(arg) {
+                    self.consume(name, *sp)
+                } else {
+                    self.expr(arg)
+                };
+                let Some(result) = task_result(value.ty.as_ref()).cloned() else {
+                    self.error(
+                        *span,
+                        "await/spawn requires a task with a known local lifetime",
+                    );
+                    return Value::plain(None);
+                };
+                if callee == "$pxr_spawn" {
+                    if matches!(value.ty, Some(TypeRef::Applied(ref name, _, _)) if name != TASK) {
+                        self.error(*span, "spawn requires an unstarted task; a spawned or conditionally started handle cannot be spawned again");
+                    }
+                    Value {
+                        mode: Mode::Transfer,
+                        ty: Some(task_type(result, *span, true)),
+                        fresh: false,
+                        origins: BTreeSet::new(),
+                    }
+                } else {
+                    Value::plain(Some(result))
+                }
+            }
+            Expr::Call {
                 callee,
                 args,
                 span,
@@ -1252,6 +1382,9 @@ impl Checker {
                 if let [arg] = args.as_slice() {
                     if let Expr::Var(n, sp) = unparen(arg) {
                         let v = self.read(n, *sp);
+                        if task_result(v.ty.as_ref()).is_some() {
+                            self.error(*span, "task handles cannot be borrowed");
+                        }
                         if !matches!(v.mode, Mode::Owned | Mode::Read | Mode::Write) {
                             self.error(
                                 *span,
@@ -1299,6 +1432,15 @@ impl Checker {
                     .cloned()
                     .map(|s| specialize_signature(s, type_args));
                 let name = fallback.as_deref().unwrap_or(callee).to_ascii_lowercase();
+                if name == "sleepasync" && sig.is_none() {
+                    self.arguments(args, None, false, *span, false);
+                    return Value {
+                        mode: Mode::Transfer,
+                        ty: Some(task_type(TypeRef::Void, *span, false)),
+                        fresh: false,
+                        origins: BTreeSet::new(),
+                    };
+                }
                 let builtin = sig.is_none() && super::Builtin::from_name(&name).is_some();
                 // Builtins which can retain/return object payloads require normal
                 // escape checks. Scalar/string readers cannot retain handles.
@@ -1349,12 +1491,23 @@ impl Checker {
                 let bindings = self.arguments(args, sig.as_ref(), reading, *span, name == "strval");
                 if let Some(s) = sig {
                     Value {
-                        mode: if mode(s.ret.as_ref()) == Mode::Owned {
+                        mode: if s.is_async || mode(s.ret.as_ref()) == Mode::Owned {
                             Mode::Transfer
                         } else {
                             Mode::Shared
                         },
-                        ty: s.ret.as_ref().map(|t| substitute(&inner(t), &bindings)),
+                        ty: if s.is_async {
+                            Some(task_type(
+                                s.ret
+                                    .as_ref()
+                                    .map(|t| substitute(&inner(t), &bindings))
+                                    .unwrap_or(TypeRef::Mixed),
+                                *span,
+                                false,
+                            ))
+                        } else {
+                            s.ret.as_ref().map(|t| substitute(&inner(t), &bindings))
+                        },
                         fresh: false,
                         origins: BTreeSet::new(),
                     }
@@ -1789,6 +1942,18 @@ fn erase_target(t: &mut LValue) {
         _ => {}
     }
 }
+fn rewrite_task_drops(s: &mut Stmt, spans: &BTreeSet<Span>) {
+    if let Stmt::Expr(Expr::Call { callee, span, .. }, _) = s {
+        if callee == "$pxr_drop" && spans.contains(span) {
+            *callee = "$pxr_task_drop".into();
+        }
+    }
+    for body in s.bodies_mut() {
+        for child in body {
+            rewrite_task_drops(child, spans);
+        }
+    }
+}
 fn erase_stmt(s: &mut Stmt) {
     match s {
         Stmt::Expr(Expr::Call { callee, .. }, _) if callee == "$pxr_drop" => {
@@ -1960,6 +2125,17 @@ fn specialize_signature(mut sig: Signature, types: &[TypeRef]) -> Signature {
 fn join_type(a: Option<&TypeRef>, b: Option<&TypeRef>) -> Option<TypeRef> {
     match (a, b) {
         (Some(a), Some(b)) if type_shape(a) == type_shape(b) => Some(a.clone()),
+        (Some(a), Some(b))
+            if task_result(Some(a))
+                .zip(task_result(Some(b)))
+                .is_some_and(|(a, b)| type_shape(a) == type_shape(b)) =>
+        {
+            Some(TypeRef::Applied(
+                ANY_TASK.into(),
+                vec![task_result(Some(a)).unwrap().clone()],
+                Span::synthetic(),
+            ))
+        }
         (Some(_), Some(_)) => Some(TypeRef::Mixed),
         _ => None,
     }

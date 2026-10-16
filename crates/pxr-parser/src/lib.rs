@@ -406,7 +406,9 @@ impl Parser {
                 let semi = self.expect(&TokenKind::Semicolon, "`;` after `print`")?;
                 Ok(Some(Stmt::Print(e, start.merge(semi.span))))
             }
-            TokenKind::Function => self.parse_fn().map(|f| Some(Stmt::FnDecl(Box::new(f)))),
+            TokenKind::Function | TokenKind::Async => {
+                self.parse_fn().map(|f| Some(Stmt::FnDecl(Box::new(f))))
+            }
             TokenKind::Class | TokenKind::Abstract | TokenKind::Interface | TokenKind::Trait => {
                 self.parse_class()
                     .map(|c| Some(Stmt::ClassDecl(Box::new(c))))
@@ -569,13 +571,19 @@ impl Parser {
 
     fn parse_fn(&mut self) -> Result<FnDecl, ()> {
         let previous = std::mem::take(&mut self.type_params);
-        let result = self.parse_fn_inner();
+        let is_async = self.eat(&TokenKind::Async);
+        let result = self.parse_fn_inner().map(|mut f| {
+            f.is_async = is_async;
+            f
+        });
         self.type_params = previous;
         result
     }
 
     fn parse_fn_inner(&mut self) -> Result<FnDecl, ()> {
-        let start = self.advance().span; // `function`
+        let start = self
+            .expect(&TokenKind::Function, "`function` after async")?
+            .span;
         let name_tok = self.expect_ident("function name")?;
         let name = match name_tok.kind {
             TokenKind::Ident(n) => n,
@@ -629,6 +637,7 @@ impl Parser {
         let body = self.parse_block()?;
         let end = self.peek().span;
         Ok(FnDecl {
+            is_async: false,
             type_params,
             bounds,
             name,
@@ -1495,6 +1504,24 @@ impl Parser {
     fn parse_unary(&mut self) -> Result<Expr, ()> {
         let start = self.peek().span;
         match self.peek().kind {
+            TokenKind::Await | TokenKind::Spawn => {
+                let op = self.advance();
+                let value = self.parse_unary()?;
+                let span = start.merge(value.span());
+                Ok(Expr::Call {
+                    callee: if op.kind == TokenKind::Await {
+                        "$pxr_await"
+                    } else {
+                        "$pxr_spawn"
+                    }
+                    .into(),
+                    fallback: None,
+                    callee_span: start,
+                    type_args: vec![],
+                    args: vec![value],
+                    span,
+                })
+            }
             TokenKind::Amp => {
                 self.advance();
                 let mutable = matches!(&self.peek().kind, TokenKind::Ident(n) if n == "mut");

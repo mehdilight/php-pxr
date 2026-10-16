@@ -64,15 +64,15 @@ trustworthy standard library (M2). The early milestones exist so the compiler is
 
 ## Async sequencing
 
-Async/await is planned for M7.1, followed by threaded parallelism in M7.2.
-The proposed PXR syntax is `async function`, `await`, and explicit `spawn`;
-[`ASYNC.md`](ASYNC.md) records the design and remaining decisions. M5 supplies
-generic types, and M6 supplies affine handles, call-borrow lifetimes, and precise
-heap reclamation. Resumable task frames still need their own root/lifetime
-lowering in M7. Structured
-error propagation and cancellation must be settled before implementation.
-The first executor uses one thread with nonblocking timers and socket I/O;
-ordinary blocking calls still block that thread.
+M7.1 is in progress. Free `async function` declarations with explicit results,
+`await`, `spawn`, affine task locals, nonblocking timers and global async main
+now compile to resumable native frames. M5 generics and M6 ownership/reclamation
+remain foundations; the async compiler extends borrow checks and precise roots
+to captures and suspension. [`ASYNC.md`](ASYNC.md) records runnable syntax and
+current rejected forms. Public socket operations, source cancellation/error
+APIs, async methods/generics and broader task signatures remain pending.
+The executor uses one thread; ordinary blocking calls still block it.
+Threaded parallelism remains M7.2.
 
 ## Non‑goals (for now)
 

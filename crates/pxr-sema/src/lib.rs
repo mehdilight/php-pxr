@@ -713,6 +713,7 @@ pub struct TCase {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TFunc {
+    pub is_async: bool,
     /// Link-time name.
     pub name: String,
     /// Display name.
@@ -793,6 +794,7 @@ pub struct Analyzer {
 
 #[derive(Clone, Debug)]
 struct Signature {
+    is_async: bool,
     mangled: String,
     display: String,
     params: Vec<Ty>,
@@ -803,6 +805,7 @@ struct Signature {
 
 /// Result of analysing one function body.
 struct FnCtx {
+    is_async: bool,
     infer_return: bool,
     inference_failed: bool,
     return_types: Vec<(Ty, Span)>,
@@ -823,6 +826,7 @@ struct FnCtx {
 impl FnCtx {
     fn new(ret: Ty, is_main: bool) -> Self {
         FnCtx {
+            is_async: false,
             infer_return: false,
             inference_failed: false,
             return_types: Vec::new(),
@@ -962,7 +966,7 @@ impl Analyzer {
             return true;
         }
         match (from, to) {
-            (from, Ty::Mixed) if *from != Ty::Void => true,
+            (from, Ty::Mixed) if *from != Ty::Void && !matches!(from, Ty::Task(_)) => true,
             (Ty::Int, Ty::Float) => true,
             (Ty::Array(e), Ty::Array(t)) => {
                 matches!(**e, Ty::Null)
@@ -1230,6 +1234,7 @@ impl Analyzer {
         body.extend(make_return_stmts(&method.mangled));
 
         TFunc {
+            is_async: false,
             name: disp_mangled,
             display: disp_display,
             params: param_tys,
@@ -2060,6 +2065,9 @@ impl Analyzer {
                 continue;
             }
 
+            if f.is_async && (!f.type_params.is_empty() || f.ret.is_none()) {
+                self.diags.emit(Diagnostic::error("async functions currently require an explicit result type and cannot be generic").with_code("E0300").with_span(f.name_span));
+            }
             let bindings: HashMap<_, _> = f
                 .type_params
                 .iter()
@@ -2117,6 +2125,7 @@ impl Analyzer {
             self.funcs.insert(
                 key,
                 Signature {
+                    is_async: f.is_async,
                     mangled: mangle_fn(&f.name),
                     display: f.name.clone(),
                     params,
@@ -2213,6 +2222,7 @@ impl Analyzer {
             .function(&mut declaration, &substitutions);
         let f = &declaration;
         let mut ctx = FnCtx::new(sig.ret.clone(), false);
+        ctx.is_async = f.is_async;
         ctx.infer_return = f.ret.is_none();
         ctx.type_bindings = bindings;
         for (name, ty) in sig.param_names.iter().zip(sig.params.iter()) {
@@ -2227,6 +2237,7 @@ impl Analyzer {
         }
 
         TFunc {
+            is_async: f.is_async,
             name: sig.mangled.clone(),
             display: sig.display.clone(),
             params: sig
@@ -2306,6 +2317,7 @@ impl Analyzer {
         if !method.ast_method.is_abstract && method.name != "__construct" && method.ret != Ty::Void
         {
             let sig = Signature {
+                is_async: false,
                 mangled: method.mangled.clone(),
                 display: format!("{class_name}::{}", method.name),
                 params: method.params.clone(),
@@ -2332,6 +2344,7 @@ impl Analyzer {
         );
 
         Some(TFunc {
+            is_async: false,
             name: method.mangled.clone(),
             display: format!("{class_name}::{}", method.name),
             params: all_params,
@@ -2377,8 +2390,47 @@ impl Analyzer {
                 }
             }
         }
-        body.extend(self.analyze_stmts(stmts, &mut ctx));
+        if let Some(entry) = self.funcs.get("main").filter(|f| f.is_async).cloned() {
+            if !entry.params.is_empty()
+                || entry.ret != Ty::Void
+                || stmts.iter().any(|s| {
+                    !matches!(
+                        s,
+                        ast::Stmt::FnDecl(_) | ast::Stmt::ClassDecl(_) | ast::Stmt::Empty
+                    )
+                })
+            {
+                self.diags.emit(Diagnostic::error("async main must have no parameters, return void, and cannot coexist with executable top-level statements").with_code("E0301").with_span(entry.span));
+            } else {
+                let task_ty = Ty::Task(Box::new(Ty::Void));
+                let task = TExpr::Call {
+                    callee: Callee::User {
+                        mangled: entry.mangled,
+                        name: entry.display,
+                        params: vec![],
+                    },
+                    ret: task_ty.clone(),
+                    args: vec![],
+                    arg_tys: vec![],
+                    span: entry.span,
+                };
+                body.push(TStmt::Expr(TExpr::Call {
+                    callee: Callee::User {
+                        mangled: "pxr_async_run".into(),
+                        name: "async entry".into(),
+                        params: vec![task_ty.clone()],
+                    },
+                    ret: Ty::Void,
+                    args: vec![task],
+                    arg_tys: vec![task_ty],
+                    span: entry.span,
+                }));
+            }
+        } else {
+            body.extend(self.analyze_stmts(stmts, &mut ctx));
+        }
         Some(TFunc {
+            is_async: false,
             name: "main".to_string(),
             display: "main".to_string(),
             params: Vec::new(),
@@ -2442,6 +2494,16 @@ impl Analyzer {
                 let mut texprs = Vec::new();
                 for e in exprs {
                     if let Some(t) = self.infer(e, ctx) {
+                        if matches!(t.ty(), Ty::Void | Ty::Task(_)) {
+                            self.diags.emit(
+                                Diagnostic::error(
+                                    "echo requires a completed value, not void or a task handle",
+                                )
+                                .with_code("E0240")
+                                .with_span(e.span()),
+                            );
+                            continue;
+                        }
                         if t.ty().is_array() {
                             self.diags.emit(
                                 Diagnostic::error(
@@ -2459,6 +2521,16 @@ impl Analyzer {
             }
             ast::Stmt::Print(e, _) => {
                 let t = self.infer(e, ctx)?;
+                if matches!(t.ty(), Ty::Void | Ty::Task(_)) {
+                    self.diags.emit(
+                        Diagnostic::error(
+                            "print requires a completed value, not void or a task handle",
+                        )
+                        .with_code("E0240")
+                        .with_span(e.span()),
+                    );
+                    return None;
+                }
                 if t.ty().is_array() {
                     self.diags.emit(
                         Diagnostic::error("cannot print an array; index it or use `implode()`")
@@ -3631,6 +3703,7 @@ impl Analyzer {
                     fallback.as_deref().unwrap_or(callee)
                 };
                 if self.php_interop
+                    && !name.eq_ignore_ascii_case("sleepasync")
                     && !self.is_compiled_function(&callee.to_ascii_lowercase())
                     && fallback
                         .as_ref()
@@ -4380,6 +4453,9 @@ impl Analyzer {
         if l.contains_infer() || r.contains_infer() {
             return Some(Ty::Infer);
         }
+        if matches!(l, Ty::Task(_)) || matches!(r, Ty::Task(_)) {
+            return self.bad_operands(op, l, r, span);
+        }
         if *l == Ty::Mixed || *r == Ty::Mixed {
             if *l == Ty::Void || *r == Ty::Void {
                 return self.bad_operands(op, l, r, span);
@@ -4849,6 +4925,52 @@ impl Analyzer {
         ctx: &mut FnCtx,
     ) -> Option<TExpr> {
         let key = callee.to_ascii_lowercase();
+        if ["$pxr_await", "$pxr_spawn", "$pxr_task_drop", "sleepasync"].contains(&key.as_str()) {
+            if !ctx.is_async || args.len() != 1 || !type_args.is_empty() {
+                self.diags.emit(
+                    Diagnostic::error(
+                        "await, spawn and sleepAsync require an async context and one operand",
+                    )
+                    .with_code("E0300")
+                    .with_span(span),
+                );
+                return None;
+            }
+            let value = self.infer(&args[0], ctx)?;
+            let input = value.ty();
+            let (mangled, ret) = if key == "sleepasync" {
+                if input != Ty::Int {
+                    return self.builtin_ty_err("sleepAsync", "int milliseconds", &input, span);
+                }
+                ("pxr_async_sleep_task", Ty::Task(Box::new(Ty::Void)))
+            } else if let Ty::Task(result) = &input {
+                if key == "$pxr_task_drop" {
+                    ("pxr_async_drop", Ty::Void)
+                } else if key == "$pxr_await" {
+                    ("$pxr_await", (**result).clone())
+                } else {
+                    ("pxr_async_spawn", input.clone())
+                }
+            } else {
+                self.diags.emit(
+                    Diagnostic::error(format!("await/spawn requires a Task, found `{input}`"))
+                        .with_code("E0300")
+                        .with_span(span),
+                );
+                return None;
+            };
+            return Some(TExpr::Call {
+                callee: Callee::User {
+                    mangled: mangled.into(),
+                    name: callee.into(),
+                    params: vec![input.clone()],
+                },
+                ret,
+                args: vec![value],
+                arg_tys: vec![input],
+                span,
+            });
+        }
 
         if let Some(declaration) = self.generics.get(&key).cloned() {
             return self.infer_generic_call(&declaration, type_args, args, span, ctx);
@@ -4866,6 +4988,14 @@ impl Analyzer {
 
         // User-defined function?
         if let Some(sig) = self.funcs.get(&key).cloned() {
+            if sig.is_async && !ctx.is_async {
+                self.diags.emit(
+                    Diagnostic::error("async calls require an async function context")
+                        .with_code("E0300")
+                        .with_span(span),
+                );
+                return None;
+            }
             if args.len() != sig.params.len() {
                 self.diags.emit(
                     Diagnostic::error(format!(
@@ -4913,7 +5043,11 @@ impl Analyzer {
                     name: sig.display,
                     params: sig.params,
                 },
-                ret: sig.ret,
+                ret: if sig.is_async {
+                    Ty::Task(Box::new(sig.ret))
+                } else {
+                    sig.ret
+                },
                 args: targs,
                 arg_tys,
                 span,
@@ -5004,6 +5138,14 @@ impl Analyzer {
             targs.push(self.infer(a, ctx)?);
         }
         let atys: Vec<Ty> = targs.iter().map(|t| t.ty()).collect();
+        if let Some(task) = atys.iter().find(|t| matches!(t, Ty::Task(_))) {
+            return self.builtin_ty_err(
+                name,
+                "an ordinary value rather than a task handle",
+                task,
+                span,
+            );
+        }
         let n = args.len();
 
         let ret = match kind {

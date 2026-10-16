@@ -7,6 +7,7 @@
 //! * [`llvm`] translates the (optimized) IR into textual LLVM IR, which the
 //!   driver hands to `clang` for machine-code generation and linking.
 
+mod async_lower;
 pub mod llvm;
 pub mod lower;
 mod roots;
