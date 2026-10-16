@@ -909,5 +909,170 @@ are proposals; the compiler does not implement them yet.
 
 ## ⛔ M9 — Tooling & ecosystem
 
-* Package manager, language server, formatter, cross‑compilation, incremental
+* PXR package tooling, language server, formatter, cross‑compilation, incremental
   builds, `clang` → LLVM‑API backend for in‑process JIT, broader benchmark suite.
+* This tooling track can progress alongside the compatibility milestones below;
+  delivering an LSP or JIT is not a prerequisite for loading PHP dependencies.
+  Composer compatibility is tracked separately in M12.
+
+## Planned PHP application compatibility track
+
+M10–M15 expand compatibility with ordinary PHP packages and applications. These
+are planned capabilities, not current support claims or delivery dates. M8 stays
+the next implementation milestone. Dependencies below refer to required
+capabilities, not completion of every unrelated tooling item in M9.
+
+Before implementation, select a small, version-pinned, framework-agnostic fixture
+corpus: callable/event dispatch, a reflection-based container, dependency loading,
+a CLI application, and an HTTP application. Record the unsupported forms each
+fixture actually needs and use that inventory to order the work. Keep the current
+native type checks as the default; define an explicit package/module compatibility
+policy before accepting untyped declarations or broader dynamic behavior. A
+compiler failure must never silently switch execution to PHP.
+
+### ⛔ M10 — PHP language compatibility foundations
+
+**Scope.**
+
+* Closures, arrow functions, first-class callables and callback invocation,
+  including capture lifetime, callable arrays and bound receivers. Define
+  reference captures against the ownership model before supporting them.
+* `Throwable`, `throw`, `try`/`catch`/`finally`, exception propagation and stack
+  unwinding. Preserve precise GC roots, affine resources and cleanup on every
+  exit. Specify how exceptions interact with await, task results and cancellation.
+* Nullable/union annotations and failure-valued returns such as `string|false`;
+  broaden argument handling for native optional, variadic and named arguments
+  and unpacking as required by the fixture inventory.
+* Close common syntax/data gaps: keyed `foreach`, nested array/property writes,
+  expression assignments and increments, and richer interpolation. Track
+  generators/iteration protocols and attributes as explicit subfeatures, with
+  separate acceptance checks rather than treating them as implied support.
+* Define how untyped parameters, bare arrays and changing value types enter
+  mixed storage under the compatibility policy without weakening typed code.
+
+**Acceptance.** Differential PHP tests cover captures/aliases, callback dispatch,
+argument binding, nested mutation and exception/finally ordering. Stress GC and
+sanitizers cover unwinding, retained closures, suspension and resource cleanup.
+Each subfeature remains rejected until its own end-to-end checks pass.
+
+### ⛔ M11 — Reflection and dynamic object behavior
+
+**Depends on:** the callable, exception and value-representation foundations in M10.
+
+**Scope.**
+
+* Runtime class/function/method/parameter/property metadata, discovery and
+  reflection APIs needed for instantiation and dependency inspection. Include
+  visibility, inheritance, signatures, defaults and attributes when implemented.
+* Dynamic class/function/member names, callable resolution, reflective
+  construction/invocation and late static binding.
+* Magic dispatch for missing/inaccessible methods and properties (`__call`,
+  `__callStatic`, `__get`, `__set`, `__isset`, `__unset`), with PHP-compatible
+  visibility and error behavior. Preserve existing `__toString` support.
+* Application-scoped globals and function-local statics, with explicit lifetimes
+  for standalone programs, requests and isolated workers. Assess reference alias
+  semantics separately; do not equate PHP aliases with call-scoped PXR borrows.
+
+**Acceptance.** Generic container and event-dispatch fixtures resolve dependencies,
+invoke callbacks and inspect defaults without hard-coded application names.
+PHP comparisons cover inherited metadata, magic fallbacks, late binding and
+errors. Ownership checks and GC remain valid through reflective/dynamic calls.
+
+### ⛔ M12 — Composer dependencies and autoloading
+
+**Depends on:** M10 callables and M11 runtime class/call resolution.
+
+**Scope.**
+
+* Read Composer-generated dependency metadata and support PSR-4 mappings,
+  classmaps and files autoload entries, with explicit handling of other mapping
+  forms. Reuse installed dependencies and lock files; this is separate from
+  building a new dependency resolver or PXR package registry in M9.
+* Provide autoloader registration and dispatch compatible with the supported
+  PHP loading APIs, including ordering, missing classes and error behavior.
+* Broaden include/require paths and declaration loading beyond the current
+  literal compile-time modules and explicitly marked PHP boundaries. Preserve
+  once-only execution, file side effects, path resolution and loading cycles.
+* Define which dependencies compile ahead of time, which need runtime discovery,
+  and which remain at an explicit PHP boundary. Do not promise arbitrary PHP
+  source evaluation or silently fall back when a package fails to compile.
+
+**Acceptance.** A locked, version-pinned multi-package fixture loads dependencies
+from its normal Composer layout without editing vendor sources. Test mapping
+precedence, files side effects, include-once behavior, missing dependencies,
+class aliases and worker/request loader-state isolation. Publish the supported
+loading contract and remaining mapping/runtime-loading gaps.
+
+### ⛔ M13 — Standard library and native service integrations
+
+**Depends on:** M10 failure/exception representations; M8 for C-backed bindings.
+
+**Scope.**
+
+* Expand filesystem/path, stream/resource, environment/process, date/time,
+  JSON, regex, encoding and collection APIs according to the fixture inventory.
+  Preserve byte-string behavior and document warning/error/coercion contracts.
+* Add tested database access with at least one implemented driver, including
+  parameter binding, transactions, failures and deterministic connection cleanup.
+* Add required hashing, secure randomness, encryption and multibyte operations
+  through implemented APIs, with explicit dependency/version requirements.
+* Choose and document native C bindings or explicit PHP boundaries per API.
+  M8 does not itself provide Zend extension ABI compatibility; existing PHP
+  extension binaries must not be advertised as natively loadable without a
+  separate implemented ABI contract.
+* Classify blocking calls and provide executor-safe asynchronous forms where
+  needed, preserving ownership and resource closure on error/cancellation.
+
+**Acceptance.** Filesystem/configuration, JSON/regex, database and resource-lifetime
+fixtures match the selected PHP reference behavior. Native bindings have failure,
+size/binary-input, cleanup and sanitizer coverage. Publish an API/driver matrix
+that distinguishes native support, explicit PHP boundaries and unsupported APIs.
+
+### ⛔ M14 — Application HTTP and request lifecycle
+
+**Depends on:** M10–M13 capabilities used by the selected HTTP fixtures; builds on
+M7's existing HTTP parser, structured tasks and request globals.
+
+**Scope.**
+
+* Request/response objects, routing and composable middleware/handler contracts.
+* Multipart uploads, file metadata, cookies, sessions, output buffering and
+  streaming responses, each with a documented supported contract.
+* Complete the selected request-global population and isolation rules, including
+  uploaded files and sessions, plus environment/configuration and CLI entry-point
+  behavior needed by the fixtures.
+* Map exceptions and runtime failures to responses, preserve header/body ordering,
+  and reset request-local state in persistent workers. Integrate deadlines,
+  cancellation and graceful shutdown with owned resource cleanup.
+* Document deployment and gateway boundaries. Standalone native HTTP support
+  must not be presented as complete PHP web SAPI compatibility.
+
+**Acceptance.** A generic HTTP application handles routes, middleware, errors,
+uploads, sessions and streamed output using the implemented contracts. Repeated
+and concurrent requests demonstrate isolation, bounded memory and cleanup after
+failures/disconnects. CLI configuration and application entry points are tested
+separately from server execution.
+
+### ⛔ M15 — Package and application compatibility acceptance
+
+**Depends on:** the M10–M14 capabilities exercised by each acceptance fixture.
+
+**Scope.**
+
+* Expand the initial fixture corpus into reproducible, version-pinned package,
+  CLI and HTTP application checks using normal dependency layouts and entry points.
+* Exercise autoloading, reflective dependency construction, callback dispatch,
+  exception handling, configuration, template/file rendering and an implemented
+  database driver together, rather than inferring application compatibility from
+  isolated syntax tests.
+* Compare observable output, errors and relevant side effects with a pinned PHP
+  reference. Record package/runtime versions, patches, configuration and whether
+  each scenario runs natively or crosses an explicit PHP boundary.
+* Add representative application benchmarks alongside the existing microbenchmarks,
+  covering startup and persistent request handling, memory and concurrency.
+
+**Acceptance.** Publish a reproducible compatibility matrix with passing scenarios
+and explicit gaps. Run normal/forced GC, applicable sanitizers and worker checks.
+Claim support only for tested package versions, scenarios and execution modes;
+partial boot, a successful autoload, or a mixed PHP/native run is not proof of
+fully native application compatibility.

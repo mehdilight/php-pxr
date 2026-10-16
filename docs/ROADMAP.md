@@ -54,7 +54,13 @@ today     typed scalars, arrays, control flow, LLVM backend, tests, benchmarks
   ├─ M6  affine ownership, borrows, precise reclamation    ✅ done
   ├─ M7  async/await + structured tasks, then threads      ✅ done
   ├─ M8  C interoperability (extern "C", FFI)             (systems access)
-  └─ M9  package manager, LSP, cross-compile, JIT         (ecosystem)
+  ├─ M9  package tooling, LSP, cross-compile, JIT         (parallel tooling track)
+  ├─ M10 PHP language compatibility foundations          (planned)
+  ├─ M11 reflection and dynamic object behavior          (planned)
+  ├─ M12 Composer dependencies and autoloading            (planned)
+  ├─ M13 standard library and native service integrations (planned)
+  ├─ M14 application HTTP and request lifecycle           (planned)
+  └─ M15 package/application compatibility acceptance     (planned)
 ```
 
 The destination — a compiled, memory‑safe language that speaks PHP — requires
@@ -95,10 +101,26 @@ These process timings are not a general application or server throughput claim.
 **Next:** M8 — C interoperability: extern declarations, native linking and exports.
 The draft syntax is saved in [C_INTEROP_PROPOSAL.md](C_INTEROP_PROPOSAL.md).
 
+## PHP package and application compatibility
+
+The planned M10–M15 track broadens language behavior, reflection/dynamic dispatch,
+Composer dependency loading, runtime libraries and request lifecycle support.
+It uses version-pinned, framework-agnostic package, CLI and HTTP fixtures, with
+explicit acceptance gates in [MILESTONES.md](MILESTONES.md#planned-php-application-compatibility-track).
+M8 remains next; M9 tooling can progress alongside this compatibility work.
+
+Native support and explicit PHP boundaries remain separate execution modes.
+Current typed checks stay the default; any broader package compatibility policy
+must be designed and documented before implementation. C interoperability does
+not imply that existing Zend extension binaries load natively. Application
+support will be claimed only for tested versions and scenarios, with reproducible
+configuration, compatibility gaps and application-level measurements.
+
 ## Non‑goals (for now)
 
 * Re‑implementing the entire PHP standard library or its web SAPI.
-* Running unmodified large frameworks (that is what M4's interop and `mixed` are
-  for, and even then it is best‑effort).
+* Claiming compatibility with arbitrary unmodified PHP applications. M10–M15
+  work toward tested package/application scenarios; current M4 boundaries remain
+  explicit and do not imply native compatibility.
 * Replacing PHP's interpreter for existing deployments — PXR is an additional
   toolchain, not a drop‑in replacement.
