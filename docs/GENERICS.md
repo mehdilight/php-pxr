@@ -73,6 +73,28 @@ instantiated, and unused templates emit no native function. This is a template
 model: operations must be valid for each concrete instantiation. Declared bounds
 are checked before accepting an instantiation.
 
+## Async generic functions
+
+Free generic functions can be async with an explicit completed-result type:
+
+```php
+async function delayed<T>(T $value): T {
+    await sleepAsync(0);
+    return $value;
+}
+async function main(): void {
+    echo await delayed(42), ":", await delayed<string>("hello"), "\n";
+}
+```
+
+Inference, bounds, contextual argument conversion and specialization reuse follow
+the rules above. Each concrete async specialization has a lazy task constructor
+and a resumable body; arrays preserve value semantics and shared objects keep
+their identity across suspension. Owned captures must be moved, while borrowed
+captures, owned/borrowed results and task arguments remain rejected. Calls require
+an async context, and the global async main cannot be generic. Async methods and
+async return inference remain pending. See [ASYNC.md](ASYNC.md).
+
 ## Generic classes and interfaces
 
 ```php

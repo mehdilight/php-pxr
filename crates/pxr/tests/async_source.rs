@@ -298,7 +298,7 @@ fn invalid_async_forms_fail_before_codegen() {
         ("entry-params", "async function main(int $x): void {}".to_string()),
         ("entry-result", "async function main(): int { return 1; }".to_string()),
         ("entry-top", "echo 1; async function main(): void {}".to_string()),
-        ("generic", "async function f<T>(T $x): T { return $x; }".to_string()),
+        ("generic-main", "async function main<T>(): void {}".to_string()),
         ("inferred", "async function f() { return 1; }".to_string()),
         ("borrow-capture", "async function f(&int $x): int { return $x; }".to_string()),
         ("owned-result", "async function f(): owned<int> { return 1; }".to_string()),
@@ -343,6 +343,171 @@ fn invalid_async_forms_fail_before_codegen() {
 }
 
 #[test]
+fn generic_async_calls_preserve_results_recursion_and_lazy_task_rules() {
+    run_case(
+        "generic-async-values",
+        r#"<?php
+function syncIdentity<T>(T $value) { return $value; }
+async function identity<T>(T $value): T { await sleepAsync(0); return syncIdentity($value); }
+async function even<T>(T $value, int $n): T {
+    if ($n === 0) { return $value; }
+    return await odd($value, $n - 1);
+}
+async function odd<T>(T $value, int $n): T {
+    if ($n === 0) { return $value; }
+    return await even<T>($value, $n - 1);
+}
+async function emit<T>(T $value): void { await sleepAsync(0); echo $value; }
+async function never<T>(T $value): void { echo "unreachable"; await sleepAsync(10000000); }
+async function main(): void {
+    $lazy = never("discarded"); drop($lazy);
+    $first = identity(42); $moved = move($first); $started = spawn $moved;
+    echo await $started, ":", await identity("hello"), ":";
+    echo await identity<float>(1) + 0.5, ":", await identity(true), ":";
+    echo is_null(await identity(null)), ":";
+    $mixed = await identity<mixed>("mixed");
+    echo strval($mixed), ":", await even("recursive", 7), ":";
+    await emit<int>(9); echo "\n";
+}"#,
+        "42:hello:1.5:1:1:mixed:recursive:9\n",
+    );
+}
+
+#[test]
+fn generic_async_arrays_objects_and_owned_captures_survive_suspension() {
+    run_case(
+        "generic-async-roots",
+        r#"<?php
+class Box<T> {
+    public T $value;
+    public function __construct(T $value) { $this->value = $value; }
+}
+async function identity<T>(T $value): T { await sleepAsync(0); return $value; }
+async function first<T>(array<T> $values, T $fallback): T {
+    await sleepAsync(0); return $values[0] ?? $fallback;
+}
+async function consume<T>(owned<Box<T>> $box): T {
+    await sleepAsync(0); return $box->value;
+}
+async function ownedFirst<T>(owned<array<T>> $values): T {
+    await sleepAsync(0); return $values[0];
+}
+async function held<T>(owned<T> $value): void { await sleepAsync(10000000); }
+async function main(): void {
+    echo await first([], 7), ":", await first(["a", "b"], "z"), ":";
+    $empty = await identity([]); echo count($empty), ":";
+    $original = [1, 2]; $pending = identity($original); $original[0] = 9;
+    $result = await $pending; $result[1] = 8; echo $original[1], ":", $result[0], ":";
+    $array = await identity<array<mixed>>([1, "two"]);
+    echo count($array), ":", strval($array[1]), ":";
+    $object = new Box<string>(str_repeat("x", 128));
+    $copy = await identity($object); $copy->value = "shared";
+    echo $object->value, ":";
+    $owner: owned<Box<string>> = new Box<string>(str_repeat("y", 128));
+    $task = consume(move($owner)); await sleepAsync(0);
+    echo strlen(await $task), ":";
+    $values: owned<array<string>> = [str_repeat("z", 128)];
+    echo strlen(await ownedFirst(move($values))), "\n";
+    $capture: owned<Box<string>> = new Box<string>(str_repeat("c", 8192));
+    $cancelled = spawn held(move($capture)); await sleepAsync(0); cancelTask($cancelled);
+}"#,
+        "7:a:0:2:1:2:two:shared:128:128\n",
+    );
+}
+
+#[test]
+fn generic_async_bounds_and_specializations_reuse_concrete_native_functions() {
+    if !have_cc() {
+        return;
+    }
+    let source = r#"<?php
+interface Named { public function name(): string; }
+class Label implements Named {
+    public function name(): string { return "label"; }
+}
+async function describe<T: Named>(T $value): string {
+    await sleepAsync(0); return $value->name();
+}
+async function identity<T>(T $value): T { await sleepAsync(0); return $value; }
+async function unused<T>(T $value): T { return $value->missing(); }
+async function main(): void {
+    echo await identity(1), ":", await identity<int>(2), ":";
+    echo await identity("a"), ":", await identity<string>("b"), ":";
+    echo await describe(new Label()), "\n";
+}"#;
+    let encoded: String = b"identity".iter().map(|b| format!("{b:02x}")).collect();
+    let unused: String = b"unused".iter().map(|b| format!("{b:02x}")).collect();
+    let prefix = ["pxr$g$", &encoded, "$"].concat();
+    let unused_prefix = ["pxr$g$", &unused, "$"].concat();
+    for opt in [0, 3] {
+        let executable = build("generic-async-specializations", source, opt);
+        let llvm = std::fs::read_to_string(executable.with_extension("ll")).unwrap();
+        let definitions: Vec<_> = llvm
+            .lines()
+            .filter(|line| line.starts_with("define ") && line.contains(&prefix))
+            .collect();
+        assert_eq!(
+            definitions.len(),
+            4,
+            "two constructors and their resumable bodies: {definitions:?}"
+        );
+        assert!(!llvm.contains(&unused_prefix));
+        for stress in [false, true] {
+            let mut command = Command::new(&executable);
+            command.env("PXR_PHP", "/pxr-no-php-cli");
+            if stress {
+                command.env("PXR_GC_STRESS", "1");
+            }
+            let out = execute(&mut command);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(out.stdout, b"1:2:a:b:label\n");
+            assert!(out.stderr.is_empty());
+        }
+        std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn generic_async_invalid_calls_captures_and_specializations_are_diagnosed() {
+    let dir = std::env::temp_dir().join(format!("pxr-generic-async-errors-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (i, (source, diagnostic)) in [
+        ("async function f<T>(T $x): T { return $x; } function g(): void { f(1); }", "E0300"),
+        ("async function f<T>(T $x): T { return $x; } $t = f(1);", "E0300"),
+        ("async function main<T>(): void {}", "E0300"),
+        ("async function f<T>(T $x) { return $x; }", "E0300"),
+        ("async function f<T>(&T $x): T { return $x; }", "call-scoped borrows"),
+        ("async function f<T>(&mut array<T> $x): void {}", "call-scoped borrows"),
+        ("async function f<T>(owned<T> $x): owned<T> { return move($x); }", "async results"),
+        ("async function f<T>(T $x): T { return $x; } async function main(): void { $t = f(1); await $t; await $t; }", "error"),
+        ("async function f<T>(T $x): T { return $x; } async function main(): void { $a = [f(1)]; }", "error"),
+        ("async function f<T>(T $x): T { return $x; } async function main(): void { echo await f(sleepAsync(0)); }", "error"),
+        ("async function f<T>(T $x): T { return $x; } async function main(): void { $x: owned<int> = 1; await f(&$x); }", "error"),
+        ("async function f<T>(owned<T> $x): void {} async function main(): void { $x: owned<string> = \"x\"; $t = f(move($x)); echo $x; }", "error"),
+        ("function read(&int $x, int $y): int { return $x + $y; } async function f<T>(T $x): T { return $x; } async function main(): void { $x: owned<int> = 1; echo read(&$x, await f(1)); }", "error"),
+        ("async function f<T>(T $x, T $y): T { return $x; } async function main(): void { await f(1, 2.5); }", "E0281"),
+        ("async function f<T>(T $x): T { return $x; } async function main(): void { await f<int,string>(1); }", "E0280"),
+        ("async function f<T>(T $x): T { return $x; } async function main(): void { await f<void>(1); }", "E0280"),
+        ("async function f<T>(array<T> $x): T { return $x[0]; } async function main(): void { await f([]); }", "E0281"),
+        ("interface Named { public function name(): string; } async function f<T: Named>(T $x): T { return $x; } async function main(): void { await f(1); }", "error"),
+        ("async function f<T>(T $x): T { return $x->missing(); } async function main(): void { await f(1); }", "while specializing"),
+        ("async function grow<T>(T $x): void { await grow([$x]); } async function main(): void { await grow(1); }", "E0283"),
+        ("async function f<T>(T $x): T { return $x; } async function main(): void { await tcpServeAsync(\"127.0.0.1\", 8080, \"f\", 1, 10); }", "E0300"),
+    ].iter().enumerate() {
+        let path = dir.join(format!("{i}.php")); std::fs::write(&path, format!("<?php {source}")).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_pxr")).arg("check").arg(path).output().unwrap();
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "case {i} accepted");
+        assert!(error.contains(diagnostic) && !error.contains("panicked"), "case {i}: {error}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn affine_tasks_move_reinitialize_and_join_across_branches() {
     run_case(
         "affine",
@@ -370,10 +535,10 @@ fn async_functions_resolve_across_native_modules_and_namespaces() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("helpers.php"),
-        "<?php namespace Jobs; async function answer(): int { await sleepAsync(0); return 42; }",
+        "<?php namespace Jobs; async function answer(): int { await sleepAsync(0); return 42; } async function later<T>(T $value): T { await sleepAsync(0); return $value; }",
     )
     .unwrap();
-    std::fs::write(dir.join("main.php"), "<?php require __DIR__ . '/helpers.php'; use function Jobs\\answer; async function main(): void { echo await answer(), \"\\n\"; }").unwrap();
+    std::fs::write(dir.join("main.php"), "<?php require __DIR__ . '/helpers.php'; use function Jobs\\answer; use function Jobs\\later as delayed; async function main(): void { echo await answer(), \":\", await delayed<string>(\"hello\"), \"\\n\"; }").unwrap();
     let executable = dir.join("main");
     let out = Command::new(env!("CARGO_BIN_EXE_pxr"))
         .arg("build")
@@ -393,7 +558,7 @@ fn async_functions_resolve_across_native_modules_and_namespaces() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(out.stdout, b"42\n");
+    assert_eq!(out.stdout, b"42:hello\n");
     assert!(out.stderr.is_empty());
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1479,18 +1644,18 @@ fn http_handler_failures_join_descendants_and_return_clean_500_responses() {
     let handler = format!(
         r#"
 async function reply(string $request): string {{ return $request; }}
-async function failChild(): void {{ await sleepAsync(-1); }}
+async function failChild<T>(T $context): void {{ await sleepAsync(-1); }}
 async function handle(): string {{
     if ($_SERVER["PATH_INFO"] === "/direct") {{
         header("X-Private: secret"); echo "private";
-        await failChild();
+        await failChild("direct");
         return "unreachable";
     }}
     $listener = spawn tcpServeAsync("127.0.0.1", {gate}, "reply", 0, 10);
     await sleepAsync(0);
     if ($_SERVER["PATH_INFO"] === "/tree") {{
         header("X-Private: secret"); http_response_code(201); echo "private";
-        spawn failChild();
+        spawn failChild<int>(1);
         return "discarded";
     }}
     cancelTask($listener);

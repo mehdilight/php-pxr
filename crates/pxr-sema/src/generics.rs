@@ -137,7 +137,11 @@ impl GenericCall {
                 name: self.signature.display,
                 params: self.signature.params,
             },
-            ret: self.signature.ret,
+            ret: if self.signature.is_async {
+                Ty::Task(Box::new(self.signature.ret))
+            } else {
+                self.signature.ret
+            },
             args: self.values,
             arg_tys,
             span,
@@ -333,6 +337,14 @@ impl Analyzer {
         span: Span,
         ctx: &mut FnCtx,
     ) -> Option<TExpr> {
+        if declaration.is_async && !ctx.is_async {
+            self.diags.emit(
+                Diagnostic::error("async functions can only be called from an async context")
+                    .with_code("E0300")
+                    .with_span(span),
+            );
+            return None;
+        }
         let prepared = self.prepare_generic_call(declaration, type_args, args, span, ctx)?;
         if prepared.deferred {
             return Some(TExpr::Deferred);
@@ -500,7 +512,7 @@ impl Analyzer {
                 None => self.class_expander.inferred_return(&mangled),
             };
             Signature {
-                is_async: false,
+                is_async: declaration.is_async,
                 mangled,
                 display: format!(
                     "{}<{}>",

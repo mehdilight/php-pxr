@@ -2067,8 +2067,19 @@ impl Analyzer {
                 continue;
             }
 
-            if f.is_async && (!f.type_params.is_empty() || f.ret.is_none()) {
-                self.diags.emit(Diagnostic::error("async functions currently require an explicit result type and cannot be generic").with_code("E0300").with_span(f.name_span));
+            if f.is_async && f.ret.is_none() {
+                self.diags.emit(
+                    Diagnostic::error("async functions currently require an explicit result type")
+                        .with_code("E0300")
+                        .with_span(f.name_span),
+                );
+            }
+            if f.is_async && key == "main" && !f.type_params.is_empty() {
+                self.diags.emit(
+                    Diagnostic::error("async main cannot be generic")
+                        .with_code("E0300")
+                        .with_span(f.name_span),
+                );
             }
             let bindings: HashMap<_, _> = f
                 .type_params

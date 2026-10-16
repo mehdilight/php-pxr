@@ -778,6 +778,14 @@ live-root bitmaps, including packed pointer intermediates. Results/locals suppor
 scalars, strings, arrays, shared objects and mixed; native module/name resolution
 and ordinary control flow work around awaits. See `examples/async/main.php`.
 
+**Delivered generic async functions:** explicit-result free async templates use
+inferred or explicit type arguments, bounds and native specialization reuse.
+Each specialization lowers to a lazy constructor and resumable body with the
+same precise roots and affine task rules. Tests cover scalar/null/mixed results,
+array value semantics, shared objects, moved owned captures, cancellation,
+mutual recursion, generic HTTP helper failures, native module imports and bounded
+specialization diagnostics. See `examples/async/generics.php`.
+
 **Delivered I/O slice:** `tcpExchangeAsync` owns a nonblocking numeric IPv4/IPv6
 connection, sends a binary request, half-closes writes, and reads a bounded
 response to EOF. Its optional deadline covers the entire started operation.
@@ -821,7 +829,7 @@ parameters and cancellation/GC roots. See [`HTTP.md`](HTTP.md),
 `examples/async/http.php` and the finite `examples/async/http_demo.php`.
 
 **Remaining:** streaming socket/resource APIs, recoverable error APIs, broader
-task/result ownership signatures, generic async functions, async methods and
+task/result ownership signatures, async methods and
 async return inference. Unsupported source forms
 receive diagnostics. The current runtime error envelope does not implement PHP
 exceptions or finally/destructors. Request/response objects, router classes,
@@ -832,7 +840,7 @@ pending. Threading remains M7.2.
 AddressSanitizer/UndefinedBehaviorSanitizer. They cover scheduling progress,
 ordered awaits, affine handles, joins/cleanup, control-flow suspension, captured
 values, module resolution, failure propagation, bounded memory and invalid forms.
-All 240 workspace tests, async/HTTP/heap/ownership sanitizer checks, example checks
+All 244 workspace tests, async/HTTP/heap/ownership sanitizer checks, example checks
 and the release build pass.
 M7.1 and M7 remain incomplete until the remaining I/O/lifecycle APIs and their
 source acceptance checks are delivered.

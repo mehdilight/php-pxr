@@ -73,12 +73,44 @@ are ordinary helpers, not CLI entry points. Synchronous programs retain their
 existing top-level entry. Calling an async function, awaiting, spawning or
 constructing a timer from synchronous source receives a diagnostic.
 
-The first slice requires explicit async result annotations and supports free
-functions. Async generic functions, inferred async results and async methods are
-rejected. Ordinary synchronous generic functions/methods may still be called
+Async functions require explicit result annotations and support free functions,
+including generic functions. Inferred async results and async methods remain
+rejected. Ordinary synchronous generic functions/methods may also be called
 inside an async body. Successful results may be scalar, string, array, shared
 native object, mixed, or void; owned/borrowed async result annotations are
 rejected until result ownership contracts are extended.
+
+## Generic async functions
+
+```php
+async function delayed<T>(T $value): T {
+    await sleepAsync(0);
+    return $value;
+}
+
+async function main(): void {
+    $number = spawn delayed(42);
+    $word = spawn delayed<string>("hello");
+    echo await $number, ":", await $word, "\n";
+}
+```
+
+Type arguments are inferred from ordinary value arguments or supplied explicitly,
+using the existing [generic function rules](GENERICS.md). Arrays, generic classes,
+nominal bounds, namespace/function imports and direct/mutual recursion work.
+Repeated concrete calls reuse a specialization; each async specialization lowers
+to its own lazy constructor and resumable body with precise roots. Unused template
+bodies emit no code. Specialization limits and concrete body diagnostics still
+apply. See `examples/async/generics.php`.
+
+The written result type describes the completed value, so `: T` creates a lazy
+`Task<T>` and `: void` creates `Task<void>`. Generic functions obey the same
+borrow, move, cancellation and scope rules as other async functions; they cannot
+accept task handles as ordinary generic arguments or return owned/borrowed
+results. The global async main is never generic. Literal server callbacks still
+require a non-generic handler, which can await a generic helper.
+
+## Task handles
 
 Task locals currently use inferred types. Source `Task<T>` annotations, task
 parameters/returns, task fields/arrays, shared tasks, escaping handles and detached
@@ -105,7 +137,7 @@ echo await $joined;
 ```
 
 Call-scoped borrowed parameters cannot be captured by async functions, even if
-an immediate await would appear safe. Await/spawn/cancelTask also cannot cross
+an immediate await would appear safe. Await/spawn/cancelTask/stopServer also cannot cross
 an active call borrow during argument evaluation. Owned locals and explicitly moved owned
 parameters can survive suspension; synchronous borrow calls are allowed once no
 suspension crosses their call lifetime.

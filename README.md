@@ -25,7 +25,7 @@ worker when they execute.
 > independent methods; nominal bounds, trait composition, and return inference.
 > M6 adds affine `owned<T>` handles, moves, call-scoped borrows, and precise
 > reclamation of dead values and cycles. M7 is in progress: an internal executor
-> supports free async functions, affine task handles, await/spawn, nonblocking
+> supports generic free async functions, affine task handles, await/spawn, nonblocking
 > timers, owned TCP exchanges, bounded native TCP servers, consuming cancellation
 > and an async main entry. A bounded HTTP adapter adds isolated request globals,
 > PHP-style output, header() and http_response_code(), bounded chunked bodies,
@@ -218,7 +218,7 @@ advanced trait adaptations and generic trait mixins,
 stored/named-lifetime borrows and owned fields, the complex string‑interpolation forms (`"$a[0]"`,
 `"{$expr}"`, `"${name}"`, `"$obj->p"`; the simple `"$name"` / `"{$name}"` work),
 native exceptions, C interop (`extern`), streaming async socket APIs and recoverable task errors,
-async methods/generics and threaded concurrency (M7 is in progress; see
+async methods, async return inference and threaded concurrency (M7 is in progress; see
 [`docs/ASYNC.md`](docs/ASYNC.md)), and broader PHP language/library coverage in compiled code.
 
 ## License

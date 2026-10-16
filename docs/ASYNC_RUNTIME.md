@@ -113,8 +113,12 @@ the existing terminal cleanup limitations.
 
 The source checker rejects call-scoped borrows entering lazy frames, checks
 affine task/result consumption and prevents child handles escaping their creating
-scope. The first slice uses inferred task locals and rejects generic async
-functions, async methods, owned/borrowed async results and async result inference.
+scope. Free async generic functions specialize to concrete functions before the
+existing resumable lowering, preserving async identity in signatures and wrapping
+call results as tasks. They use the same precise live-root analysis and task ABI;
+no separate generic runtime or boxed dispatch is introduced. The source uses
+inferred task locals and rejects async methods, owned/borrowed async results and
+async result inference.
 OS threads, `Send`/`Sync`, shared tasks and detached tasks remain future work.
 
 ## Validation

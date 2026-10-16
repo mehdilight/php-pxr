@@ -71,7 +71,7 @@ remain foundations; the async compiler extends borrow checks and precise roots
 to captures and suspension. [`ASYNC.md`](ASYNC.md) records runnable syntax and
 current rejected forms. Owned TCP exchanges, bounded native TCP servers with
 concurrent async handlers, and consuming `cancelTask` are delivered. Streaming
-socket resources, recoverable errors, async methods/generics and broader task
+socket resources, recoverable errors, async methods and broader task
 signatures remain pending. See [`ASYNC_IO.md`](ASYNC_IO.md) and
 [`ASYNC_SERVER.md`](ASYNC_SERVER.md). The [HTTP adapter](HTTP.md) now adds bounded
 request framing, isolated PHP-style query/form/cookie/server globals, buffered
