@@ -887,6 +887,10 @@ ThreadSanitizer checks pass. See [PARALLEL.md](PARALLEL.md) and the runnable
 
 ## ⛔ M8 — C interoperability
 
+Draft library blocks, C types, symbol aliases and opaque pointer syntax are
+recorded in [C_INTEROP_PROPOSAL.md](C_INTEROP_PROPOSAL.md). These declarations
+are proposals; the compiler does not implement them yet.
+
 * `extern "C"` declarations, calling C libraries, linking system libraries.
 * Exporting a C ABI from PXR; a header generator.
 

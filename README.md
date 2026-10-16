@@ -166,19 +166,24 @@ and marked legacy files run in PHP. The boundary and differences are documented 
 
 ## Benchmarks
 
-`benchmarks/run.sh` builds each benchmark with `pxr build --opt 3` and compares
-against the PHP interpreter (best of N runs). M6 measurements on the reference
-Apple-silicon laptop (best of five, including process startup):
+`benchmarks/run.sh` compares identical programs against the installed PHP CLI,
+checking outputs and reporting median wall time after warmup. On the Apple M3
+Max with PHP 8.4.25 CLI (JIT disabled), nine runs at PXR `-O3` measured:
 
-| benchmark | PXR | PHP | speedup |
-| --- | ---: | ---: | ---: |
-| `fib.php` (naive recursive `fib(30)`) | ~4.6 ms | ~88.8 ms | ~19.2× |
-| `loop.php` (5M‑iteration integer loop) | ~2.5 ms | ~76.4 ms | ~30.1× |
+| workload | PXR | PHP | PXR relative to PHP |
+| --- | ---: | ---: | --- |
+| Recursive `fib(30)` | 4.21 ms | 86.67 ms | 20.58× faster |
+| Integer loop (5M) | 2.12 ms | 80.49 ms | 38.03× faster |
+| Array append + reads (10k) | 83.58 ms | 28.37 ms | 2.95× slower |
+| Read-only array copies (100k) | 255.35 ms | 29.76 ms | 8.58× slower |
+| String append (50k) | 186.14 ms | 29.70 ms | 6.27× slower |
+| Objects + methods (2M) | 284.24 ms | 188.74 ms | 1.51× slower |
 
-Memory-free scalar functions omit root frames; allocating functions retain
-collection safepoints. Scalar loops before the first possible allocation also
-omit polling. These are illustrative, not a claim about all programs; re-run them
-on your own machine with `./benchmarks/run.sh`.
+Timings include process startup and exclude compilation. PHP startup on this
+configuration is about 28 ms; PXR startup is about 2.3 ms. These microbenchmarks
+are not a general application speedup claim. See the
+[full report and raw samples](benchmarks/results/2026-10-16-m7.md) or re-run
+`./benchmarks/run.sh` on your machine.
 
 ## Architecture
 

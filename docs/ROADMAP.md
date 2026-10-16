@@ -82,6 +82,7 @@ full web SAPI compatibility remain further extensions. Ordinary blocking calls
 still block their executor; CPU parallelism is explicit.
 
 **Next:** M8 — C interoperability: extern declarations, native linking and exports.
+The draft syntax is saved in [C_INTEROP_PROPOSAL.md](C_INTEROP_PROPOSAL.md).
 
 ## Non‑goals (for now)
 
