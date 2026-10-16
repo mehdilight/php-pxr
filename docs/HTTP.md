@@ -30,6 +30,13 @@ or the process stops. `examples/async/http_demo.php` is a finite demonstration
 with a native server and two native clients on loopback port 8767; it prints the
 complete responses and exits. No Python server is needed.
 
+For a form POST using chunked input and the continue handshake:
+
+```sh
+curl --http1.1 -H 'Transfer-Encoding: chunked' -H 'Expect: 100-continue' \
+  --data 'name=Ada' http://127.0.0.1:8080/hello
+```
+
 ## Server and handler contract
 
 `httpServeAsync(string address, int port, literal string handler, int maxRequests,
@@ -146,23 +153,46 @@ The adapter accepts strict CRLF-delimited HTTP/1.0 and HTTP/1.1 request lines an
 origin-form targets. It serves one request per connection with Content-Length
 and `Connection: close`. Unlike the raw TCP server, it invokes the handler as
 soon as the headers and declared body are complete, without waiting for EOF.
-Missing Content-Length means no body. HTTP/1.1 requires one valid Host field.
+HTTP/1.1 accepts Content-Length or a single `Transfer-Encoding: chunked` coding;
+HTTP/1.0 accepts Content-Length. Without either, the body is empty.
+HTTP/1.1 requires one valid Host field.
 Malformed header tokens/values, whitespace before a colon, folded headers,
 conflicting/duplicate Content-Length and TE+CL are rejected with 400.
 
 Headers, including their terminator, are limited to 16 KiB and 100 fields;
 exceeding these limits returns 431. Targets are limited to 8 KiB. `maxBytes` is
-an independent nonnegative limit on declared request body content and combined
+an independent nonnegative limit on decoded request body content and combined
 handler output/result, excluding headers. Oversized requests receive 413;
 invalid/oversized handler responses receive 500. Fixed error responses have a
 small reserved body even when `maxBytes` is zero. Buffers, parsed variables,
 string copies and arbitrary handler allocations also consume memory; this is
 not a total process memory bound.
 
-Transfer-Encoding (including chunked requests) and Upgrade receive 501, Expect
-receives 417, and unsupported versions receive 505. Keep-alive, pipelining
-execution, CONNECT/proxy/asterisk targets, trailers, compression, TLS and HTTP/2
-are not implemented. Additional bytes are not dispatched as another request.
+Chunk sizes, data and CRLF delimiters can span reads. Token and quoted chunk
+extensions are validated and ignored. Decoded content populates
+`httpRequestBody()` and form `$_POST`/`$_REQUEST` exactly like Content-Length
+content; no synthetic `CONTENT_LENGTH` is added. Consumed wire bytes are
+discarded during decoding. Limits are 8 KiB per size/extension or trailer line,
+64 KiB of total chunk metadata, and 8192 nonempty chunks (413 on excess).
+Trailers have an additional 16 KiB/100-field limit (431). Valid nonessential
+trailers are discarded and never merged into request headers or globals.
+Framing, routing, credentials and content-processing trailers, including
+Content-Length, Transfer-Encoding, Host, Cookie and Content-Type, receive 400.
+Malformed sizes, extensions, delimiters, trailers and truncated bodies receive
+400; size overflow or decoded content beyond `maxBytes` receives 413.
+
+`Expect: 100-continue` on HTTP/1.1 receives an interim response after header
+validation if content is still needed, before waiting for more input. Invalid
+headers receive a final error directly; if content is already complete, the
+interim response can be omitted. HTTP/1.0 ignores `100-continue`.
+Other expectations receive 417. Interim writes use nonblocking readiness and
+the existing absolute connection deadline.
+
+Unsupported transfer codings and Upgrade receive 501; duplicate/nonfinal
+chunked coding, malformed coding lists, HTTP/1.0 Transfer-Encoding and TE+CL
+receive 400. Unsupported versions receive 505. Keep-alive, pipelining execution,
+CONNECT/proxy/asterisk targets, trailer APIs, compression, TLS and HTTP/2 are not
+implemented. Additional bytes are not dispatched as another request.
 After sending the response, the server shuts down writes so the peer sees EOF,
 then drains at most 64 KiB/100 ms of input before closing, bounded by the existing
 connection deadline. This reduces resets when rejecting unread request bodies;
@@ -181,7 +211,8 @@ behavior. This slice is not yet a production web-server compatibility claim.
 ## Verification and references
 
 Source acceptance tests use real clients that keep their write sides open.
-They cover fragmented headers/bodies, binary 1 MiB transfers, limits, HTTP status
+They cover fragmented headers/bodies, fixed/chunked binary 1 MiB transfers,
+clients waiting for 100 Continue, malformed chunk framing, limits, HTTP status
 and header behavior, PHP-style output and globals, nested parameters, and
 connection-local protocol errors followed by valid requests. A protocol gate
 proves a fast request finishes while another handler is suspended; globals,
@@ -191,7 +222,9 @@ status, headers and child-task output remain isolated. The suites run at
 The native C suite additionally feeds headers byte by byte, tests truncation,
 NUL/control bytes and deterministic arbitrary input, forces collection while
 request/output buffers are live, verifies nested REQUEST merging, and checks
-read deadlines, bounded teardown and cancellation through a handler's joining
-grandchild. Cleanup and descriptor reuse are checked before process teardown.
+read/interim-write deadlines, bounded teardown, cancellation during chunk
+decoding and through a handler's joining grandchild. Every truncation of a
+chunked fixture, quoted extensions and metadata limits are checked.
+Cleanup and descriptor reuse are checked before process teardown.
 See [ASYNC_REFERENCES.md](ASYNC_REFERENCES.md) for RFCs, PHP source/manuals and the
 pinned llhttp checkout studied. No upstream parser code is vendored or copied.

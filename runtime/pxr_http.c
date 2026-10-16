@@ -28,7 +28,7 @@ static void pxr_http_mark_context(pxr_http_context *context) {
     for (size_t i = 0; i < 6; i++) pxr_gc_mark(context->globals[i]);
     pxr_gc_mark(context->headers); pxr_gc_mark(context->response_headers);
     pxr_gc_mark(context->body);
-    pxr_gc_mark(context->output.data);
+    pxr_gc_mark(context->output.data); pxr_gc_mark(context->decoded.data);
 }
 static pxr_http_context *pxr_http_context_new(int fd, int64_t max_bytes) {
     pxr_http_context *context = pxr_heap_alloc(sizeof(*context));
@@ -405,8 +405,32 @@ static int pxr_http_parse_headers(pxr_http_context *context, const char *data) {
         at = end + 2;
     }
     if (v11 && hosts != 1) return 400;
-    if (transfer) return lengths ? 400 : 501;
-    if (expect) return 417;
+    if (transfer) {
+        if (lengths || !v11) return 400;
+        pxr_str *coding = pxr_http_find(context, "transfer-encoding");
+        size_t i = 0; int chunks = 0, unsupported = 0;
+        while (i < coding->len) {
+            while (i < coding->len && (coding->data[i] == ' ' || coding->data[i] == '\t')) i++;
+            size_t start = i;
+            while (i < coding->len && pxr_http_token((unsigned char)coding->data[i])) i++;
+            if (i == start) return 400;
+            int chunk = pxr_http_equal(coding->data + start, i - start, "chunked");
+            if (chunks) return 400; /* Chunked must occur once, at the end. */
+            if (chunk) chunks = 1; else unsupported = 1;
+            while (i < coding->len && (coding->data[i] == ' ' || coding->data[i] == '\t')) i++;
+            if (i < coding->len && coding->data[i++] != ',') return 400;
+            if (i == coding->len && coding->data[i - 1] == ',') return 400;
+        }
+        if (!coding->len) return 400;
+        if (unsupported) return 501;
+        if (!chunks) return 400;
+        context->chunked = 1;
+    }
+    if (expect) {
+        pxr_str *value = pxr_http_find(context, "expect");
+        if (!pxr_http_equal(value->data, value->len, "100-continue")) return 417;
+        context->continue_pending = v11 && (context->chunked || context->body_length);
+    }
     if (pxr_http_find(context, "upgrade")) return 501;
     pxr_str *encoding = pxr_http_find(context, "content-encoding");
     if (encoding && !pxr_http_equal(encoding->data, encoding->len, "identity")) return 415;
@@ -440,6 +464,126 @@ static void pxr_http_merge(pxr_array *destination, pxr_array *source) {
             PXR_TAG_MIXED, (intptr_t)pxr_mixed_copy((void *)(intptr_t)entry->bits));
     }
 }
+
+/* Wire bytes are discarded as they are consumed. Only decoded content and a
+ * partial metadata line survive a read; each has an independent hard bound. */
+enum { PXR_CHUNK_SIZE, PXR_CHUNK_DATA, PXR_CHUNK_CRLF, PXR_CHUNK_TRAILERS, PXR_CHUNK_DONE };
+static int pxr_http_chunk_size(pxr_http_context *context, const char *data, size_t length) {
+    size_t at = 0, size = 0;
+    while (at < length && pxr_http_hex((unsigned char)data[at]) >= 0) {
+        unsigned digit = (unsigned)pxr_http_hex((unsigned char)data[at++]);
+        if (size > (SIZE_MAX - digit) / 16) return 413;
+        size = size * 16 + digit;
+    }
+    if (!at) return 400;
+    /* RFC 9112 chunk extensions: token names and token/quoted-string values.
+     * BWS is accepted only where the extension grammar allows it. */
+    while (at < length) {
+        while (at < length && (data[at] == ' ' || data[at] == '\t')) at++;
+        if (at == length || data[at++] != ';') return 400;
+        while (at < length && (data[at] == ' ' || data[at] == '\t')) at++;
+        size_t start = at;
+        while (at < length && pxr_http_token((unsigned char)data[at])) at++;
+        if (at == start) return 400;
+        size_t end = at;
+        while (at < length && (data[at] == ' ' || data[at] == '\t')) at++;
+        if (at < length && data[at] == '=') {
+            at++;
+            while (at < length && (data[at] == ' ' || data[at] == '\t')) at++;
+            if (at < length && data[at] == '"') {
+                at++; int closed = 0;
+                while (at < length) {
+                    unsigned char c = (unsigned char)data[at++];
+                    if (c == '"') { closed = 1; break; }
+                    if (c == '\\') {
+                        if (at == length) return 400;
+                        c = (unsigned char)data[at++];
+                    }
+                    if ((c < 32 && c != '\t') || c == 127) return 400;
+                }
+                if (!closed) return 400;
+            } else {
+                start = at;
+                while (at < length && pxr_http_token((unsigned char)data[at])) at++;
+                if (at == start) return 400;
+            }
+        } else at = end;
+    }
+    if (size > (uint64_t)context->max_bytes - context->decoded.len) return 413;
+    if (size && ++context->chunk_count > 8192) return 413;
+    context->chunk_remaining = size;
+    context->chunk_state = size ? PXR_CHUNK_DATA : PXR_CHUNK_TRAILERS;
+    return 0;
+}
+static int pxr_http_trailer(pxr_http_context *context, const char *data, size_t length) {
+    size_t colon = 0;
+    while (colon < length && pxr_http_token((unsigned char)data[colon])) colon++;
+    if (!colon || colon == length || data[colon] != ':' ||
+        !pxr_http_value(data + colon + 1, length - colon - 1)) return 400;
+    if (++context->trailer_count > 100) return 431;
+    /* Trailer metadata never changes framing, routing, credentials or globals.
+     * Reject fields whose semantics require processing before the body. */
+    const char *forbidden[] = {
+        "content-length", "transfer-encoding", "host", "connection", "trailer",
+        "expect", "upgrade", "content-type", "content-encoding", "content-range",
+        "authorization", "proxy-authorization", "cookie", "set-cookie",
+        "cache-control", "max-forwards", "range", "te"
+    };
+    for (size_t i = 0; i < sizeof(forbidden) / sizeof(*forbidden); i++)
+        if (pxr_http_equal(data, colon, forbidden[i])) return 400;
+    return 0; /* Valid nonessential trailers are deliberately discarded. */
+}
+/* 0 = incomplete, 1 = complete, HTTP status = invalid. */
+static int pxr_http_chunks(pxr_http_context *context, pxr_buf *wire) {
+    size_t at = 0;
+    while (context->chunk_state != PXR_CHUNK_DONE) {
+        if (context->chunk_state == PXR_CHUNK_DATA) {
+            size_t n = wire->len - at;
+            if (n > context->chunk_remaining) n = context->chunk_remaining;
+            if (n) pxr_buf_append(&context->decoded, wire->data + at, n);
+            at += n; context->chunk_remaining -= n;
+            if (context->chunk_remaining) break;
+            context->chunk_state = PXR_CHUNK_CRLF;
+        } else if (context->chunk_state == PXR_CHUNK_CRLF) {
+            if (at == wire->len) break;
+            if (wire->data[at] != '\r') return 400;
+            if (wire->len - at < 2) break;
+            if (wire->data[at + 1] != '\n') return 400;
+            at += 2; context->chunk_metadata += 2;
+            if (context->chunk_metadata > 65536) return 413;
+            context->chunk_state = PXR_CHUNK_SIZE;
+        } else {
+            size_t end = context->chunk_scan > at ? context->chunk_scan : at;
+            while (end + 1 < wire->len && !(wire->data[end] == '\r' && wire->data[end + 1] == '\n')) end++;
+            int trailer = context->chunk_state == PXR_CHUNK_TRAILERS;
+            if (end + 1 >= wire->len) {
+                size_t pending = wire->len - at;
+                if (pending > 8192 || pending > 65536 - context->chunk_metadata) return 413;
+                if (trailer && pending > 16384 - context->trailer_bytes) return 431;
+                context->chunk_scan = wire->len > at ? wire->len - 1 : at;
+                break;
+            }
+            size_t n = end - at, metadata = n + 2;
+            if (n > 8192 || metadata > 65536 - context->chunk_metadata) return 413;
+            context->chunk_metadata += metadata;
+            if (trailer) {
+                if (metadata > 16384 - context->trailer_bytes) return 431;
+                context->trailer_bytes += metadata;
+            }
+            int status = trailer ? (n ? pxr_http_trailer(context, wire->data + at, n) : 0)
+                                 : pxr_http_chunk_size(context, wire->data + at, n);
+            if (status) return status;
+            if (trailer && !n) context->chunk_state = PXR_CHUNK_DONE;
+            at = end + 2; context->chunk_scan = at;
+        }
+    }
+    if (at) {
+        memmove(wire->data, wire->data + at, wire->len - at); wire->len -= at;
+        context->chunk_scan = context->chunk_scan > at ? context->chunk_scan - at : 0;
+    }
+    return context->chunk_state == PXR_CHUNK_DONE;
+}
+
 static int pxr_http_consume(pxr_task *task, pxr_server_connection *frame, int eof) {
     pxr_http_context *context = task->http;
     if (!context->parsed) {
@@ -454,10 +598,32 @@ static int pxr_http_consume(pxr_task *task, pxr_server_connection *frame, int eo
         int status = pxr_http_parse_headers(context, frame->request.data);
         if (status) return pxr_http_error(task, frame, status);
         context->parsed = 1;
+        if (context->chunked) {
+            memmove(frame->request.data, frame->request.data + context->header_end,
+                frame->request.len - context->header_end);
+            frame->request.len -= context->header_end; context->header_end = 0;
+        }
     }
-    if (frame->request.len - context->header_end < context->body_length)
-        return eof ? pxr_http_error(task, frame, 400) : 0;
-    context->body = pxr_http_string(frame->request.data + context->header_end, context->body_length);
+    int complete;
+    if (context->chunked) {
+        complete = pxr_http_chunks(context, &frame->request);
+        if (complete > 1) return pxr_http_error(task, frame, complete);
+    } else complete = frame->request.len - context->header_end >= context->body_length;
+    if (!complete) {
+        if (eof) return pxr_http_error(task, frame, 400);
+        if (context->continue_pending) {
+            context->continue_pending = 0;
+            frame->response = pxr_http_string("HTTP/1.1 100 Continue\r\n\r\n", 25);
+            task->roots[1] = frame->response; frame->sent = 0;
+            frame->phase = PXR_SERVER_CONTINUE; return 3;
+        }
+        return 0;
+    }
+    context->continue_pending = 0;
+    if (context->chunked) {
+        context->body = pxr_http_string(context->decoded.data, context->decoded.len);
+        pxr_heap_free(context->decoded.data); memset(&context->decoded, 0, sizeof(context->decoded));
+    } else context->body = pxr_http_string(frame->request.data + context->header_end, context->body_length);
     pxr_str *cookie = pxr_http_find(context, "cookie");
     if (cookie && !pxr_http_parameters(context->globals[2], cookie->data, cookie->len, 1)) return pxr_http_error(task, frame, 400);
     pxr_str *content_type = pxr_http_find(context, "content-type");

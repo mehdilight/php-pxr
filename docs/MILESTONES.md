@@ -803,8 +803,11 @@ without waiting for EOF and invokes native async string/void handlers. Isolated
 `$_GET`, `$_POST`, `$_COOKIE`, `$_SERVER`, `$_REQUEST` and empty `$_FILES` arrays
 are visible in helpers and inherited by async descendants. Native echo/print/
 printf, header() and http_response_code() produce buffered request-local
-responses. Protocol errors produce bounded local HTTP responses; transport/task
-errors retain fail-fast structured cleanup. Tests prove concurrent context
+responses. Incremental chunked request decoding and nonblocking 100-continue
+support preserve decoded body/form globals, with separate chunk/trailer metadata
+limits and rejection of ambiguous framing. Protocol errors produce bounded local
+HTTP responses; transport/task errors retain fail-fast structured cleanup.
+Tests prove concurrent context
 isolation, open-client-write-side framing, large binary bodies, limits, nested
 parameters and cancellation/GC roots. See [`HTTP.md`](HTTP.md),
 `examples/async/http.php` and the finite `examples/async/http_demo.php`.
@@ -821,7 +824,7 @@ pending. Threading remains M7.2.
 AddressSanitizer/UndefinedBehaviorSanitizer. They cover scheduling progress,
 ordered awaits, affine handles, joins/cleanup, control-flow suspension, captured
 values, module resolution, failure propagation, bounded memory and invalid forms.
-All 231 workspace tests, async/HTTP/heap/ownership sanitizer checks, example checks
+All 233 workspace tests, async/HTTP/heap/ownership sanitizer checks, example checks
 and the release build pass.
 M7.1 and M7 remain incomplete until the remaining I/O/lifecycle APIs and their
 source acceptance checks are delivered.

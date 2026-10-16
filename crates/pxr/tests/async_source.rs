@@ -1020,6 +1020,9 @@ fn read_http(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
     use std::io::Read;
     let mut response = Vec::new();
     stream.read_to_end(&mut response).unwrap();
+    while response.starts_with(b"HTTP/1.1 100 Continue\r\n\r\n") {
+        response.drain(..25);
+    }
     let split = response
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -1050,6 +1053,19 @@ fn http_cases(
                 let mut results = Vec::new();
                 for (request, status, body) in requests {
                     let mut stream = connect_http(port);
+                    let wait_continue =
+                        status < 400 && request.windows(20).any(|w| w == b"Expect: 100-continue");
+                    let request = if wait_continue {
+                        use std::io::Read;
+                        let split = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                        stream.write_all(&request[..split]).unwrap();
+                        let mut interim = [0; 25];
+                        stream.read_exact(&mut interim).unwrap();
+                        assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+                        request[split..].to_vec()
+                    } else {
+                        request
+                    };
                     for chunk in request.chunks(if request.len() > 65536 { 8192 } else { 7 }) {
                         stream.write_all(chunk).unwrap();
                     }
@@ -1166,8 +1182,8 @@ async function handle(): string {
         "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
     ] { cases.push((request.as_bytes().to_vec(), 400, b"Bad Request\n".to_vec())); }
     cases.extend([
-        (b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(), 501, b"Not Implemented\n".to_vec()),
-        (b"POST / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n".to_vec(), 417, b"Expectation Failed\n".to_vec()),
+        (b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n".to_vec(), 501, b"Not Implemented\n".to_vec()),
+        (b"POST / HTTP/1.1\r\nHost: localhost\r\nExpect: something-else\r\nContent-Length: 3\r\n\r\n".to_vec(), 417, b"Expectation Failed\n".to_vec()),
         (b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=x\r\n\r\n".to_vec(), 415, b"Unsupported Media Type\n".to_vec()),
         (b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4097\r\n\r\n".to_vec(), 413, b"Content Too Large\n".to_vec()),
         (b"GET / HTTP/2.0\r\nHost: localhost\r\n\r\n".to_vec(), 505, b"HTTP Version Not Supported\n".to_vec()),
@@ -1349,5 +1365,110 @@ fn http_round_trips_large_binary_bodies_without_client_eof() {
     let mut request = b"POST /bytes HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: 1048576\r\n\r\n".to_vec();
     let body: Vec<u8> = (0..1048576).map(|i| (i % 256) as u8).collect();
     request.extend_from_slice(&body);
-    http_cases("http-binary", "async function handle(): string { await sleepAsync(0); header(\"Content-Type: application/octet-stream\"); return httpRequestBody(); }", vec![(request, 200, body)], 1048576);
+    let mut chunked =
+        b"POST /bytes HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    for chunk in body.chunks(16381) {
+        chunked.extend_from_slice(format!("{:x};binary\r\n", chunk.len()).as_bytes());
+        chunked.extend_from_slice(chunk);
+        chunked.extend_from_slice(b"\r\n");
+    }
+    chunked.extend_from_slice(b"0\r\nX-Checksum: ignored\r\n\r\n");
+    http_cases("http-binary", "async function handle(): string { await sleepAsync(0); header(\"Content-Type: application/octet-stream\"); return httpRequestBody(); }", vec![(request, 200, body.clone()), (chunked, 200, body)], 1048576);
+}
+
+#[test]
+fn http_decodes_chunked_forms_and_handles_continue_handshakes() {
+    http_cases(
+        "http-chunked-form",
+        r#"async function handle(): string {
+            await sleepAsync(0);
+            echo $_POST["name"], ":", $_REQUEST["name"], ":";
+            return httpRequestBody();
+        }"#,
+        vec![
+            (b"POST /?name=query HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: ChUnKeD\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\n4;foo=\"a\\\"b\"\r\nname\r\n5\r\n=form\r\n0\r\nX-Checksum: ignored\r\n\r\n".to_vec(), 200, b"form:form:name=form".to_vec()),
+            (b"POST / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 9\r\n\r\nname=form".to_vec(), 200, b"form:form:name=form".to_vec()),
+            (b"POST / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Type: application/x-www-form-urlencoded\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nname=form\r\n0\r\n\r\n".to_vec(), 200, b"form:form:name=form".to_vec()),
+        ],
+        4096,
+    );
+}
+
+#[test]
+fn http_rejects_ambiguous_chunks_and_recovers_for_the_next_request() {
+    let mut requests = Vec::new();
+    for (fields, wire, status, reason) in [
+        (
+            "Transfer-Encoding: chunked",
+            "1\r\naX\n",
+            400,
+            "Bad Request\n",
+        ),
+        (
+            "Transfer-Encoding: chunked",
+            "0\r\nContent-Type: forged\r\n\r\n",
+            400,
+            "Bad Request\n",
+        ),
+        (
+            "Transfer-Encoding: chunked",
+            "0\r\nCookie: evil=1\r\n\r\n",
+            400,
+            "Bad Request\n",
+        ),
+        (
+            "Transfer-Encoding: chunked, chunked",
+            "",
+            400,
+            "Bad Request\n",
+        ),
+        ("Transfer-Encoding: chunked, gzip", "", 400, "Bad Request\n"),
+        (
+            "Transfer-Encoding: gzip, chunked",
+            "",
+            501,
+            "Not Implemented\n",
+        ),
+        ("Transfer-Encoding: chunked,", "", 400, "Bad Request\n"),
+        (
+            "Transfer-Encoding: chunked\r\nContent-Length: 0",
+            "",
+            400,
+            "Bad Request\n",
+        ),
+        (
+            "Transfer-Encoding: chunked",
+            "1001\r\n",
+            413,
+            "Content Too Large\n",
+        ),
+        (
+            "Expect: 100-continue\r\nContent-Length: 4097",
+            "",
+            413,
+            "Content Too Large\n",
+        ),
+    ] {
+        requests.push((
+            format!("POST / HTTP/1.1\r\nHost: localhost\r\n{fields}\r\n\r\n{wire}").into_bytes(),
+            status,
+            reason.as_bytes().to_vec(),
+        ));
+    }
+    requests.push((
+        b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+        400,
+        b"Bad Request\n".to_vec(),
+    ));
+    requests.push((
+        b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+        200,
+        b"ok".to_vec(),
+    ));
+    http_cases(
+        "http-chunked-errors",
+        "async function handle(): string { return \"ok\"; }",
+        requests,
+        4096,
+    );
 }

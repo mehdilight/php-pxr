@@ -15,9 +15,10 @@ typedef struct {
     pxr_array *globals[6], *headers, *response_headers;
     pxr_str *body;
     size_t scan, header_end, body_length;
-    int parsed, head, status, error;
+    int parsed, head, status, error, chunked, chunk_state, continue_pending;
+    size_t chunk_remaining, chunk_count, chunk_metadata, chunk_scan, trailer_count, trailer_bytes;
     int64_t max_bytes;
-    pxr_buf output;
+    pxr_buf output, decoded;
 } pxr_http_context;
 static pxr_http_context *pxr_http_cli_context;
 static void pxr_http_mark_context(pxr_http_context *context);
@@ -673,7 +674,7 @@ typedef struct {
     pxr_http_handler http_handler;
     int64_t port, max_requests, remaining, max_bytes, timeout_ms, max_concurrent;
 } pxr_server_frame;
-enum { PXR_SERVER_READ, PXR_SERVER_HANDLER, PXR_SERVER_WRITE,
+enum { PXR_SERVER_READ, PXR_SERVER_HANDLER, PXR_SERVER_WRITE, PXR_SERVER_CONTINUE,
        PXR_SERVER_SHUTDOWN, PXR_SERVER_DRAIN };
 typedef struct {
     int fd, phase;
@@ -734,9 +735,9 @@ static void pxr_server_connection_resume(pxr_task *task, void *raw) {
             size_t size = sizeof(chunk);
             if (frame->http_handler) {
                 pxr_http_context *http = task->http;
-                size_t remaining = http->parsed
-                    ? http->header_end + http->body_length - frame->request.len
-                    : 16384 - frame->request.len;
+                size_t remaining = !http->parsed ? 16384 - frame->request.len
+                    : http->chunked ? sizeof(chunk)
+                    : http->header_end + http->body_length - frame->request.len;
                 if (size > remaining) size = remaining;
                 assert(size); /* consume dispatches/errors before a bound is reached. */
             }
@@ -753,7 +754,7 @@ static void pxr_server_connection_resume(pxr_task *task, void *raw) {
                     task->roots[0] = frame->request.data;
                 }
                 ready = pxr_http_consume(task, frame, !n);
-                if (ready == 2) continue; /* A bounded protocol-error response. */
+                if (ready >= 2) continue; /* Protocol error or interim response. */
             }
             if (ready) {
                 if (frame->http_handler) {
@@ -804,6 +805,10 @@ static void pxr_server_connection_resume(pxr_task *task, void *raw) {
             if (n <= 0 || frame->sent >= 65536) { pxr_task_finish(task, 0, 0); return; }
         } else {
             if (frame->sent == frame->response->len) {
+                if (frame->phase == PXR_SERVER_CONTINUE) {
+                    frame->response = NULL; task->roots[1] = NULL; frame->sent = 0;
+                    frame->phase = PXR_SERVER_READ; continue;
+                }
                 if (frame->http_handler) { frame->phase = PXR_SERVER_SHUTDOWN; continue; }
                 pxr_task_finish(task, 0, 0); return; /* Cleanup closes the send side. */
             }

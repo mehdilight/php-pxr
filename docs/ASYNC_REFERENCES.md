@@ -57,7 +57,7 @@ server implementation remains original; no upstream code or dependency was added
 Read on 2026-10-16. Also cloned [nodejs/llhttp](https://github.com/nodejs/llhttp)
 with `git clone --depth 1` to the same external reference directory, revision
 `69936dbc22922e596a05dfa912fc11d9a7af2136`. Read its MIT `LICENSE`, strict-parser
-flags in `README.md`, and Content-Length/Transfer-Encoding states in
+flags in `README.md`, and Content-Length/Transfer-Encoding/chunk states in
 `src/llhttp/http.ts`. These informed framing ambiguity checks and malformed-input
 tests. PXR uses its own bounded parser; llhttp is not a runtime/build dependency
 and no llhttp source was copied.
@@ -65,8 +65,12 @@ and no llhttp source was copied.
 Primary protocol reading: [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html)
 (request line, field syntax, message length, incomplete messages and teardown)
 and [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html) (Host, HEAD, status and
-response metadata). The implemented subset rejects chunked/Upgrade/Expect and
-other documented unsupported forms; studying the RFCs is not a conformance claim.
+response metadata). For chunked input, additionally read RFC 9112 §7.1–7.1.3
+(chunk framing, extensions and trailers), RFC 9110 §6.5 (trailer semantics) and
+§10.1.1 (100-continue). These informed incremental decoding, separate metadata
+limits, discarded nonessential trailers and nonblocking interim responses.
+The subset still rejects Upgrade and other documented unsupported forms;
+studying the RFCs is not a conformance claim.
 
 PHP syntax/semantics checked against the official manuals for
 [superglobals](https://www.php.net/manual/en/language.variables.superglobals.php),
