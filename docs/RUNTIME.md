@@ -251,8 +251,17 @@ value itself, `bool` is zero‑extended, `float` is its IEEE‑754 bits
 (`bitcast`), and `string`/`array` are `ptrtoint`‑ed pointers. The compiler knows
 the static element type, so it is the one that packs and unpacks the payload with
 `Inst::BitCast`; the runtime only carries the bits. Arrays preserve insertion
-order and use linear lookup (a hash index is a roadmap item). `pxr_array_push`
-uses PHP's "next key = largest integer key + 1" rule.
+order in a contiguous entry buffer. Dense `0..n-1` integer lists use direct
+indexing; sparse integer and string keys use an open-addressed hash index of entry
+positions, with expected constant-time lookup for fixed-length keys. Hash tables
+stay at most half full and are traced through the array header by GC. Overwriting
+an existing key preserves insertion order. Copied non-packed arrays rebuild their
+private index lazily on the first key lookup.
+
+`pxr_array_push` caches the next integer key instead of scanning. The cache copies
+with the array and follows PHP 8.3+ negative-key progression; a string-only array
+starts at zero. Reaching INT64_MAX makes further appends fail without signed
+overflow. Key normalization preserves `"-0"` as a string, while `"0"` is integer zero.
 
 PHP array **value semantics** are enforced at compile time: the backend emits a
 `pxr_array_copy` (a deep copy, recursing into nested arrays) at every store,

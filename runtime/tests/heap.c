@@ -66,6 +66,88 @@ static void test_collection(void) {
     pxr_gc_leave(&frame);
 }
 
+static void test_array_index(void) {
+    pxr_gc_frame frame; void *roots[3] = {0}; pxr_gc_enter(&frame, roots); pxr_gc_roots(&frame, 3);
+    pxr_array *a = pxr_array_new(), *keys = pxr_array_new(); roots[0] = a; roots[1] = keys;
+    for (int i = 0; i < 512; i++) {
+        pxr_str *key = pxr_str_alloc(6);
+        key->data[0] = 'k'; key->data[1] = 0;
+        memcpy(key->data + 2, &i, sizeof(i));
+        pxr_array_push(keys, PXR_TAG_STR, (intptr_t)key);
+    }
+    int seen[1024] = {0}, snapshot_seen[1024] = {0}, order[1024], count = 0;
+    int64_t expected[1024] = {0}, snapshot[1024] = {0};
+    uint32_t random = 12345; pxr_array *copy = NULL;
+    for (int step = 0; step < 20000; step++) {
+        random = random * UINT32_C(1664525) + UINT32_C(1013904223);
+        int id = (int)((random >> 10) & 1023);
+        int64_t tag = id < 512 ? PXR_TAG_INT : PXR_TAG_STR;
+        int64_t number = id - 256;
+        pxr_str *key = id < 512 ? NULL : (void *)(intptr_t)keys->ents[id - 512].bits;
+        if (random & 3) {
+            if (!seen[id]) {seen[id] = 1; order[count++] = id;}
+            expected[id] = step + 1;
+            pxr_array_set(a, tag, number, key, PXR_TAG_INT, expected[id]);
+        }
+        /* Byte equality must work even when lookup uses a distinct allocation. */
+        if (key && step % 31 == 0) {
+            pxr_str *other = pxr_str_alloc(key->len); memcpy(other->data, key->data, key->len); key = other;
+        }
+        assert(pxr_array_has(a, tag, number, key) == seen[id]);
+        assert(pxr_array_get_bits(a, tag, number, key) == expected[id]);
+        assert(a->len == (size_t)count);
+        if (step == 9999) {
+            copy = pxr_array_copy(a); roots[2] = copy;
+            memcpy(snapshot, expected, sizeof(expected)); memcpy(snapshot_seen, seen, sizeof(seen));
+        }
+        if (step % 257 == 0) pxr_gc_collect();
+    }
+    for (int i = 0; i < count; i++) {
+        int id = order[i]; const pxr_ent *entry = &a->ents[i];
+        if (id < 512) assert(!entry->ks && entry->ki == id - 256);
+        else assert(pxr_str_eq(entry->ks, (void *)(intptr_t)keys->ents[id - 512].bits));
+        assert(entry->bits == expected[id]);
+    }
+    for (int id = 0; id < 1024; id++) {
+        int64_t tag = id < 512 ? PXR_TAG_INT : PXR_TAG_STR;
+        pxr_str *key = id < 512 ? NULL : (void *)(intptr_t)keys->ents[id - 512].bits;
+        assert(pxr_array_has(copy, tag, id - 256, key) == snapshot_seen[id]);
+        assert(pxr_array_get_bits(copy, tag, id - 256, key) == snapshot[id]);
+    }
+    /* An intentionally crowded bucket exercises probe chains through growth,
+     * missing lookups and overwrites, without changing insertion order. */
+    a = pxr_array_new(); roots[0] = a;
+    int64_t collisions[33]; int found = 0;
+    for (int64_t key = 1; found < 33; key++)
+        if (!(pxr_array_key_hash(PXR_TAG_INT, key, NULL) & 63)) collisions[found++] = key;
+    for (int i = 0; i < 32; i++) pxr_array_set(a, PXR_TAG_INT, collisions[i], NULL, PXR_TAG_INT, i + 1);
+    pxr_array_set(a, PXR_TAG_INT, collisions[17], NULL, PXR_TAG_INT, 999);
+    for (int i = 0; i < 32; i++) {
+        assert(a->ents[i].ki == collisions[i]);
+        assert(pxr_array_get_bits(a, PXR_TAG_INT, collisions[i], NULL) == (i == 17 ? 999 : i + 1));
+    }
+    assert(!pxr_array_has(a, PXR_TAG_INT, collisions[32], NULL));
+    pxr_gc_collect(); assert(pxr_array_get_bits(a, PXR_TAG_INT, collisions[17], NULL) == 999);
+    /* Append metadata survives copies and the dense-to-indexed transition. */
+    a = pxr_array_new(); roots[0] = a;
+    for (int i = 0; i < 1000; i++) pxr_array_push(a, PXR_TAG_INT, i);
+    assert(a->packed && !a->index && a->next_index == 1000);
+    pxr_array_set(a, PXR_TAG_INT, -10, NULL, PXR_TAG_INT, 9);
+    copy = pxr_array_copy(a); roots[2] = copy;
+    pxr_array_push(copy, PXR_TAG_INT, 42);
+    assert(pxr_array_get_bits(copy, PXR_TAG_INT, 1000, NULL) == 42);
+    assert(!pxr_array_has(a, PXR_TAG_INT, 1000, NULL));
+    a = pxr_array_new(); roots[0] = a;
+    pxr_array_set(a, PXR_TAG_INT, INT64_MIN, NULL, PXR_TAG_INT, 1);
+    pxr_array_push(a, PXR_TAG_INT, 2);
+    assert(pxr_array_get_bits(a, PXR_TAG_INT, INT64_MIN + 1, NULL) == 2);
+    pxr_array_set(a, PXR_TAG_INT, INT64_MAX - 1, NULL, PXR_TAG_INT, 3);
+    pxr_array_push(a, PXR_TAG_INT, 4);
+    assert(pxr_array_get_bits(a, PXR_TAG_INT, INT64_MAX, NULL) == 4 && a->append_overflow);
+    pxr_gc_roots(&frame, 0); pxr_gc_collect(); assert(!pxr_heap_bytes && !pxr_heap_blocks);
+    pxr_gc_leave(&frame);
+}
+
 static void assert_shutdown(void) {
     assert(pxr_heap_head == NULL);
     assert(pxr_heap_blocks == 0);
@@ -77,6 +159,7 @@ int main(int argc, char **argv) {
     assert(argc == 2);
     /* Registered first so this runs AFTER the heap's exit callback. */
     assert(atexit(assert_shutdown) == 0);
+    if (strcmp(argv[1], "array-index") == 0) { test_array_index(); return 0; }
     if (strcmp(argv[1], "collection") == 0) { test_collection(); return 0; }
     if (strcmp(argv[1], "alloc-overflow") == 0) pxr_heap_alloc(SIZE_MAX);
     if (strcmp(argv[1], "string-overflow") == 0) pxr_str_alloc(SIZE_MAX);

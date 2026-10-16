@@ -170,19 +170,23 @@ and marked legacy files run in PHP. The boundary and differences are documented 
 checking outputs and reporting median wall time after warmup. On the Apple M3
 Max with PHP 8.4.25 CLI (JIT disabled), nine runs at PXR `-O3` measured:
 
-| workload | PXR | PHP | PXR relative to PHP |
+| Workload | PXR median | PHP median | PXR relative to PHP |
 | --- | ---: | ---: | --- |
-| Recursive `fib(30)` | 4.21 ms | 86.67 ms | 20.58× faster |
-| Integer loop (5M) | 2.12 ms | 80.49 ms | 38.03× faster |
-| Array append + reads (10k) | 83.58 ms | 28.37 ms | 2.95× slower |
-| Read-only array copies (100k) | 255.35 ms | 29.76 ms | 8.58× slower |
-| String append (50k) | 186.14 ms | 29.70 ms | 6.27× slower |
-| Objects + methods (2M) | 284.24 ms | 188.74 ms | 1.51× slower |
+| Recursive fib(30) | 4.42 ms | 87.54 ms | 19.78× faster |
+| Integer loop (5M) | 2.21 ms | 81.42 ms | 36.81× faster |
+| Integer-array append + reads (10k) | 2.99 ms | 28.80 ms | 9.63× faster |
+| String-key array writes + reads (5k) | 4.32 ms | 29.34 ms | 6.79× faster |
+| Read-only array copies (100k × 1k items) | 256.50 ms | 30.54 ms | 8.40× slower |
+| String append (50k) | 187.13 ms | 29.93 ms | 6.25× slower |
+| Objects + methods (2M) | 282.04 ms | 187.63 ms | 1.50× slower |
 
-Timings include process startup and exclude compilation. PHP startup on this
-configuration is about 28 ms; PXR startup is about 2.3 ms. These microbenchmarks
-are not a general application speedup claim. See the
-[full report and raw samples](benchmarks/results/2026-10-16-m7.md) or re-run
+Timings include startup and exclude compilation. PHP startup on this configuration
+is about 29 ms; PXR startup is about 2.5 ms. The first array optimization improved
+the dense integer workload by 28.9× and string-key workload by 10.5× relative to
+the previous PXR build. Array copies, strings and objects still need optimization.
+These microbenchmarks are not a general application speedup claim. See the
+[before/after report and raw samples](benchmarks/results/2026-10-16-array-index.md),
+[original M7 comparison](benchmarks/results/2026-10-16-m7.md), or re-run
 `./benchmarks/run.sh` on your machine.
 
 ## Architecture

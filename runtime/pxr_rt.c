@@ -632,6 +632,9 @@ typedef struct {
     size_t   cap;
     int64_t identity; /* negative native lineage; positive retained PHP array */
     int shared;      /* an observed copy needs a fresh lineage on mutation */
+    int packed, has_integer, append_overflow;
+    int64_t next_index;
+    size_t *index, index_cap; /* positions + 1; no pointers into movable entries */
 } pxr_array;
 
 static _Thread_local int64_t pxr_array_identity = -1;
@@ -644,16 +647,15 @@ static void pxr_array_share(pxr_array *source, pxr_array *copy) {
     copy->identity = source->identity; copy->shared = 1;
 }
 static int pxr_array_is_list(const pxr_array *array) {
-    for (size_t i = 0; i < array->len; i++)
-        if (array->ents[i].ks || array->ents[i].ki != (int64_t)i) return 0;
-    return 1;
+    return array->packed;
 }
 
 /*
  * PHP converts a *canonical* decimal-integer string key to an `int` key, so
  * `$a["1"]` and `$a[1]` address the same element. The canonical form is an
  * optional `-`, then either `0` or a non-zero digit followed by digits (no
- * leading zeros, no `+`), and the value must fit in a signed 64-bit integer.
+ * leading zeros, no `+`, and "-0" remains a string), and the value must fit
+ * in a signed 64-bit integer.
  */
 static int pxr_key_parse_int(const pxr_str *s, int64_t *out) {
     if (!s || s->len == 0) {
@@ -669,8 +671,8 @@ static int pxr_key_parse_int(const pxr_str *s, int64_t *out) {
     if (p >= end || *p < '0' || *p > '9') {
         return 0;
     }
-    if (*p == '0' && p + 1 != end) {
-        return 0; /* leading zero, e.g. "01" or "00" */
+    if (*p == '0' && (neg || p + 1 != end)) {
+        return 0; /* leading zeros and "-0" stay string keys in PHP */
     }
     unsigned long long acc = 0;
     for (; p < end; p++) {
@@ -709,20 +711,54 @@ static void pxr_norm_key(long long *ktag, long long *ki, const pxr_str **ks) {
     }
 }
 
-/* Linear scan; a hash index is a roadmap item. */
+/* Entries remain in insertion order. Dense 0..n-1 keys address entries
+ * directly; other arrays use an open-addressed index of entry positions. */
+static uint64_t pxr_array_key_hash(long long ktag, int64_t ki, const pxr_str *ks) {
+    uint64_t hash;
+    if (ktag == PXR_TAG_INT) hash = (uint64_t)ki;
+    else {
+        hash = UINT64_C(14695981039346656037);
+        if (ks) for (size_t i = 0; i < ks->len; i++) {
+            hash ^= (unsigned char)ks->data[i];
+            hash *= UINT64_C(1099511628211);
+        }
+        hash ^= UINT64_C(0x9e3779b97f4a7c15);
+    }
+    hash ^= hash >> 30; hash *= UINT64_C(0xbf58476d1ce4e5b9);
+    hash ^= hash >> 27; hash *= UINT64_C(0x94d049bb133111eb);
+    return hash ^ (hash >> 31);
+}
+static void pxr_array_index_insert(pxr_array *a, size_t entry) {
+    const pxr_ent *e = &a->ents[entry];
+    size_t slot = (size_t)pxr_array_key_hash(e->ks ? PXR_TAG_STR : PXR_TAG_INT,
+        e->ki, e->ks) & (a->index_cap - 1);
+    while (a->index[slot]) slot = (slot + 1) & (a->index_cap - 1);
+    a->index[slot] = entry + 1; /* zero is an empty slot */
+}
+static void pxr_array_reindex(pxr_array *a) {
+    size_t capacity = 8;
+    while (capacity / 2 < a->len) capacity = pxr_size_mul(capacity, 2);
+    size_t bytes = pxr_size_mul(capacity, sizeof(size_t));
+    pxr_heap_free(a->index);
+    a->index = pxr_heap_alloc(bytes); a->index_cap = capacity;
+    memset(a->index, 0, bytes);
+    for (size_t i = 0; i < a->len; i++) pxr_array_index_insert(a, i);
+}
 static long pxr_array_find(pxr_array *a, long long ktag, long long ki,
                            const pxr_str *ks) {
-    for (size_t i = 0; i < a->len; i++) {
-        pxr_ent *e = &a->ents[i];
-        if (e->ks == NULL) {
-            if (ktag == PXR_TAG_INT && e->ki == (int64_t)ki) {
-                return (long)i;
-            }
-        } else if (ktag == PXR_TAG_STR && ks != NULL) {
-            if (pxr_str_eq(e->ks, ks)) {
-                return (long)i;
-            }
-        }
+    if (a->packed) {
+        return ktag == PXR_TAG_INT && ki >= 0 && (uint64_t)ki < a->len ? (long)ki : -1;
+    }
+    if (!a->len || (ktag != PXR_TAG_INT && (ktag != PXR_TAG_STR || !ks))) return -1;
+    /* A copied non-packed array rebuilds once, on its first key lookup. */
+    if (!a->index_cap) pxr_array_reindex(a);
+    size_t slot = (size_t)pxr_array_key_hash(ktag, (int64_t)ki, ks) & (a->index_cap - 1);
+    while (a->index[slot]) {
+        size_t position = a->index[slot] - 1;
+        const pxr_ent *e = &a->ents[position];
+        if (ktag == PXR_TAG_INT ? (!e->ks && e->ki == (int64_t)ki)
+                               : (e->ks && pxr_str_eq(e->ks, ks))) return (long)position;
+        slot = (slot + 1) & (a->index_cap - 1);
     }
     return -1;
 }
@@ -740,6 +776,8 @@ void *pxr_array_new(void) {
     a->ents = NULL;
     a->len = 0;
     a->cap = 0;
+    a->packed = 1; a->has_integer = a->append_overflow = 0;
+    a->next_index = 0; a->index = NULL; a->index_cap = 0;
     a->identity = pxr_array_fresh_identity(); a->shared = 0;
     return a;
 }
@@ -758,7 +796,8 @@ void pxr_array_set(void *p, long long ktag, long long ki, const pxr_str *ks,
     if (a->len == a->cap) {
         pxr_array_grow(a, pxr_size_add(a->len, 1));
     }
-    pxr_ent *e = &a->ents[a->len++];
+    int was_packed = a->packed;
+    pxr_ent *e = &a->ents[a->len];
     e->vt = vt;
     e->bits = bits;
     if (ktag == PXR_TAG_INT) {
@@ -768,18 +807,26 @@ void pxr_array_set(void *p, long long ktag, long long ki, const pxr_str *ks,
         e->ks = (pxr_str *)ks;
         e->ki = 0;
     }
+    if (ktag != PXR_TAG_INT || ki < 0 || (uint64_t)ki != a->len) a->packed = 0;
+    if (ktag == PXR_TAG_INT && !a->append_overflow && (!a->has_integer || ki >= a->next_index)) {
+        a->has_integer = 1;
+        if (ki == INT64_MAX) {a->next_index = INT64_MAX; a->append_overflow = 1;}
+        else a->next_index = (int64_t)ki + 1;
+    }
+    a->len++;
+    if (!a->packed) {
+        if (was_packed || !a->index_cap || a->len > a->index_cap / 2) pxr_array_reindex(a);
+        else pxr_array_index_insert(a, a->len - 1);
+    }
 }
 
 void pxr_array_push(void *p, long long vt, long long bits) {
     pxr_array *a = (pxr_array *)p;
-    /* PHP: the next key is the largest integer key plus one (0 if none). */
-    int64_t nk = 0;
-    for (size_t i = 0; i < a->len; i++) {
-        if (a->ents[i].ks == NULL && a->ents[i].ki >= nk) {
-            nk = a->ents[i].ki + 1;
-        }
+    if (a->append_overflow) {
+        fputs("Fatal error: Cannot add element to the array as the next element is already occupied\n", stderr);
+        exit(255);
     }
-    pxr_array_set(p, PXR_TAG_INT, nk, NULL, vt, bits);
+    pxr_array_set(p, PXR_TAG_INT, a->next_index, NULL, vt, bits);
 }
 
 long long pxr_array_get_bits(void *p, long long ktag, long long ki, const pxr_str *ks) {
@@ -839,6 +886,8 @@ void *pxr_array_copy(void *p) {
         d->ents[d->len].ki = src->ki;
         d->len++;
     }
+    d->packed = s->packed; d->has_integer = s->has_integer;
+    d->next_index = s->next_index; d->append_overflow = s->append_overflow;
     pxr_array_share(s, d);
     return d;
 }
@@ -2951,6 +3000,7 @@ void pxr_gc_collect(void) {
             case PXR_HEAP_ARRAY: {
                 pxr_array *a = ptr;
                 pxr_gc_mark(a->ents);
+                pxr_gc_mark(a->index);
                 for (size_t i = 0; i < a->len; i++) {
                     pxr_gc_mark(a->ents[i].ks);
                     pxr_gc_mark_value(a->ents[i].vt, a->ents[i].bits);

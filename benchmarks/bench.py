@@ -23,7 +23,7 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 PXR = ROOT / "target" / "release" / "pxr"
 BENCH_DIR = ROOT / "benchmarks"
-BENCHMARKS = ["startup.php", "fib.php", "loop.php", "arrays.php",
+BENCHMARKS = ["startup.php", "fib.php", "loop.php", "arrays.php", "array_keys.php",
               "array_copy.php", "strings.php", "objects.php"]
 
 
@@ -47,6 +47,7 @@ def metadata(php: str | None) -> dict:
         "platform": platform.platform(), "machine": platform.machine(),
         "compiler_revision": capture(["git", "rev-parse", "HEAD"]),
         "working_tree_dirty": bool(capture(["git", "status", "--porcelain"])),
+        "pxr_binary_path": str(PXR),
         "pxr_binary_sha256": hashlib.sha256(PXR.read_bytes()).hexdigest(),
         "pxr_version": capture([str(PXR), "--version"]),
         "clang_version": capture([os.environ.get("CC", "clang"), "--version"]),
@@ -77,7 +78,9 @@ def summarize(samples: list[float]) -> dict:
 
 
 def main() -> int:
+    global PXR
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pxr", type=Path, default=PXR, help="release compiler to measure")
     parser.add_argument("--repeat", type=int, default=9)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--opt", type=int, choices=range(4), default=3)
@@ -85,6 +88,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.repeat < 1 or args.warmup < 1:
         parser.error("repeat and warmup must each be at least 1")
+    PXR = args.pxr.resolve()
     if not PXR.exists():
         parser.error(f"{PXR} not found; run cargo build --release first")
 

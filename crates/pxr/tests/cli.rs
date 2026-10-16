@@ -4079,3 +4079,59 @@ function legacyText() { return new LegacyText(); }
     .unwrap();
     assert_file_matches_php(&entry);
 }
+
+#[test]
+fn indexed_arrays_preserve_order_copies_and_append_keys() {
+    assert_matches_php(
+        "array_index_transitions",
+        r#"<?php
+$a = []; $i = 0;
+while ($i < 128) {$a[] = $i; $i++;}
+$b = $a; $b["label"] = 9; $b[-3] = 10; $b["300"] = 11; $b[] = 42;
+echo count($a), ":", count($b), ":", $b[301], ":", $a[127], "\n";
+$c = [-5 => 11, "note" => 22]; $c[] = 33;
+echo $c[-4], ":", array_key_exists(0, $c), ":";
+foreach ($c as $v) {echo $v, ":";}
+echo "\n";
+$d = array_reverse($b, true); $d[] = 99;
+echo $d[302], ":", count($d), ":", $b[301], "\n";
+"#,
+    );
+}
+
+#[test]
+fn indexed_arrays_normalize_keys_without_merging_distinct_strings() {
+    assert_matches_php(
+        "array_index_keys",
+        r#"<?php
+$a = ["0" => 1, "-0" => 2, "01" => 3, "-01" => 4, "+1" => 5,
+      "9223372036854775807" => 6, "9223372036854775808" => 7,
+      "a\0b" => 8, "a\0c" => 9];
+$a[0] = 10; $a["a\0b"] = 11;
+echo count($a), ":", $a["-0"], ":", $a["9223372036854775807"], ":", $a["9223372036854775808"], "\n";
+foreach ($a as $v) {echo $v, ":";}
+echo "\n";
+$b = $a; $b["-0"] = 99;
+echo $a["-0"], ":", $b["-0"], ":", array_key_exists("missing", $b), "\n";
+"#,
+    );
+}
+
+#[test]
+fn appending_after_the_largest_integer_key_fails_without_overflow() {
+    if !have_cc() {
+        return;
+    }
+    let file = temp_php(
+        "array_append_overflow",
+        "<?php $a = [9223372036854775807 => 1]; $a[] = 2; echo \"bad\";",
+    );
+    let result = run_ok(&["run", file.to_str().unwrap()]);
+    assert_eq!(result.code, 255);
+    assert!(result.stdout.is_empty());
+    assert!(
+        result.stderr.contains("next element is already occupied"),
+        "{}",
+        result.stderr
+    );
+}
