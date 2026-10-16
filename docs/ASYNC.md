@@ -2,7 +2,7 @@
 
 **Implemented first source slice:** free async functions with explicit result
 types, inferred affine task handles, `await`, `spawn`, nonblocking timers,
-owned TCP exchanges, bounded native TCP servers, consuming cancellation and an
+owned TCP exchanges, bounded native TCP/HTTP servers, consuming cancellation and an
 async CLI entry point. Programs compile to native resumable frames and run
 without PHP. This syntax is a PXR language extension and cannot run in PHP.
 M7.1 remains incomplete: streaming/resource APIs, recoverable errors and broader
@@ -56,7 +56,9 @@ a handle and requests cancellation; parent scope exit still joins cleanup. See
 [ASYNC_IO.md](ASYNC_IO.md) for exact signatures, protocol, limits and examples.
 `tcpServeAsync` adds listening/acceptance and concurrent, bounded async string
 handlers using matching EOF framing; see [ASYNC_SERVER.md](ASYNC_SERVER.md) and
-`examples/async/server.php`. HTTP and request superglobals remain unimplemented.
+`examples/async/server.php`. `httpServeAsync` adds framed HTTP requests, isolated
+PHP-style request globals, buffered output and header/status helpers; see
+[HTTP.md](HTTP.md) and `examples/async/http.php`.
 
 The initial executor is cooperative and single-threaded. Ordinary blocking
 functions and CPU work occupy that thread until they return or await. OS-thread

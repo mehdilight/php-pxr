@@ -135,6 +135,10 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
                     "sleepasync",
                     "tcpexchangeasync",
                     "tcpserveasync",
+                    "httpserveasync",
+                    "http_response_code",
+                    "header",
+                    "httprequestbody",
                     "canceltask",
                 ]
                 .contains(
@@ -147,7 +151,7 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
                 ) {
                     c.error(
                         f.name_span,
-                        "move/drop/sleepAsync/tcpExchangeAsync/tcpServeAsync/cancelTask are reserved intrinsics",
+                        "move/drop and native async/HTTP intrinsics are reserved",
                     );
                 }
                 c.signatures.insert(
@@ -428,6 +432,11 @@ impl Checker {
             );
         }
         for p in params {
+            if super::request_global(&p.name).is_some()
+                || ["_SESSION", "_ENV", "GLOBALS"].contains(&p.name.as_str())
+            {
+                self.error(p.span, "request globals cannot be shadowed by parameters");
+            }
             self.env.insert(
                 p.name.clone(),
                 Binding {
@@ -440,6 +449,9 @@ impl Checker {
         self.block(body);
     }
     fn read(&mut self, name: &str, span: Span) -> Value {
+        if super::request_global(name).is_some() {
+            return Value::plain(Some(TypeRef::Array(Box::new(TypeRef::Mixed))));
+        }
         if let Some(b) = self.env.get(name).cloned() {
             if b.mode == Mode::Conflict {
                 self.error(
@@ -1462,7 +1474,13 @@ impl Checker {
                     .cloned()
                     .map(|s| specialize_signature(s, type_args));
                 let name = fallback.as_deref().unwrap_or(callee).to_ascii_lowercase();
-                if ["sleepasync", "tcpexchangeasync", "tcpserveasync"].contains(&name.as_str())
+                if [
+                    "sleepasync",
+                    "tcpexchangeasync",
+                    "tcpserveasync",
+                    "httpserveasync",
+                ]
+                .contains(&name.as_str())
                     && sig.is_none()
                 {
                     self.arguments(args, None, false, *span, false);

@@ -50,3 +50,36 @@ descriptors. Checked [accept semantics and flag inheritance](https://man7.org/li
 [IPV6_V6ONLY](https://man7.org/linux/man-pages/man7/ipv6.7.html). PXR configures
 accepted descriptors itself and requests separate IPv4/IPv6 listeners. The
 server implementation remains original; no upstream code or dependency was added.
+
+
+## HTTP adapter references
+
+Read on 2026-10-16. Also cloned [nodejs/llhttp](https://github.com/nodejs/llhttp)
+with `git clone --depth 1` to the same external reference directory, revision
+`69936dbc22922e596a05dfa912fc11d9a7af2136`. Read its MIT `LICENSE`, strict-parser
+flags in `README.md`, and Content-Length/Transfer-Encoding states in
+`src/llhttp/http.ts`. These informed framing ambiguity checks and malformed-input
+tests. PXR uses its own bounded parser; llhttp is not a runtime/build dependency
+and no llhttp source was copied.
+
+Primary protocol reading: [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html)
+(request line, field syntax, message length, incomplete messages and teardown)
+and [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html) (Host, HEAD, status and
+response metadata). The implemented subset rejects chunked/Upgrade/Expect and
+other documented unsupported forms; studying the RFCs is not a conformance claim.
+
+PHP syntax/semantics checked against the official manuals for
+[superglobals](https://www.php.net/manual/en/language.variables.superglobals.php),
+[GET](https://www.php.net/manual/en/reserved.variables.get.php),
+[POST](https://www.php.net/manual/en/reserved.variables.post.php),
+[COOKIE](https://www.php.net/manual/en/reserved.variables.cookies.php),
+[REQUEST](https://www.php.net/manual/en/reserved.variables.request.php),
+[header](https://www.php.net/manual/en/function.header.php), and
+[http_response_code](https://www.php.net/manual/en/function.http-response-code.php).
+Also studied input-name normalization, bracket/cookie parsing and recursive
+REQUEST merging in the existing ignored PHP 8.5.11 source archive,
+`references/php-src-php-8.5.11/main/php_variables.c` (SHA-256
+`a2d15a0a9505cf17e8b45dc29220368b0efb96e31523e40d63849aadde384f9b`;
+version verified in `main/php_version.h`; PHP License 3.01 read). No PHP source
+was copied. [HTTP.md](HTTP.md) records fixed GP precedence, input limits,
+malformed-name handling and other deliberate compatibility boundaries.

@@ -2,8 +2,9 @@
 
 PXR can listen on a numeric IPv4/IPv6 address, accept connections and run native
 async handlers concurrently. This first server API implements bounded,
-EOF-delimited TCP requests. HTTP parsing, routing, request/response objects,
-streaming handles and PHP request superglobals are not implemented.
+EOF-delimited TCP requests. The separate [HTTP adapter](HTTP.md) adds HTTP
+framing, PHP-style request globals and buffered responses. Request/response
+objects, router classes and streaming handles remain pending.
 
 ```php
 <?php
@@ -115,13 +116,13 @@ Cancellation cannot retract bytes already transmitted or undo handler effects.
 
 ## Next server layers
 
-Streaming resource ownership and recoverable errors remain M7 work. The HTTP
-layer will need request framing and limits, request/response types, routing, and
-request-local query/form/cookie/upload/header access. PHP compatibility
-superglobals such as `$_GET`, `$_POST`, `$_COOKIE`, `$_FILES`, `$_SERVER`,
-`$_REQUEST` and `$_SESSION` are not populated by this TCP API. Any later
-compatibility layer must isolate concurrent requests rather than share mutable
-process globals. Neither sessions nor an HTTP API is claimed by this slice.
+Streaming resource ownership and recoverable errors remain M7 work. The separate
+[HTTP layer](HTTP.md) now implements framed requests, request-local query/form/
+cookie/server data and PHP-style buffered output/header/status helpers. It uses
+`httpServeAsync`, rather than changing this TCP operation's EOF protocol.
+Request/response object APIs, routing classes, uploads and sessions remain future
+work. The HTTP documentation records the implemented PHP syntax and explicit
+compatibility/protocol boundaries.
 
 ## Validation
 

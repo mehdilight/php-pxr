@@ -191,9 +191,12 @@ pxr_str *pxr_str_alloc(size_t len) {
 }
 
 /* -------------------------------------------------------------- printing */
+static int pxr_http_output(const char *data, size_t length);
 
 void pxr_print_i64(long long v) {
-    printf("%lld", v);
+    char buffer[32]; int length = snprintf(buffer, sizeof(buffer), "%lld", v);
+    if (pxr_http_output(buffer, (size_t)length)) return;
+    fwrite(buffer, 1, (size_t)length, stdout);
 }
 
 /*
@@ -299,11 +302,13 @@ static void pxr_gcvt(double v, char *buf) {
 void pxr_print_f64(double v) {
     char buf[48];
     pxr_gcvt(v, buf);
+    if (pxr_http_output(buf, strlen(buf))) return;
     fputs(buf, stdout);
 }
 
 void pxr_print_str(const pxr_str *s) {
     if (s && s->len) {
+        if (pxr_http_output(s->data, s->len)) return;
         fwrite(s->data, 1, s->len, stdout);
     }
 }
@@ -311,6 +316,7 @@ void pxr_print_str(const pxr_str *s) {
 /* bool prints as "1" for true and "" for false, matching PHP. */
 void pxr_print_bool(int v) {
     if (v) {
+        if (pxr_http_output("1", 1)) return;
         fputc('1', stdout);
     }
 }
@@ -2128,9 +2134,7 @@ pxr_str *pxr_sprintf(const pxr_str *fmt, void *vargs) {
 
 long long pxr_printf(const pxr_str *fmt, void *args) {
     pxr_str *s = pxr_sprintf(fmt, args);
-    if (s && s->len > 0) {
-        fwrite(s->data, 1, s->len, stdout);
-    }
+    pxr_print_str(s);
     return s ? (long long)s->len : 0;
 }
 

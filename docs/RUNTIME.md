@@ -1,8 +1,8 @@
 # The PXR runtime
 
 The PXR runtime is the small library every compiled program links against. It is
-written in C (`runtime/pxr_rt.c` plus `runtime/pxr_async.c`), embedded into the
-`pxr` binary at build time,
+written in C (`runtime/pxr_rt.c`, `runtime/pxr_async.c` and `runtime/pxr_http.c`),
+embedded into the `pxr` binary at build time,
 compiled on demand with the system C compiler, and cached as an object file.
 
 The runtime provides the value operations emitted by the native backend,
@@ -364,3 +364,12 @@ async handlers, and consuming cancellation are available. See
 Streaming socket/resource and recoverable error APIs remain pending. See [`ASYNC_RUNTIME.md`](ASYNC_RUNTIME.md) for lifecycle, result, error,
 cancellation and descriptor ownership rules. Existing synchronous programs do
 not start an executor.
+
+The native [HTTP adapter](HTTP.md) owns one request context per accepted
+connection. Tasks inherit their parent's context; structured joins keep it alive
+until descendants stop. The collector explicitly traces its request arrays,
+headers, raw body and output buffer. Generated accesses to supported PHP request
+globals fetch that context instead of ordinary function-local slots. Native
+printing captures HTTP output while ordinary CLI output is unchanged. The HTTP
+adapter frames bounded requests without EOF, serializes responses, and uses
+bounded write shutdown/input draining before ordinary connection cleanup.

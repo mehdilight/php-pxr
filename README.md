@@ -27,11 +27,12 @@ worker when they execute.
 > reclamation of dead values and cycles. M7 is in progress: an internal executor
 > supports free async functions, affine task handles, await/spawn, nonblocking
 > timers, owned TCP exchanges, bounded native TCP servers, consuming cancellation
-> and an async main entry.
+> and an async main entry. A bounded HTTP adapter adds isolated request globals,
+> PHP-style output, header() and http_response_code().
 > Streaming socket APIs, recoverable errors and broader async signatures remain
 > pending; see
 > [`docs/ASYNC.md`](docs/ASYNC.md), [`docs/ASYNC_IO.md`](docs/ASYNC_IO.md),
-> and [`docs/ASYNC_SERVER.md`](docs/ASYNC_SERVER.md).
+> [`docs/ASYNC_SERVER.md`](docs/ASYNC_SERVER.md), and [`docs/HTTP.md`](docs/HTTP.md).
 > See [`docs/OWNERSHIP.md`](docs/OWNERSHIP.md), [`docs/GENERICS.md`](docs/GENERICS.md), [`docs/MILESTONES.md`](docs/MILESTONES.md),
 > [`docs/MIXED.md`](docs/MIXED.md), and [`docs/INTEROP.md`](docs/INTEROP.md).
 

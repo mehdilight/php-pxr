@@ -73,9 +73,10 @@ current rejected forms. Owned TCP exchanges, bounded native TCP servers with
 concurrent async handlers, and consuming `cancelTask` are delivered. Streaming
 socket resources, recoverable errors, async methods/generics and broader task
 signatures remain pending. See [`ASYNC_IO.md`](ASYNC_IO.md) and
-[`ASYNC_SERVER.md`](ASYNC_SERVER.md). HTTP framing/routing, request/response
-objects and isolated request data will build on the server foundation; request
-superglobals and sessions are not implemented.
+[`ASYNC_SERVER.md`](ASYNC_SERVER.md). The [HTTP adapter](HTTP.md) now adds bounded
+request framing, isolated PHP-style query/form/cookie/server globals, buffered
+output and header/status helpers. Request/response objects, routing classes,
+uploads, sessions and full web SAPI compatibility remain pending.
 The executor uses one thread; ordinary blocking calls still block it.
 Threaded parallelism remains M7.2.
 

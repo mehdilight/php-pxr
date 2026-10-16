@@ -236,7 +236,7 @@ impl Builtin {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Callee {
     /// A statically checked async string handler, passed as a native constructor.
-    AsyncServer { handler: String },
+    AsyncServer { handler: String, http: bool },
     Php {
         name: String,
         fallback: Option<String>,
@@ -2772,6 +2772,14 @@ impl Analyzer {
         body: &[ast::Stmt],
         ctx: &mut FnCtx,
     ) -> Option<TStmt> {
+        if request_global_name(value) || key.is_some_and(request_global_name) {
+            self.diags.emit(
+                Diagnostic::error("foreach cannot replace a request-global binding")
+                    .with_code("E0300")
+                    .with_span(value_span),
+            );
+            return None;
+        }
         if key.is_some() {
             self.diags.emit(
                 Diagnostic::error(
@@ -2927,6 +2935,12 @@ impl Analyzer {
         span: Span,
         ctx: &mut FnCtx,
     ) -> Option<TStmt> {
+        if let ast::LValue::Var { name, .. } = target {
+            if request_global_name(name) {
+                self.diags.emit(Diagnostic::error("whole request-global replacement is not supported yet; assign array elements instead").with_code("E0300").with_span(span));
+                return None;
+            }
+        }
         let expected = if let Some(annotation) = annotation {
             Some(self.resolve_type_with(annotation, &ctx.type_bindings))
         } else if let ast::LValue::Var { name, .. } = target {
@@ -3565,6 +3579,29 @@ impl Analyzer {
             ast::Expr::NullLit(_) => Some(TExpr::Null),
             ast::Expr::Paren(inner, _) => self.infer(inner, ctx),
             ast::Expr::Var(name, span) => {
+                if let Some(id) = request_global(name) {
+                    return Some(TExpr::Call {
+                        callee: Callee::User {
+                            mangled: "pxr_http_global".into(),
+                            name: format!("${name}"),
+                            params: vec![Ty::Int],
+                        },
+                        ret: Ty::array(Ty::Mixed),
+                        args: vec![TExpr::Int(id)],
+                        arg_tys: vec![Ty::Int],
+                        span: *span,
+                    });
+                }
+                if ["_SESSION", "_ENV", "GLOBALS"].contains(&name.as_str()) {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "`${name}` is not implemented by the native request runtime"
+                        ))
+                        .with_code("E0300")
+                        .with_span(*span),
+                    );
+                    return None;
+                }
                 if name == "this" && ctx.slot_of("this").is_none() {
                     self.diags.emit(
                         Diagnostic::error("using `$this` when not in object context")
@@ -3709,6 +3746,10 @@ impl Analyzer {
                         "sleepasync",
                         "tcpexchangeasync",
                         "tcpserveasync",
+                        "httpserveasync",
+                        "http_response_code",
+                        "header",
+                        "httprequestbody",
                         "canceltask",
                     ]
                     .iter()
@@ -4934,9 +4975,73 @@ impl Analyzer {
         ctx: &mut FnCtx,
     ) -> Option<TExpr> {
         let key = callee.to_ascii_lowercase();
-        if key == "tcpserveasync" {
+        if ["http_response_code", "header", "httprequestbody"].contains(&key.as_str()) {
+            let (mut params, defaults, minimum, ret, runtime) = match key.as_str() {
+                "http_response_code" => (
+                    vec![Ty::Int],
+                    vec![TExpr::Int(0)],
+                    0,
+                    Ty::Int,
+                    "pxr_http_status",
+                ),
+                "header" => (
+                    vec![Ty::String, Ty::Bool, Ty::Int],
+                    vec![TExpr::Bool(true), TExpr::Int(0)],
+                    1,
+                    Ty::Void,
+                    "pxr_http_header",
+                ),
+                _ => (vec![], vec![], 0, Ty::String, "pxr_http_body"),
+            };
+            if !type_args.is_empty() || args.len() < minimum || args.len() > params.len() {
+                self.diags.emit(
+                    Diagnostic::error(format!(
+                        "invalid argument count/type arguments for `{callee}`"
+                    ))
+                    .with_code("E0300")
+                    .with_span(span),
+                );
+                return None;
+            }
+            let mut values = Vec::new();
+            for (arg, expected) in args.iter().zip(&params) {
+                let value = self.infer(arg, ctx)?;
+                if value.ty() != *expected {
+                    return self.builtin_ty_err(
+                        callee,
+                        &format!("argument of type `{expected}`"),
+                        &value.ty(),
+                        arg.span(),
+                    );
+                }
+                values.push(value);
+            }
+            while values.len() < params.len() {
+                values.push(defaults[values.len() - minimum].clone());
+            }
+            if key == "header" {
+                values[1] = TExpr::Coerce {
+                    expr: Box::new(values[1].clone()),
+                    ty: Ty::Int,
+                };
+                params[1] = Ty::Int;
+            }
+            return Some(TExpr::Call {
+                callee: Callee::User {
+                    mangled: runtime.into(),
+                    name: callee.into(),
+                    params: params.clone(),
+                },
+                ret,
+                args: values,
+                arg_tys: params,
+                span,
+            });
+        }
+        if key == "tcpserveasync" || key == "httpserveasync" {
+            let http = key == "httpserveasync";
             if !ctx.is_async || !(5..=7).contains(&args.len()) || !type_args.is_empty() {
-                self.diags.emit(Diagnostic::error("tcpServeAsync requires an async context and (string address, int port, literal string handler, int maxRequests, int maxBytes, optional int timeoutMs, optional int maxConcurrent)").with_code("E0300").with_span(span));
+                self.diags.emit(Diagnostic::error(format!("{callee} requires an async context and (string address, int port, literal string handler, int maxRequests, int maxBytes, optional int timeoutMs, optional int maxConcurrent)")).with_code("E0300").with_span(span));
                 return None;
             }
             let mut handler_arg = &args[2];
@@ -4945,9 +5050,9 @@ impl Analyzer {
             }
             let ast::Expr::StrLit(handler_name, _) = handler_arg else {
                 self.diags.emit(
-                    Diagnostic::error(
-                        "tcpServeAsync handler must be a literal native async function name",
-                    )
+                    Diagnostic::error(format!(
+                        "{callee} handler must be a literal native async function name"
+                    ))
                     .with_code("E0300")
                     .with_span(args[2].span()),
                 );
@@ -4959,10 +5064,18 @@ impl Analyzer {
                     self.funcs
                         .get(&name.strip_prefix('\\').unwrap_or(name).to_ascii_lowercase())
                 })
-                .filter(|s| s.is_async && s.params == [Ty::String] && s.ret == Ty::String)
+                .filter(|s| {
+                    s.is_async
+                        && (if http {
+                            s.params.is_empty()
+                        } else {
+                            s.params == [Ty::String]
+                        })
+                        && (s.ret == Ty::String || (http && s.ret == Ty::Void))
+                })
                 .cloned()
             else {
-                self.diags.emit(Diagnostic::error("tcpServeAsync handler must name a native non-generic async function(string): string").with_code("E0300").with_span(args[2].span()));
+                self.diags.emit(Diagnostic::error(if http { "httpServeAsync handler must name a native non-generic async function(): string or void" } else { "tcpServeAsync handler must name a native non-generic async function(string): string" }).with_code("E0300").with_span(args[2].span()));
                 return None;
             };
             let mut values = Vec::new();
@@ -4975,7 +5088,7 @@ impl Analyzer {
                 let value = self.infer(arg, ctx)?;
                 if value.ty() != expected {
                     return self.builtin_ty_err(
-                        "tcpServeAsync",
+                        callee,
                         &format!("argument of type `{expected}`"),
                         &value.ty(),
                         arg.span(),
@@ -4995,6 +5108,7 @@ impl Analyzer {
             return Some(TExpr::Call {
                 callee: Callee::AsyncServer {
                     handler: handler.mangled,
+                    http,
                 },
                 ret: Ty::Task(Box::new(Ty::Void)),
                 args: values,
@@ -5756,6 +5870,16 @@ pub fn is_truthy(ty: &Ty) -> bool {
 }
 
 /// Types that may be compared with `==` / `!=` (and `switch` case matching).
+pub(crate) fn request_global_name(name: &str) -> bool {
+    request_global(name).is_some() || ["_SESSION", "_ENV", "GLOBALS"].contains(&name)
+}
+pub(crate) fn request_global(name: &str) -> Option<i64> {
+    ["_GET", "_POST", "_COOKIE", "_SERVER", "_REQUEST", "_FILES"]
+        .iter()
+        .position(|n| *n == name)
+        .map(|id| id as i64)
+}
+
 fn comparable_eq(a: &Ty, b: &Ty) -> bool {
     if (*a == Ty::Mixed || *b == Ty::Mixed) && *a != Ty::Void && *b != Ty::Void {
         return true;

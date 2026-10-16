@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 pub const RUNTIME_SOURCE: &str = concat!(
     include_str!("../../../runtime/pxr_rt.c"),
     "\n",
-    include_str!("../../../runtime/pxr_async.c")
+    include_str!("../../../runtime/pxr_async.c"),
+    "\n",
+    include_str!("../../../runtime/pxr_http.c")
 );
 const PHP_WORKER_SOURCE: &str = include_str!("../../../runtime/pxr_php_worker.php");
 

@@ -991,3 +991,363 @@ async function main(): void {{
         "binary clean\n",
     );
 }
+
+fn connect_http(port: u16) -> std::net::TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                stream.set_nodelay(true).unwrap();
+                return stream;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ConnectionRefused
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            Err(error) => panic!("HTTP connect: {error}"),
+        }
+    }
+}
+fn read_http(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+    use std::io::Read;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let split = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("HTTP response headers");
+    let headers = String::from_utf8(response[..split].to_vec()).unwrap();
+    assert!(headers.contains("Connection: close\r\n"));
+    (headers, response[split + 4..].to_vec())
+}
+fn http_cases(
+    name: &str,
+    handler: &str,
+    requests: Vec<(Vec<u8>, u16, Vec<u8>)>,
+    limit: i64,
+) -> Vec<Vec<String>> {
+    use std::io::Write;
+    if !have_cc() {
+        return vec![];
+    }
+    let port = server_port("127.0.0.1");
+    let count = requests.len();
+    let source = format!("<?php {handler}\nasync function main(): void {{ await httpServeAsync(\"127.0.0.1\", {port}, \"handle\", {count}, {limit}, 10000); echo \"done\\n\"; }}");
+    let mut all_headers = Vec::new();
+    for opt in [0, 3] {
+        let executable = build(name, &source, opt);
+        for stress in [false, true] {
+            let requests = requests.clone();
+            let client = std::thread::spawn(move || {
+                let mut results = Vec::new();
+                for (request, status, body) in requests {
+                    let mut stream = connect_http(port);
+                    for chunk in request.chunks(if request.len() > 65536 { 8192 } else { 7 }) {
+                        stream.write_all(chunk).unwrap();
+                    }
+                    // Leave the write side open, as a browser does. The response
+                    // must be framed by headers/Content-Length, never TCP EOF.
+                    let (headers, actual) = read_http(&mut stream);
+                    assert!(
+                        headers.starts_with(&format!("HTTP/1.1 {status} ")),
+                        "{headers}"
+                    );
+                    assert_eq!(actual, body, "{headers}");
+                    results.push(headers);
+                }
+                results
+            });
+            let mut command = Command::new(&executable);
+            command.env("PXR_PHP", "/pxr-no-php-cli");
+            if stress {
+                command.env("PXR_GC_STRESS", "1");
+            }
+            let output = execute(&mut command);
+            assert!(
+                output.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"done\n");
+            assert!(
+                output.stderr.is_empty(),
+                "{name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            all_headers.push(client.join().unwrap());
+        }
+        std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+    }
+    all_headers
+}
+#[test]
+fn http_frames_requests_and_exposes_php_request_globals() {
+    let handler = r#"
+function currentName(): string { return strval($_GET["name"] ?? "none"); }
+async function afterAwait(): string { await sleepAsync(0); return currentName(); }
+async function handle(): string {
+    header("Content-Type: text/plain");
+    header("X-Version: old"); header("X-Version: new");
+    header("Set-Cookie: a=1", false); header("Set-Cookie: b=2", false);
+    http_response_code(201);
+    $saved = $_GET;
+    $_GET["name"] = "local";
+    $name = await afterAwait();
+    return strval($_SERVER["REQUEST_METHOD"]) . ":" . strval($saved["name"] ?? "none") . ":" . $name . ":" . strval($_POST["name"] ?? "none") . ":" . strval($_REQUEST["name"] ?? "none") . ":" . strval($_COOKIE["id"] ?? "none") . ":" . httpRequestBody();
+}
+"#;
+    let headers = http_cases("http-globals", handler, vec![
+        (b"GET /hello?name=Ada+Lovelace HTTP/1.1\r\nHost: localhost\r\nCookie: id=a+b; id=second\r\n\r\n".to_vec(), 201, b"GET:Ada Lovelace:local:none:Ada Lovelace:a+b:".to_vec()),
+        (b"POST /hello?name=query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 9\r\n\r\nname=form".to_vec(), 201, b"POST:query:local:form:form:none:name=form".to_vec()),
+        (b"PUT /bytes HTTP/1.0\r\nContent-Length: 3\r\n\r\na\0b".to_vec(), 201, b"PUT:none:local:none:none:none:a\0b".to_vec()),
+    ], 4096);
+    for run in headers {
+        for headers in run {
+            assert!(headers.contains("Content-Type: text/plain\r\n"));
+            assert!(!headers.contains("X-Version: old"));
+            assert_eq!(headers.matches("X-Version: new").count(), 1);
+            assert_eq!(headers.matches("Set-Cookie:").count(), 2);
+        }
+    }
+}
+#[test]
+fn http_head_statuses_and_protocol_errors_are_connection_local() {
+    let handler = r#"
+async function handle(): string {
+    $path = strval($_SERVER["PATH_INFO"]);
+    if ($path === "/empty") { http_response_code(204); }
+    if ($path === "/redirect") { header("Location: /target"); }
+    if ($path === "/invalid") { header("X-Test: yes\r\nInjected: bad"); }
+    if ($path === "/missing") { header("http/1.1 404 Not Found"); }
+    return "hello";
+}
+"#;
+    let mut cases = vec![
+        (
+            b"HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            200,
+            vec![],
+        ),
+        (
+            b"GET /empty HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            204,
+            vec![],
+        ),
+        (
+            b"GET /redirect HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            302,
+            b"hello".to_vec(),
+        ),
+        (
+            b"GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            404,
+            b"hello".to_vec(),
+        ),
+        (
+            b"GET /invalid HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            500,
+            b"Internal Server Error\n".to_vec(),
+        ),
+    ];
+    for request in [
+        "GET / HTTP/1.1\r\n\r\n", // missing Host
+        "GET / HTTP/1.1\r\nHost: one\r\nHost: two\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: localhost\r\nBad : value\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: localhost\r\n Folded: value\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
+    ] { cases.push((request.as_bytes().to_vec(), 400, b"Bad Request\n".to_vec())); }
+    cases.extend([
+        (b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(), 501, b"Not Implemented\n".to_vec()),
+        (b"POST / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n".to_vec(), 417, b"Expectation Failed\n".to_vec()),
+        (b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=x\r\n\r\n".to_vec(), 415, b"Unsupported Media Type\n".to_vec()),
+        (b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4097\r\n\r\n".to_vec(), 413, b"Content Too Large\n".to_vec()),
+        (b"GET / HTTP/2.0\r\nHost: localhost\r\n\r\n".to_vec(), 505, b"HTTP Version Not Supported\n".to_vec()),
+        (b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(), 200, b"hello".to_vec()),
+    ]);
+    http_cases("http-protocol", handler, cases, 4096);
+}
+
+#[test]
+fn http_php_output_and_nested_parameters_survive_await() {
+    let handler = r#"
+async function handle(): void {
+    header("Content-Type: text/plain");
+    $tags = $_GET["tags"] ?? [];
+    if (is_array($tags)) { echo $tags[0], ":", $tags[1], ":"; }
+    $form = $_POST["user"] ?? [];
+    if (is_array($form)) { echo $form["name"], ":"; }
+    echo $_GET["a_b"] ?? "none", ":";
+    echo http_response_code(), ":";
+    await sleepAsync(0);
+    echo 42, ":", 1.5, ":", true, ":";
+    print "print:";
+    printf("%s:%d", "printf", 7);
+}
+"#;
+    http_cases("http-php-output", handler, vec![(
+        b"POST /?tags[]=one&tags[]=two&a.b=last HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 19\r\n\r\nuser[name]=Ada+Love".to_vec(),
+        200, b"one:two:Ada Love:last:200:42:1.5:1:print:printf:7".to_vec(),
+    )], 4096);
+}
+#[test]
+fn http_request_contexts_are_isolated_across_concurrent_handlers_and_children() {
+    use std::io::{Read, Write};
+    if !have_cc() {
+        return;
+    }
+    let gate = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    gate.set_nonblocking(true).unwrap();
+    let gate_port = gate.local_addr().unwrap().port();
+    let port = server_port("127.0.0.1");
+    let source = format!(
+        r#"<?php
+function currentId(): string {{ return strval($_GET["id"]); }}
+async function child(): string {{ await sleepAsync(0); echo "child:"; return currentId(); }}
+async function handle(): string {{
+    $id = currentId();
+    $_GET["id"] = $id . "-changed";
+    $_SERVER["MARK"] = $id;
+    header("X-Request-ID: " . $id);
+    if ($id === "slow") {{
+        http_response_code(202);
+        await tcpExchangeAsync("127.0.0.1", {gate_port}, "hold", 2);
+    }} else {{ http_response_code(201); }}
+    $value = await child();
+    return $id . ":" . $value . ":" . strval($_REQUEST["id"]) . ":" . strval($_SERVER["MARK"]);
+}}
+async function main(): void {{
+    $_GET["id"] = "cli";
+    await httpServeAsync("127.0.0.1", {port}, "handle", 2, 4096, 10000, 2);
+    echo currentId(), "\n";
+}}
+"#
+    );
+    for opt in [0, 3] {
+        let executable = build("http-context-isolation", &source, opt);
+        for stress in [false, true] {
+            let listener = gate.try_clone().unwrap();
+            let client = std::thread::spawn(move || {
+                let mut slow = connect_http(port);
+                slow.write_all(b"GET /?id=slow HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .unwrap();
+                let mut hold = accept_tcp(&listener);
+                let mut token = Vec::new();
+                hold.read_to_end(&mut token).unwrap();
+                assert_eq!(token, b"hold"); // Slow handler is suspended before fast starts.
+                let mut fast = connect_http(port);
+                fast.write_all(b"GET /?id=fast HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .unwrap();
+                let (headers, body) = read_http(&mut fast);
+                assert!(
+                    headers.starts_with("HTTP/1.1 201 ") && headers.contains("X-Request-ID: fast")
+                );
+                assert_eq!(body, b"child:fast:fast-changed:fast:fast");
+                hold.write_all(b"ok").unwrap();
+                drop(hold);
+                let (headers, body) = read_http(&mut slow);
+                assert!(
+                    headers.starts_with("HTTP/1.1 202 ") && headers.contains("X-Request-ID: slow")
+                );
+                assert!(!headers.contains("X-Request-ID: fast"));
+                assert_eq!(body, b"child:slow:slow-changed:slow:slow");
+            });
+            let mut command = Command::new(&executable);
+            command.env("PXR_PHP", "/pxr-no-php-cli");
+            if stress {
+                command.env("PXR_GC_STRESS", "1");
+            }
+            let result = execute(&mut command);
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(result.stdout, b"cli\n");
+            assert!(result.stderr.is_empty());
+            client.join().unwrap();
+        }
+        std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+    }
+}
+#[test]
+fn php_request_globals_work_in_sync_helpers_and_reject_unsupported_forms() {
+    run_case(
+        "http-cli-globals",
+        r#"<?php
+function name(): string { return strval($_GET["name"] ?? "none"); }
+$_GET["name"] = "CLI";
+echo name(), ":", count($_POST), ":", count($_FILES), "\n";
+"#,
+        "CLI:0:0\n",
+    );
+    let dir = std::env::temp_dir().join(format!("pxr-http-errors-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (i, source) in [
+        "async function handle(string $request): string { return $request; } async function main(): void { await httpServeAsync(\"127.0.0.1\", 8080, \"handle\", 1, 10); }",
+        "function handle(): string { return \"x\"; } async function main(): void { await httpServeAsync(\"127.0.0.1\", 8080, \"handle\", 1, 10); }",
+        "async function handle(): int { return 1; } async function main(): void { await httpServeAsync(\"127.0.0.1\", 8080, \"handle\", 1, 10); }",
+        "function httpServeAsync(): void {}",
+        "namespace X; function header(string $line): void {}",
+        "function f(array<mixed> $_GET): void {}",
+        "class X { public function f(array<mixed> $_POST): void {} }",
+        "$_GET = [];", "$_POST: owned<array<int>> = [];", "$_SESSION = [];",
+        "echo $_SESSION;", "echo $_ENV;", "echo $GLOBALS;",
+        "foreach ([1] as $_GET) {}",
+        "header(1);", "header(\"X: y\", 1);", "header(\"X: y\", true, \"200\");",
+        "http_response_code(\"200\");", "httpRequestBody(1);",
+        "async function f(): int { return 1; } async function main(): void { $_GET[\"task\"] = f(); }",
+    ].iter().enumerate() {
+        let input = dir.join(format!("{i}.php")); std::fs::write(&input, format!("<?php {source}")).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_pxr")).arg("check").arg(input).output().unwrap();
+        assert!(!output.status.success(), "case {i} unexpectedly accepted");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("error") && !error.contains("panicked"), "{i}: {error}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn http_bounds_headers_and_echoed_response_content() {
+    let mut oversized = b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Large: ".to_vec();
+    oversized.resize(oversized.len() + 17000, b'x');
+    oversized.extend_from_slice(b"\r\n\r\n");
+    let mut many = b"GET / HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+    for i in 0..100 {
+        many.extend_from_slice(format!("X-{i}: y\r\n").as_bytes());
+    }
+    many.extend_from_slice(b"\r\n");
+    http_cases(
+        "http-bounds",
+        "async function handle(): void { echo \"abc\"; }",
+        vec![
+            (
+                oversized,
+                431,
+                b"Request Header Fields Too Large\n".to_vec(),
+            ),
+            (many, 431, b"Request Header Fields Too Large\n".to_vec()),
+            (
+                b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+                500,
+                b"Internal Server Error\n".to_vec(),
+            ),
+        ],
+        2,
+    );
+}
+#[test]
+fn http_round_trips_large_binary_bodies_without_client_eof() {
+    let mut request = b"POST /bytes HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: 1048576\r\n\r\n".to_vec();
+    let body: Vec<u8> = (0..1048576).map(|i| (i % 256) as u8).collect();
+    request.extend_from_slice(&body);
+    http_cases("http-binary", "async function handle(): string { await sleepAsync(0); header(\"Content-Type: application/octet-stream\"); return httpRequestBody(); }", vec![(request, 200, body)], 1048576);
+}

@@ -798,20 +798,30 @@ rebinding and namespace/import dispatch. C tests inspect pending read/write/
 handler/listener cleanup and use a fake clock for handler deadlines. See
 [`ASYNC_SERVER.md`](ASYNC_SERVER.md) and `examples/async/server.php`.
 
+**Delivered HTTP slice:** `httpServeAsync` frames bounded HTTP/1.x requests
+without waiting for EOF and invokes native async string/void handlers. Isolated
+`$_GET`, `$_POST`, `$_COOKIE`, `$_SERVER`, `$_REQUEST` and empty `$_FILES` arrays
+are visible in helpers and inherited by async descendants. Native echo/print/
+printf, header() and http_response_code() produce buffered request-local
+responses. Protocol errors produce bounded local HTTP responses; transport/task
+errors retain fail-fast structured cleanup. Tests prove concurrent context
+isolation, open-client-write-side framing, large binary bodies, limits, nested
+parameters and cancellation/GC roots. See [`HTTP.md`](HTTP.md),
+`examples/async/http.php` and the finite `examples/async/http_demo.php`.
+
 **Remaining:** streaming socket/resource APIs, recoverable error APIs, broader
 task/result ownership signatures, generic async functions, async methods and
 async return inference. Unsupported source forms
 receive diagnostics. The current runtime error envelope does not implement PHP
-exceptions or finally/destructors. HTTP framing/routing, request/response objects
-and isolated query/form/cookie/upload/header access will build on the TCP
-foundation. Request superglobals and sessions are not implemented. Threading
-remains M7.2.
+exceptions or finally/destructors. Request/response objects, router classes,
+streaming HTTP, uploads, sessions and full PHP web SAPI compatibility remain
+pending. Threading remains M7.2.
 
 **Validation:** native source tests run at `-O0`/`-O3`, normal/forced GC, and with
 AddressSanitizer/UndefinedBehaviorSanitizer. They cover scheduling progress,
 ordered awaits, affine handles, joins/cleanup, control-flow suspension, captured
 values, module resolution, failure propagation, bounded memory and invalid forms.
-All 223 workspace tests, async/heap/ownership sanitizer checks, example checks
+All 231 workspace tests, async/HTTP/heap/ownership sanitizer checks, example checks
 and the release build pass.
 M7.1 and M7 remain incomplete until the remaining I/O/lifecycle APIs and their
 source acceptance checks are delivered.

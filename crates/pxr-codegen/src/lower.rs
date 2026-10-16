@@ -2072,7 +2072,7 @@ impl Lowerer {
 
     fn lower_call(&mut self, callee: &Callee, ret: &Ty, args: &[TExpr], arg_tys: &[Ty]) -> Value {
         match callee {
-            Callee::AsyncServer { handler } => {
+            Callee::AsyncServer { handler, http } => {
                 let mut values: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let callback = self.fresh();
                 self.emit(Inst::FunctionAddr {
@@ -2080,7 +2080,15 @@ impl Lowerer {
                     name: handler.clone(),
                 });
                 values.insert(2, callback);
-                self.rt_call("pxr_async_tcp_serve", values, ret.clone())
+                self.rt_call(
+                    if *http {
+                        "pxr_async_http_serve"
+                    } else {
+                        "pxr_async_tcp_serve"
+                    },
+                    values,
+                    ret.clone(),
+                )
             }
             Callee::Php { name, fallback } => {
                 let name = self.emit_const(Literal::Str(name.as_bytes().to_vec()));

@@ -11,6 +11,17 @@
 
 typedef struct pxr_task pxr_task;
 typedef struct pxr_loop pxr_loop;
+typedef struct {
+    pxr_array *globals[6], *headers, *response_headers;
+    pxr_str *body;
+    size_t scan, header_end, body_length;
+    int parsed, head, status, error;
+    int64_t max_bytes;
+    pxr_buf output;
+} pxr_http_context;
+static pxr_http_context *pxr_http_cli_context;
+static void pxr_http_mark_context(pxr_http_context *context);
+static pxr_http_context *pxr_http_context_new(int fd, int64_t max_bytes);
 typedef void (*pxr_task_callback)(pxr_task *, void *);
 typedef struct { int status, error; int64_t tag, bits; } pxr_task_result;
 enum { PXR_TASK_OK, PXR_TASK_CANCELLED, PXR_TASK_ERROR };
@@ -31,6 +42,7 @@ struct pxr_task {
     void *frame;
     void **roots;
     size_t root_count, root_capacity;
+    pxr_http_context *http;
 };
 struct pxr_loop {
     pxr_loop *registered_next;
@@ -75,11 +87,13 @@ static void pxr_loop_init(pxr_loop *loop) {
     pxr_async_loops = loop;
 }
 static void pxr_async_mark_roots(void) {
+    pxr_http_mark_context(pxr_http_cli_context);
     for (pxr_loop *loop = pxr_async_loops; loop; loop = loop->registered_next)
         for (pxr_task *task = loop->tasks; task; task = task->all_next) {
             pxr_gc_mark(task->frame);
             for (size_t i = 0; i < task->root_count; i++) pxr_gc_mark(task->roots[i]);
             pxr_gc_mark_value(task->result.tag, task->result.bits);
+            pxr_http_mark_context(task->http);
         }
 }
 /* Roots are exact payload addresses. A frame is raw storage, never scanned.
@@ -117,6 +131,7 @@ static pxr_task *pxr_task_new(pxr_loop *loop, pxr_task *parent,
     loop->tasks = task;
     loop->task_count++;
     task->parent = parent;
+    task->http = parent ? parent->http : NULL;
     if (parent) {
         task->sibling_next = parent->children;
         if (parent->children) parent->children->sibling_prev = task;
@@ -650,23 +665,29 @@ void *pxr_async_tcp_exchange(pxr_str *address, int64_t port,
  * constructor pointer; descriptors never escape the structured connection task.
  * EOF delimits each request, exactly as in tcpExchangeAsync. */
 typedef pxr_task *(*pxr_tcp_handler)(pxr_str *);
+typedef pxr_task *(*pxr_http_handler)(void);
 typedef struct {
     int fd, started;
     pxr_str *address;
     pxr_tcp_handler handler;
+    pxr_http_handler http_handler;
     int64_t port, max_requests, remaining, max_bytes, timeout_ms, max_concurrent;
 } pxr_server_frame;
-enum { PXR_SERVER_READ, PXR_SERVER_HANDLER, PXR_SERVER_WRITE };
+enum { PXR_SERVER_READ, PXR_SERVER_HANDLER, PXR_SERVER_WRITE,
+       PXR_SERVER_SHUTDOWN, PXR_SERVER_DRAIN };
 typedef struct {
     int fd, phase;
     int64_t max_bytes;
     uint64_t expires;
     pxr_tcp_handler handler;
+    pxr_http_handler http_handler;
     pxr_task *handler_task;
     pxr_buf request;
     pxr_str *response;
     size_t sent;
 } pxr_server_connection;
+static int pxr_http_consume(pxr_task *task, pxr_server_connection *frame, int eof);
+static void pxr_http_response(pxr_task *task, pxr_server_connection *frame, pxr_str *body, int status);
 
 static void pxr_server_close(int *slot) {
     if (*slot < 0) return;
@@ -690,15 +711,19 @@ static void pxr_server_wait(pxr_task *task, pxr_server_connection *frame, short 
 static void pxr_server_connection_resume(pxr_task *task, void *raw) {
     pxr_server_connection *frame = raw;
     if (task->loop->now(task->loop->clock_context) >= frame->expires) {
-        pxr_task_fail(task, ETIMEDOUT); return;
+        if (frame->phase >= PXR_SERVER_SHUTDOWN) pxr_task_finish(task, 0, 0);
+        else pxr_task_fail(task, ETIMEDOUT);
+        return;
     }
     if (frame->phase == PXR_SERVER_HANDLER) {
         pxr_task_result result = pxr_task_take(frame->handler_task);
-        assert(result.status == PXR_TASK_OK && result.tag == PXR_TAG_STR);
+        assert(result.status == PXR_TASK_OK && (result.tag == PXR_TAG_STR || (frame->http_handler && result.tag == 0)));
         frame->handler_task = NULL;
-        frame->response = (void *)(intptr_t)result.bits;
+        frame->response = result.tag == PXR_TAG_STR ? (void *)(intptr_t)result.bits : pxr_str_alloc(0);
         task->roots[1] = frame->response;
-        if (frame->response->len > (uint64_t)frame->max_bytes) {
+        if (frame->http_handler) {
+            pxr_http_response(task, frame, frame->response, 0);
+        } else if (frame->response->len > (uint64_t)frame->max_bytes) {
             pxr_task_fail(task, EMSGSIZE); return;
         }
         frame->phase = PXR_SERVER_WRITE;
@@ -706,32 +731,80 @@ static void pxr_server_connection_resume(pxr_task *task, void *raw) {
     for (unsigned budget = 0; budget < 64; budget++) {
         if (frame->phase == PXR_SERVER_READ) {
             char chunk[8192];
-            ssize_t n = recv(frame->fd, chunk, sizeof(chunk), 0);
+            size_t size = sizeof(chunk);
+            if (frame->http_handler) {
+                pxr_http_context *http = task->http;
+                size_t remaining = http->parsed
+                    ? http->header_end + http->body_length - frame->request.len
+                    : 16384 - frame->request.len;
+                if (size > remaining) size = remaining;
+                assert(size); /* consume dispatches/errors before a bound is reached. */
+            }
+            ssize_t n = recv(frame->fd, chunk, size, 0);
             if (n < 0 && errno == EINTR) continue;
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 pxr_server_wait(task, frame, POLLIN); return;
             }
             if (n < 0) { pxr_task_fail(task, errno); return; }
-            if (!n) {
-                pxr_str *request = pxr_str_alloc(frame->request.len);
-                if (frame->request.len) memcpy(request->data, frame->request.data, frame->request.len);
-                task->roots[1] = request; /* The constructor may collect. */
-                task->roots[0] = NULL;
-                pxr_heap_free(frame->request.data); frame->request.data = NULL;
-                frame->handler_task = frame->handler(request);
-                task->roots[1] = NULL; /* The lazy handler now retains its argument. */
+            int ready = !n;
+            if (frame->http_handler) {
+                if (n) {
+                    pxr_buf_append(&frame->request, chunk, (size_t)n);
+                    task->roots[0] = frame->request.data;
+                }
+                ready = pxr_http_consume(task, frame, !n);
+                if (ready == 2) continue; /* A bounded protocol-error response. */
+            }
+            if (ready) {
+                if (frame->http_handler) {
+                    frame->handler_task = frame->http_handler();
+                } else {
+                    pxr_str *request = pxr_str_alloc(frame->request.len);
+                    if (frame->request.len) memcpy(request->data, frame->request.data, frame->request.len);
+                    task->roots[1] = request; /* The constructor may collect. */
+                    task->roots[0] = NULL;
+                    pxr_heap_free(frame->request.data); frame->request.data = NULL;
+                    frame->handler_task = frame->handler(request);
+                    task->roots[1] = NULL; /* The lazy handler now retains its argument. */
+                }
+                if (frame->http_handler) {
+                    task->roots[0] = NULL;
+                    pxr_heap_free(frame->request.data); frame->request.data = NULL;
+                }
                 frame->phase = PXR_SERVER_HANDLER;
                 pxr_task_await(task, frame->handler_task);
                 if (task->state == PXR_TASK_CHILD) pxr_task_timer_at(task, frame->expires);
                 return;
             }
+            if (frame->http_handler) continue;
             if ((size_t)n > (uint64_t)frame->max_bytes - frame->request.len) {
                 pxr_task_fail(task, EMSGSIZE); return;
             }
             pxr_buf_append(&frame->request, chunk, (size_t)n);
             task->roots[0] = frame->request.data;
+        } else if (frame->phase == PXR_SERVER_SHUTDOWN) {
+            if (shutdown(frame->fd, SHUT_WR) < 0) {
+                if (errno == EINTR) { pxr_task_yield(task); return; }
+                pxr_task_finish(task, 0, 0); return;
+            }
+            uint64_t now = task->loop->now(task->loop->clock_context);
+            uint64_t deadline = now > UINT64_MAX - 100000000 ? UINT64_MAX : now + 100000000;
+            if (deadline < frame->expires) frame->expires = deadline;
+            frame->phase = PXR_SERVER_DRAIN; frame->sent = 0;
+        } else if (frame->phase == PXR_SERVER_DRAIN) {
+            /* Announce response EOF before bounded input draining, avoiding an
+             * immediate reset when an error response rejects an unread body. */
+            char discard[8192];
+            ssize_t n = recv(frame->fd, discard, sizeof(discard), 0);
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                pxr_server_wait(task, frame, POLLIN); return;
+            }
+            if (n > 0) frame->sent += (size_t)n;
+            if (n <= 0 || frame->sent >= 65536) { pxr_task_finish(task, 0, 0); return; }
         } else {
             if (frame->sent == frame->response->len) {
+                if (frame->http_handler) { frame->phase = PXR_SERVER_SHUTDOWN; continue; }
                 pxr_task_finish(task, 0, 0); return; /* Cleanup closes the send side. */
             }
             size_t size = frame->response->len - frame->sent;
@@ -752,7 +825,7 @@ static void pxr_server_connection_resume(pxr_task *task, void *raw) {
     pxr_task_yield(task);
 }
 static int pxr_server_open(pxr_server_frame *frame) {
-    if (!frame->handler || frame->max_requests < 0 || frame->max_bytes < 0 ||
+    if ((!frame->handler && !frame->http_handler) || frame->max_requests < 0 || frame->max_bytes < 0 ||
         frame->timeout_ms <= 0 || frame->max_concurrent < 1 || frame->max_concurrent > 1024)
         return EINVAL;
     struct sockaddr_storage address; socklen_t length;
@@ -814,6 +887,8 @@ static void pxr_server_resume(pxr_task *task, void *raw) {
         pxr_server_connection *connection = child->frame;
         connection->fd = fd; connection->max_bytes = frame->max_bytes;
         connection->handler = frame->handler;
+        connection->http_handler = frame->http_handler;
+        if (frame->http_handler) child->http = pxr_http_context_new(fd, frame->max_bytes);
         connection->expires = (uint64_t)frame->timeout_ms > (UINT64_MAX - now) / 1000000
             ? UINT64_MAX : now + (uint64_t)frame->timeout_ms * 1000000;
         pxr_task_roots(child, 2);

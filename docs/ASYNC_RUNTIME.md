@@ -2,7 +2,7 @@
 
 `runtime/pxr_async.c` implements a single-thread executor tested with native,
 hand-written and compiler-generated resumable frames. The driver embeds it
-alongside `pxr_rt.c`, so standalone programs need no checkout or external async
+alongside `pxr_rt.c` and `pxr_http.c`, so standalone programs need no checkout or external async
 library. The first compiler source slice is documented in [ASYNC.md](ASYNC.md).
 These internal C interfaces are not a public FFI or a stable generated-code ABI.
 
@@ -179,3 +179,19 @@ explicitly rooted while its generated constructor can collect. The lazy handler
 then retains its parameter, and a consumed handler response is rooted until the
 last partial write completes. [ASYNC_SERVER.md](ASYNC_SERVER.md) describes source
 configuration, finite joins, fail-fast errors and protocol limitations.
+
+
+`pxr_http.c` adapts those same server/connection tasks to bounded HTTP framing.
+A zero-argument native async handler inherits a fresh `pxr_http_context` through
+`pxr_task_new`; synchronous helpers access the currently running task's context.
+All request arrays, header arrays, raw body and output buffer are explicit roots,
+including while descendants join or cancel. The context is raw managed storage,
+so those fields are traced deliberately, rather than scanned conservatively.
+A separate rooted fallback supplies initially empty CLI request arrays and is
+never used to initialize an accepted HTTP request. Response serialization waits
+for handler descendants; `echo`/`print`/`printf` can therefore stay buffered and
+headers mutable until completion. HTTP protocol errors become local responses;
+ordinary task/transport failures retain the structured fail-fast policy. After
+sending, HTTP tasks shut down writes and use a bounded drain phase. An expired
+drain completes successfully, while an expired application/read/write wait still
+fails with ETIMEDOUT. [HTTP.md](HTTP.md) specifies all source/protocol boundaries.
