@@ -2903,3 +2903,38 @@ async function main(): void {
         "35:37\n",
     );
 }
+
+#[test]
+fn generic_closures_keep_lexical_types_and_captures_across_suspension() {
+    run_case(
+        "generic_closure_lifetime",
+        r#"<?php
+function identity<T>() { return async function(T $value): T { await sleepAsync(0); return $value; }; }
+function nested<T>() { return async fn(T $seed) => async fn(T $value): T => $seed; }
+class Factory<T> {
+    private T $seed;
+    public function __construct(T $seed) { $this->seed=$seed; }
+    public function callback() { return async function(T $fallback): T { await sleepAsync(0); return $this->seed; }; }
+    public async function create<U>() { await sleepAsync(0); return async fn(U $value): T => $this->seed; }
+    public static function ownType() { return static async fn(self $value): self => $value; }
+    public function transfer<U>() { return async function(owned<U> $value): owned<U> { await sleepAsync(0); return move($value); }; }
+    public function action() { return async function(T $value): void { await sleepAsync(0); echo $value, "\n"; }; }
+}
+async function argument(): string { await sleepAsync(0); return "argument"; }
+async function main(): void {
+    $identity=identity<string>();
+    $callback=(new Factory<string>("bound"))->callback();
+    $created=await (new Factory<string>("created"))->create<int>();
+    $own=Factory<string>::ownType();
+    $outer=nested<string>(); $inner=await $outer("nested");
+    for ($i=0; $i<30; $i++) { $temporary=new Factory<string>("garbage"); await sleepAsync(0); }
+    echo await $identity(await argument()), ":", await $callback("ignored"), ":", await $created(7), ":", await $inner("ignored"), "\n";
+    $copy=await $own(new Factory<string>("self")); $action=$copy->action(); await $action("void");
+    $transfer=(new Factory<int>(1))->transfer<array<string>>();
+    $input: owned<array<string>>=["owned"];
+    $output=await $transfer(move($input)); echo $output[0], "\n"; drop($output);
+}
+"#,
+        "argument:bound:created:nested\nvoid\nowned\n",
+    );
+}

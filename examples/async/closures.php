@@ -9,6 +9,12 @@ class Prefix {
         };
     }
 }
+function delayedIdentity<T>() {
+    return async function(T $value): T {
+        await sleepAsync(0);
+        return $value;
+    };
+}
 async function main(): void {
     $format = (new Prefix("kept:"))->formatter();
     $offset = 10;
@@ -16,4 +22,6 @@ async function main(): void {
     $text = spawn $format("value");
     $number = spawn $add(3);
     echo await $text, ":", await $number, "\n";
+    $identity = delayedIdentity<string>();
+    echo await $identity("generic"), "\n";
 }

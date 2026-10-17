@@ -133,6 +133,10 @@ fn owned_values_moves_borrows_and_generic_methods() {
 #[test]
 fn ownership_violations_fail_before_lowering() {
     let cases = [
+        ("generic-closure-owned-capture", "function make<T>(owned<T> $value) { return fn(): T => $value; }"),
+        ("generic-closure-borrow-capture", "function make<T>(&T $value) { return fn(): T => $value; }"),
+        ("generic-bound-closure-owned-receiver", "class C<T> { public function make<U>() { return fn(U $value): U => $value; } } $c: owned<C<int>>=new C<int>; $f=$c->make<string>();"),
+        ("generic-closure-implicit-transfer", "function make<T>() { return fn(owned<T> $value): owned<T> => move($value); } $f=make<string>(); $value: owned<string>=\"kept\"; $result=$f($value);"),
         ("owned-async-closure-receiver", "class C { public function make() { return async fn(): int => 1; } } $c: owned<C>=new C; $f=$c->make();"),
         ("async-closure-borrow-param", "$f=async function(&int $x): int { return $x; };"),
         ("async-closure-bound-borrow-param", "class C { public function make() { return async function(&mut array<int> $x): void { $x[]=1; }; } }"),
@@ -676,6 +680,60 @@ drop($output);
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(out.stdout, b"kept!\n");
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn generic_closures_preserve_owned_transfers_borrows_and_trait_contracts() {
+    if !have_cc() {
+        return;
+    }
+    let source = r#"<?php
+function transfer<T>() { return fn(owned<T> $value): owned<T> => move($value); }
+class Factory<T> {
+    public static function transfer<U>() { return static fn(owned<U> $value): owned<U> => move($value); }
+    public function mutate() { return function(&mut array<T> $values, T $value): void { $values[]=$value; }; }
+    public static function inspect() { return static fn(&array<T> $values): T => $values[0]; }
+}
+class SelfFactory<T> { public static function transfer() { return static fn(owned<self> $value): owned<self> => move($value); } }
+trait TransferTrait { public function transfer<T>() { return fn(owned<T> $value): owned<T> => move($value); } }
+class First { use TransferTrait; }
+class Second { use TransferTrait; }
+$transfer=transfer<string>();
+$input: owned<string>="kept"; $output=$transfer(move($input));
+echo $output, "\n"; drop($output);
+$static=Factory<int>::transfer<string>();
+$input: owned<string>="static"; $output=$static(move($input));
+echo $output, "\n"; drop($output);
+$mutate=(new Factory<string>())->mutate(); $inspect=Factory<string>::inspect();
+$values: owned<array<string>>=["first"];
+$mutate(&mut $values,"second"); echo $inspect(&$values), ":", $values[1], "\n"; drop($values);
+$first=(new First())->transfer<array<int>>(); $second=(new Second())->transfer<array<int>>();
+$numbers: owned<array<int>>=[7]; $middle=$first(move($numbers)); $result=$second(move($middle));
+echo $result[0], "\n"; drop($result);
+$selfTransfer=SelfFactory<int>::transfer();
+$selfInput: owned<SelfFactory<int>>=new SelfFactory<int>();
+$selfOutput=$selfTransfer(move($selfInput)); drop($selfOutput);
+"#;
+    for opt in [0, 3] {
+        let executable = build("generic_closure_contracts", source, opt);
+        let out = Command::new(&executable)
+            .env("PXR_GC_STRESS", "1")
+            .env("PXR_PHP", "/missing/php")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"kept\nstatic\nfirst:second\n7\n");
         assert!(
             out.stderr.is_empty(),
             "{}",

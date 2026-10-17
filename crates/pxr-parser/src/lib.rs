@@ -28,11 +28,11 @@ pub struct Parser {
     declared_types: Vec<String>,
     declared_functions: Vec<String>,
     type_params: Vec<String>,
+    type_bounds: Vec<(String, Vec<TypeRef>)>,
     future_type_params: Vec<String>,
     generated_items: Vec<Stmt>,
     in_method: bool,
     method_static: bool,
-    method_generic: bool,
     closure_class: Option<closures::ClassScope>,
 }
 
@@ -69,11 +69,11 @@ pub fn parse_at(src: &str, offset: usize) -> (Option<Program>, Diagnostics) {
         declared_types: Vec::new(),
         declared_functions: Vec::new(),
         type_params: Vec::new(),
+        type_bounds: Vec::new(),
         future_type_params: Vec::new(),
         generated_items: Vec::new(),
         in_method: false,
         method_static: false,
-        method_generic: false,
         closure_class: None,
     };
     let program = p.parse_program();
@@ -594,12 +594,14 @@ impl Parser {
 
     fn parse_fn(&mut self) -> Result<FnDecl, ()> {
         let previous = std::mem::take(&mut self.type_params);
+        let previous_bounds = std::mem::take(&mut self.type_bounds);
         let is_async = self.eat(&TokenKind::Async);
         let result = self.parse_fn_inner().map(|mut f| {
             f.is_async = is_async;
             f
         });
         self.type_params = previous;
+        self.type_bounds = previous_bounds;
         result
     }
 
@@ -674,9 +676,11 @@ impl Parser {
 
     fn parse_class(&mut self) -> Result<ClassDecl, ()> {
         let previous = std::mem::take(&mut self.type_params);
+        let previous_bounds = std::mem::take(&mut self.type_bounds);
         let previous_scope = self.closure_class.take();
         let result = self.parse_class_inner();
         self.type_params = previous;
+        self.type_bounds = previous_bounds;
         self.closure_class = previous_scope;
         result
     }
@@ -721,7 +725,7 @@ impl Parser {
         }
         self.closure_class = Some(closures::ClassScope {
             name: name.clone(),
-            generic: !type_params.is_empty(),
+            type_params: type_params.clone(),
             is_trait,
             parent: extends.clone(),
             methods: Vec::new(),
@@ -889,8 +893,10 @@ impl Parser {
         is_static: bool,
     ) -> Result<MethodDecl, ()> {
         let previous = self.type_params.clone();
+        let previous_bounds = self.type_bounds.clone();
         let result = self.parse_method_inner(start, visibility, is_abstract, is_static);
         self.type_params = previous;
+        self.type_bounds = previous_bounds;
         result
     }
 
@@ -951,12 +957,9 @@ impl Parser {
         } else {
             let previous = std::mem::replace(&mut self.in_method, true);
             let previous_static = std::mem::replace(&mut self.method_static, is_static);
-            let previous_generic =
-                std::mem::replace(&mut self.method_generic, !type_params.is_empty());
             let result = self.parse_block();
             self.in_method = previous;
             self.method_static = previous_static;
-            self.method_generic = previous_generic;
             result?
         };
         let end = self.peek().span;
@@ -1138,6 +1141,9 @@ impl Parser {
         }
         let result = self.parse_type_parameters_inner();
         self.future_type_params = previous;
+        if let Ok((_, bounds)) = &result {
+            self.type_bounds.extend(bounds.clone());
+        }
         result
     }
 

@@ -5,7 +5,7 @@ use super::*;
 
 pub(super) struct ClassScope {
     pub name: String,
-    pub generic: bool,
+    pub type_params: Vec<(String, Span)>,
     pub is_trait: bool,
     pub parent: Option<ClassRef>,
     pub methods: Vec<MethodDecl>,
@@ -86,18 +86,25 @@ fn free_variables(e: &Expr, params: &[Param], captures: &mut Vec<String>) {
 }
 fn bind_annotation(t: &mut TypeRef, scope: Option<&ClassScope>) -> Result<(), &'static str> {
     match t {
-        TypeRef::Param(..) => {
-            return Err(
-                "closure annotations referring to enclosing generic types are not implemented yet",
-            );
-        }
         TypeRef::Named(n) if matches!(n.to_ascii_lowercase().as_str(), "self" | "parent") => {
             let scope = scope.ok_or("lexical closure annotations require a class scope")?;
             if scope.is_trait {
                 return Err("lexical closure annotations in trait scope are not implemented yet");
             }
             *t = if n.eq_ignore_ascii_case("self") {
-                TypeRef::Named(scope.name.clone())
+                if scope.type_params.is_empty() {
+                    TypeRef::Named(scope.name.clone())
+                } else {
+                    TypeRef::Applied(
+                        scope.name.clone(),
+                        scope
+                            .type_params
+                            .iter()
+                            .map(|(name, span)| TypeRef::Param(name.clone(), *span))
+                            .collect(),
+                        Span::synthetic(),
+                    )
+                }
             } else {
                 let parent = scope
                     .parent
@@ -179,18 +186,30 @@ impl Parser {
         let scope = if self.in_method {
             self.closure_class
                 .as_ref()
-                .map(|scope| (scope.name.clone(), scope.generic, scope.is_trait))
+                .map(|scope| (scope.name.clone(), scope.is_trait))
         } else {
             None
         };
-        if scope.as_ref().is_some_and(|(_, generic, _)| *generic)
-            || self.in_method && self.method_generic
-        {
-            self.error(span, "closures in generic class/method scope require lexical type binding and are not implemented yet");
-            return Err(());
-        }
+        let lexical_params: Vec<_> = self
+            .type_params
+            .iter()
+            .map(|name| (name.clone(), span))
+            .collect();
+        let lexical_types: Vec<_> = lexical_params
+            .iter()
+            .map(|(name, span)| TypeRef::Param(name.clone(), *span))
+            .collect();
+        let lexical_bounds = self.type_bounds.clone();
+        let class_params = if self.in_method {
+            self.closure_class
+                .as_ref()
+                .map(|scope| scope.type_params.clone())
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
         let bound = scope.is_some() && !is_static && !self.method_static;
-        if scope.as_ref().is_some_and(|(_, _, is_trait)| *is_trait) && !bound {
+        if scope.as_ref().is_some_and(|(_, is_trait)| *is_trait) && !bound {
             self.error(span, "static trait closure scope is not implemented yet");
             return Err(());
         }
@@ -311,7 +330,7 @@ impl Parser {
             .enumerate()
             .map(|(i, _)| TypeRef::Param(format!("$capture{i}"), span))
             .collect();
-        let type_params: Vec<_> = types
+        let capture_types: Vec<_> = types
             .iter()
             .map(|t| match t {
                 TypeRef::Param(n, _) => (n.clone(), span),
@@ -323,18 +342,34 @@ impl Parser {
             .zip(&types)
             .map(|(n, t)| parameter(n, t.clone(), span))
             .collect();
-        if let Some((owner, _, _)) = &scope {
+        if let Some((owner, _)) = &scope {
             let bridge = format!("$closure_body${id}");
             // The receiver also supplies its concrete specialization type.
             // Keep bound bridges lazy: a class can override a trait factory
             // without instantiating the discarded trait closure's body.
             let mut bridge_params = capture_params.clone();
-            let bridge_types: Vec<_> = bridge_params
+            let mut bridge_types: Vec<_> = lexical_params
                 .iter()
-                .filter_map(|p| match &p.ty {
-                    Some(TypeRef::Param(name, span)) => Some((name.clone(), *span)),
-                    _ => None,
+                .filter(|(name, _)| {
+                    !class_params
+                        .iter()
+                        .any(|(class_name, _)| name == class_name)
                 })
+                .cloned()
+                .collect();
+            let bridge_bounds: Vec<_> = lexical_bounds
+                .iter()
+                .filter(|(name, _)| {
+                    bridge_types
+                        .iter()
+                        .any(|(method_name, _)| name == method_name)
+                })
+                .cloned()
+                .collect();
+            bridge_types.extend(capture_types.clone());
+            let bridge_type_args: Vec<_> = bridge_types
+                .iter()
+                .map(|(name, span)| TypeRef::Param(name.clone(), *span))
                 .collect();
             bridge_params.extend(params.clone());
             self.closure_class
@@ -344,7 +379,7 @@ impl Parser {
                 .push(MethodDecl {
                     is_async,
                     type_params: bridge_types,
-                    bounds: vec![],
+                    bounds: bridge_bounds,
                     is_static: !bound,
                     is_abstract: false,
                     // The source grammar cannot spell this internal method name.
@@ -363,16 +398,19 @@ impl Parser {
                     base: Box::new(variable(BOUND_RECEIVER, span)),
                     name: bridge,
                     name_span: span,
-                    type_args: vec![],
+                    type_args: bridge_type_args,
                     args,
                     span,
                 }
             } else {
                 Expr::StaticCall {
                     class_name: owner.clone(),
-                    type_args: vec![],
+                    type_args: class_params
+                        .iter()
+                        .map(|(name, span)| TypeRef::Param(name.clone(), *span))
+                        .collect(),
                     method: bridge,
-                    method_type_args: vec![],
+                    method_type_args: bridge_type_args,
                     args,
                     span,
                 }
@@ -458,10 +496,14 @@ impl Parser {
             body: prologue,
             span,
         }));
+        let mut environment_params = lexical_params.clone();
+        environment_params.extend(capture_types.clone());
+        let mut environment_types = lexical_types.clone();
+        environment_types.extend(types);
         self.generated_items
             .push(Stmt::ClassDecl(Box::new(ClassDecl {
-                type_params: type_params.clone(),
-                bounds: vec![],
+                type_params: environment_params,
+                bounds: lexical_bounds.clone(),
                 is_trait: false,
                 trait_uses: vec![],
                 is_interface: false,
@@ -473,41 +515,86 @@ impl Parser {
                 members,
                 span,
             })));
-        let class_ty = if types.is_empty() {
+        let class_ty = if environment_types.is_empty() {
             TypeRef::Named(class.clone())
         } else {
-            TypeRef::Applied(class.clone(), types.clone(), span)
+            TypeRef::Applied(class.clone(), environment_types.clone(), span)
         };
-        self.generated_items.push(Stmt::FnDecl(Box::new(FnDecl {
-            is_async: false,
-            type_params,
-            bounds: vec![],
-            name: factory.clone(),
-            name_span: span,
-            params: capture_params,
-            ret: Some(class_ty),
-            body: vec![Stmt::Return(
-                Some(Expr::New {
-                    class_name: class,
-                    type_args: types,
-                    class_span: span,
-                    args: captures.iter().map(|n| variable(n, span)).collect(),
-                    span,
-                }),
+        let factory_body = vec![Stmt::Return(
+            Some(Expr::New {
+                class_name: class,
+                type_args: environment_types,
+                class_span: span,
+                args: captures.iter().map(|n| variable(n, span)).collect(),
                 span,
-            )],
+            }),
             span,
-        })));
-        Ok(Expr::Call {
-            fallback: None,
-            callee: factory,
-            callee_span: span,
-            type_args: vec![],
-            args: captures
-                .iter()
-                .map(|n| variable(if n == BOUND_RECEIVER { "this" } else { n }, span))
-                .collect(),
-            span,
-        })
+        )];
+        let args = captures
+            .iter()
+            .map(|n| variable(if n == BOUND_RECEIVER { "this" } else { n }, span))
+            .collect();
+        if lexical_params.is_empty() {
+            self.generated_items.push(Stmt::FnDecl(Box::new(FnDecl {
+                is_async: false,
+                type_params: capture_types,
+                bounds: vec![],
+                name: factory.clone(),
+                name_span: span,
+                params: capture_params,
+                ret: Some(class_ty),
+                body: factory_body,
+                span,
+            })));
+            Ok(Expr::Call {
+                fallback: None,
+                callee: factory,
+                callee_span: span,
+                type_args: vec![],
+                args,
+                span,
+            })
+        } else {
+            // Bind the known lexical arguments on a class, then infer capture
+            // arguments on its factory method. This also handles type-only
+            // parameters which cannot be inferred from any captured value.
+            let carrier = format!("$closure_scope${id}");
+            self.generated_items
+                .push(Stmt::ClassDecl(Box::new(ClassDecl {
+                    name: carrier.clone(),
+                    name_span: span,
+                    type_params: lexical_params,
+                    bounds: lexical_bounds,
+                    is_trait: false,
+                    trait_uses: vec![],
+                    is_interface: false,
+                    interfaces: vec![],
+                    is_abstract: false,
+                    extends: None,
+                    members: vec![ClassMember::Method(MethodDecl {
+                        is_async: false,
+                        type_params: capture_types,
+                        bounds: vec![],
+                        is_static: true,
+                        is_abstract: false,
+                        visibility: Visibility::Public,
+                        name: factory.clone(),
+                        name_span: span,
+                        params: capture_params,
+                        ret: Some(class_ty),
+                        body: factory_body,
+                        span,
+                    })],
+                    span,
+                })));
+            Ok(Expr::StaticCall {
+                class_name: carrier,
+                type_args: lexical_types,
+                method: factory,
+                method_type_args: vec![],
+                args,
+                span,
+            })
+        }
     }
 }

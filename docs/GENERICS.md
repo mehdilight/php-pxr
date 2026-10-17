@@ -73,6 +73,15 @@ instantiated, and unused templates emit no native function. This is a template
 model: operations must be valid for each concrete instantiation. Declared bounds
 are checked before accepting an instantiation.
 
+## Closures in generic scopes
+
+Closures and arrow functions retain enclosing function, class and method type
+parameters, including their bounds and parameters used only in annotations.
+They may escape, nest, and execute asynchronously without losing those types.
+This binds existing lexical parameters; it does not introduce generic closure
+invocation syntax. See [CALLABLES.md](CALLABLES.md) and
+[generic_closures.php](../examples/generic_closures.php).
+
 ## Async generic functions
 
 Generic functions and methods can be async with explicit or inferred completed-result types:

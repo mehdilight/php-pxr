@@ -4572,11 +4572,6 @@ fn unsupported_closure_aliases_and_binding_fail_explicitly() {
             "reference captures",
         ),
         (
-            "closure_generic_method_scope",
-            "<?php class C { public function make<T>(T $value) { return fn() => $value; } }",
-            "lexical type binding",
-        ),
-        (
             "closure_this",
             "<?php $f=fn() => $this;",
             "bound closure receivers",
@@ -4691,7 +4686,6 @@ fn bound_closure_scope_rejects_missing_receivers_and_unrelated_private_access() 
         ("static_closure_this", "<?php class C { public int $x=1; public function make() { return static fn(): int => $this->x; } } $f=(new C())->make();", "E0268"),
         ("closure_in_static_method_this", "<?php class C { public int $x=1; public static function make() { return fn(): int => $this->x; } } $f=C::make();", "E0268"),
         ("closure_unrelated_private", "<?php class Other { private int $x=1; } class C { public function make(Other $o) { return fn(): int => $o->x; } } $f=(new C())->make(new Other());", "E0265"),
-        ("generic_class_closure", "<?php class C<T> { public function make() { return fn(): int => 1; } }", "lexical type binding"),
         ("static_trait_closure", "<?php trait T { public function make() { return static fn(): int => 1; } }", "static trait closure scope"),
     ] {
         let path = temp_php(name, source);
@@ -4786,4 +4780,132 @@ fn async_closures_do_not_enable_async_user_magic_or_synchronous_await() {
         assert_eq!(run.code, 1, "{name}: {}", run.stderr);
         assert!(run.stderr.contains(diagnostic), "{name}: {}", run.stderr);
     }
+}
+
+#[test]
+fn generic_function_closures_bind_type_only_parameters_and_nested_bodies() {
+    let path = temp_php(
+        "generic_function_closures",
+        r#"<?php
+class ClosureBox<T> { public T $value; public function __construct(T $value) { $this->value=$value; } }
+function identity<T>() { return fn(T $value): T => $value; }
+function snapshot<T>(T $value) { return function(T $fallback) use ($value): T { return $value; }; }
+function nested<T>() { return fn(array<T> $values) => fn(T $value): array<T> => [$values[0], $value]; }
+function boxed<T>() { return function(T $value): ClosureBox<T> { $local: T = $value; return new ClosureBox<T>($local); }; }
+function action<T>() { return function(T $value): void { echo $value, "\n"; }; }
+$integer=identity<int>(); $text=identity<string>(); $mixed=identity<mixed>();
+echo $integer(42), ":", $text("text"), ":", strval($mixed("mixed")), "\n";
+$kept=snapshot([1,2]); $copy=$kept([9]); $copy[0]=99; $again=$kept([8]);
+echo $again[0], ":", $copy[0], "\n";
+$outer=nested<string>(); $inner=$outer(["outer"]); $values=$inner("inner");
+echo $values[0], ":", $values[1], "\n";
+$box=boxed<string>(); echo $box("boxed")->value, "\n";
+$print=action<string>(); $print("action");
+"#,
+    );
+    let run = run_ok(&["run", path.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(
+        run.stdout,
+        "42:text:mixed\n1:99\nouter:inner\nboxed\naction\n"
+    );
+}
+
+#[test]
+fn generic_class_closures_preserve_self_parent_and_inherited_dispatch() {
+    let path = temp_php(
+        "generic_class_closures",
+        r#"<?php
+namespace LexicalGeneric;
+class Ancestor<T> { public T $value; public function __construct(T $value) { $this->value=$value; } }
+class Factory<T> extends Ancestor<array<T>> {
+    private T $seed;
+    public function __construct(T $seed) { $this->seed=$seed; parent::__construct([$seed]); }
+    protected function marker(): int { return 1; }
+    public function callback() { return fn(T $value): T => $this->seed; }
+    public function dispatch() { return fn(): int => $this->marker(); }
+    public function ownType() { return static fn(self $value): self => $value; }
+    public function parentType() { return static fn(parent $value): parent => $value; }
+    public static function identity() { return static fn(T $value): T => $value; }
+    public function method<U>() { return fn(U $value): U => $value; }
+    public static function staticMethod<U>() { return static fn(array<U> $value): array<U> => $value; }
+    public function nested<U>(U $seed) { return fn(T $value) => fn(U $other): U => $seed; }
+}
+class Child extends Factory<int> { protected function marker(): int { return 10; } }
+$owner=new Child(7);
+$callback=$owner->callback(); $dispatch=$owner->dispatch();
+$own=$owner->ownType(); $parent=$owner->parentType();
+echo $callback(9), ":", $dispatch(), ":", $own(new Factory<int>(8))->value[0], ":", $parent(new Ancestor<array<int>>([9]))->value[0], "\n";
+$id=Factory<string>::identity(); $method=$owner->method<string>();
+$static=Factory<int>::staticMethod<string>(); $values=$static(["static"]);
+$outer=$owner->nested("nested"); $inner=$outer(0);
+echo $id("identity"), ":", $method("method"), ":", $values[0], ":", $inner("ignored"), "\n";
+"#,
+    );
+    let run = run_ok(&["run", path.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "7:10:8:9\nidentity:method:static:nested\n");
+}
+
+#[test]
+fn generic_closure_bounds_and_trait_method_scopes_remain_concrete() {
+    let path = temp_php(
+        "generic_closure_bounds",
+        r#"<?php
+interface Value<T> { public function get(): T; }
+class TextValue implements Value<string> { public function get(): string { return "bounded"; } }
+function reader<T: Value<U>, U>() { return fn(T $value): U => $value->get(); }
+class Reader<T: Value<U>, U> { public function make() { return fn(T $value): U => $value->get(); } }
+trait FactoryTrait { public function make<T>(T $seed) { return fn(T $value): T => $seed; } }
+class First { use FactoryTrait; }
+class Second { use FactoryTrait; }
+$read=reader<TextValue,string>();
+$method=(new Reader<TextValue,string>())->make();
+$first=(new First())->make(7); $second=(new Second())->make("trait");
+echo $read(new TextValue()), ":", $method(new TextValue()), ":", $first(9), ":", $second("ignored"), "\n";
+"#,
+    );
+    let run = run_ok(&["run", path.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "bounded:bounded:7:trait\n");
+}
+
+#[test]
+fn generic_closure_annotations_do_not_erase_argument_return_or_bound_checks() {
+    for (name,source,diagnostic) in [
+        ("generic_closure_wrong_arg", "<?php function make<T>() { return fn(T $x): T => $x; } $f=make<int>(); $f(\"wrong\");", "E0208"),
+        ("generic_closure_wrong_return", "<?php function make<T>() { return fn(T $x): T => \"wrong\"; } $f=make<int>(); $f(1);", "E0215"),
+        ("generic_class_closure_wrong_arg", "<?php class C<T> { public function make() { return fn(T $x): T => $x; } } $f=(new C<int>())->make(); $f(\"wrong\");", "E0208"),
+        ("generic_closure_wrong_bound", "<?php interface I { public function value(): int; } function make<T:I>() { return fn(T $x): int => $x->value(); } $f=make<int>();", "E0286"),
+    ] {
+        let path=temp_php(name,source);
+        let run=run_ok(&["check",path.to_str().unwrap()]);
+        assert_eq!(run.code,1,"{name}: {}",run.stderr);
+        assert!(run.stderr.contains(diagnostic),"{name}: {}",run.stderr);
+    }
+}
+
+#[test]
+fn generic_closure_environments_keep_module_scopes_and_symbols_distinct() {
+    let path = temp_php(
+        "generic_closure_modules",
+        r#"<?php
+namespace App;
+use function First\make as first;
+use function Second\make as second;
+require __DIR__ . '/first.php';
+require __DIR__ . '/second.php';
+$first=first("kept"); $second=second("ignored");
+echo $first("unused"), ":", $second("argument"), "\n";
+"#,
+    );
+    std::fs::write(
+        path.parent().unwrap().join("first.php"),
+        r#"<?php namespace First; function make<T>(T $seed) { return fn(T $value): T => $seed; }"#,
+    )
+    .unwrap();
+    std::fs::write(path.parent().unwrap().join("second.php"),r#"<?php namespace Second; function make<T>(T $seed) { return fn(T $value): T => $value; }"#).unwrap();
+    let run = run_ok(&["run", path.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "kept:argument\n");
 }

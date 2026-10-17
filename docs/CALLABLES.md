@@ -30,7 +30,7 @@ Closures in ordinary class methods retain their instance receiver, including
 when the body does not read `$this`. Bodies execute with the declaring class's
 visibility and `self`/`parent` context. Inherited and nested closures keep that
 scope while ordinary virtual calls still dispatch to overrides. Instance trait
-methods preserve the consuming class's scope. In non-generic classes, parameter
+methods preserve the consuming class's scope. In ordinary and generic classes, parameter
 and return annotations may use `self` and `parent`, including inside native
 container and ownership types. `self` names the declaring class even when the
 factory is inherited; `parent` names its declared parent.
@@ -49,12 +49,33 @@ echo $format("value"), "\n";
 
 `static function (...) { ... }` and `static fn(...) => ...` do not retain an
 instance receiver. They retain ordinary class visibility, including `self::`
-access in non-generic classes. A closure created in a static method also has no
+access in ordinary and generic classes. A closure created in a static method also has no
 `$this`. Creating a closure after an await in an async method is
 supported; the returned environment outlives the creating frame. Owned parameters/returns and
 read/exclusive borrow parameters keep their normal contracts through invocation;
 forwarding moves owners and reborrows borrowed parameters. Inferred `void` is
 forwarded as a call followed by a bare return.
+
+## Enclosing generic types
+
+Closures in generic functions, classes and methods retain enclosing type
+parameters and their bounds. This includes parameters used only in annotations,
+without a captured value from which to infer them. Nested and async closures
+keep those bindings after the creating frame returns. `self` includes the
+declaring class's type arguments; `parent` keeps its declared type arguments.
+
+```php
+function identity<T>() {
+    return fn(T $value): T => $value;
+}
+$integer = identity<int>();
+echo $integer(42), "\n";
+```
+
+Each enclosing specialization creates a concrete closure type. Invocation still
+checks concrete argument/return types and ownership modes. The closure itself
+does not declare method-level type parameters. This uses PXR generics and does
+not execute in PHP; see [generic_closures.php](../examples/generic_closures.php).
 
 ## Async closures
 
@@ -103,9 +124,7 @@ See [callback_objects.php](../examples/callback_objects.php) and
 - Implicit receiver capture from an owned or borrowed receiver is rejected,
   even if the closure body does not read `$this`. Static closures can escape an
   owned receiver because they do not capture it.
-- Closures in generic class/method scope and annotations using enclosing generic
-  types remain rejected until generic lexical type binding is supplied.
-  Static closures and lexical `self`/`parent` annotations in trait scope also
+- Static closures and lexical `self`/`parent` annotations in trait scope
   remain rejected. `parent` requires a declared parent class.
 - Callable strings/arrays, first-class callable references,
   `callable`/`Closure` annotations and Closure reflection/binding APIs are not
