@@ -37,8 +37,7 @@ pub fn parse(src: &str) -> (Option<Program>, Diagnostics) {
 pub fn parse_at(src: &str, offset: usize) -> (Option<Program>, Diagnostics) {
     let (mut toks, lex_diags) = pxr_lexer::lex(src);
     for token in &mut toks {
-        token.span.start += offset;
-        token.span.end += offset;
+        token.shift(offset);
     }
     let mut shifted = Diagnostics::new();
     for diag in lex_diags.items() {
@@ -1164,75 +1163,11 @@ impl Parser {
             }
         }
 
-        let lhs = self.parse_expr()?;
-        match self.peek().kind.clone() {
-            TokenKind::Assign => {
-                self.advance();
-                let value = self.parse_expr()?;
-                let span = start.merge(value.span());
-                let target = self.expr_to_lvalue(lhs)?;
-                Ok(Stmt::Assign {
-                    target,
-                    ty: None,
-                    value,
-                    span,
-                })
-            }
-            TokenKind::PlusEq
-            | TokenKind::MinusEq
-            | TokenKind::StarEq
-            | TokenKind::SlashEq
-            | TokenKind::PercentEq
-            | TokenKind::DotEq
-            | TokenKind::AmpEq
-            | TokenKind::PipeEq
-            | TokenKind::CaretEq
-            | TokenKind::ShlEq
-            | TokenKind::ShrEq
-            | TokenKind::CoalesceEq => {
-                let op = match self.peek().kind {
-                    TokenKind::PlusEq => BinOp::Add,
-                    TokenKind::MinusEq => BinOp::Sub,
-                    TokenKind::StarEq => BinOp::Mul,
-                    TokenKind::SlashEq => BinOp::Div,
-                    TokenKind::PercentEq => BinOp::Mod,
-                    TokenKind::DotEq => BinOp::Concat,
-                    TokenKind::AmpEq => BinOp::BitAnd,
-                    TokenKind::PipeEq => BinOp::BitOr,
-                    TokenKind::CaretEq => BinOp::BitXor,
-                    TokenKind::ShlEq => BinOp::Shl,
-                    TokenKind::ShrEq => BinOp::Shr,
-                    TokenKind::CoalesceEq => BinOp::NullCoalesce,
-                    _ => unreachable!(),
-                };
-                self.advance();
-                let value = self.parse_expr()?;
-                let span = start.merge(value.span());
-                let target = self.expr_to_lvalue(lhs)?;
-                Ok(Stmt::AssignOp {
-                    target,
-                    op,
-                    value,
-                    span,
-                })
-            }
-            TokenKind::PlusPlus | TokenKind::MinusMinus => {
-                let delta = if self.peek().kind == TokenKind::PlusPlus {
-                    1
-                } else {
-                    -1
-                };
-                let op_tok = self.advance();
-                let span = start.merge(op_tok.span);
-                let target = self.expr_to_lvalue(lhs)?;
-                Ok(Stmt::IncDec {
-                    target,
-                    delta,
-                    span,
-                })
-            }
-            _ => Ok(Stmt::Expr(lhs, start)),
-        }
+        let expression = self.parse_expr()?;
+        Ok(match expression {
+            Expr::Effect { statement, .. } => *statement,
+            other => Stmt::Expr(other, start),
+        })
     }
 
     /// Convert a parsed expression to an assignment target, reporting an error
@@ -1424,7 +1359,52 @@ impl Parser {
     // ---- Expressions (precedence climbing) --------------------------------
 
     fn parse_expr(&mut self) -> Result<Expr, ()> {
-        self.parse_ternary()
+        let lhs = self.parse_ternary()?;
+        self.parse_assignment_tail(lhs)
+    }
+
+    // PHP permits a writable operand to start an assignment even when it is
+    // the RHS of a tighter-binding operator (`1 + $x = 2`, `$a ?? $b = 3`).
+    fn parse_assignment_tail(&mut self, lhs: Expr) -> Result<Expr, ()> {
+        let op = match self.peek().kind {
+            TokenKind::Assign => None,
+            TokenKind::PlusEq => Some(BinOp::Add),
+            TokenKind::MinusEq => Some(BinOp::Sub),
+            TokenKind::StarEq => Some(BinOp::Mul),
+            TokenKind::SlashEq => Some(BinOp::Div),
+            TokenKind::PercentEq => Some(BinOp::Mod),
+            TokenKind::DotEq => Some(BinOp::Concat),
+            TokenKind::AmpEq => Some(BinOp::BitAnd),
+            TokenKind::PipeEq => Some(BinOp::BitOr),
+            TokenKind::CaretEq => Some(BinOp::BitXor),
+            TokenKind::ShlEq => Some(BinOp::Shl),
+            TokenKind::ShrEq => Some(BinOp::Shr),
+            TokenKind::CoalesceEq => Some(BinOp::NullCoalesce),
+            _ => return Ok(lhs),
+        };
+        self.advance();
+        let rhs = self.parse_expr()?;
+        let span = lhs.span().merge(rhs.span());
+        let target = self.expr_to_lvalue(lhs)?;
+        let statement = match op {
+            None => Stmt::Assign {
+                target,
+                ty: None,
+                value: rhs,
+                span,
+            },
+            Some(op) => Stmt::AssignOp {
+                target,
+                op,
+                value: rhs,
+                span,
+            },
+        };
+        Ok(Expr::Effect {
+            statement: Box::new(statement),
+            postfix: false,
+            span,
+        })
     }
 
     /// `cond ? then : else` and the short form `cond ?: else`.
@@ -1511,6 +1491,25 @@ impl Parser {
     fn parse_unary(&mut self) -> Result<Expr, ()> {
         let start = self.peek().span;
         match self.peek().kind {
+            TokenKind::PlusPlus | TokenKind::MinusMinus => {
+                let delta = if self.advance().kind == TokenKind::PlusPlus {
+                    1
+                } else {
+                    -1
+                };
+                let expr = self.parse_unary()?;
+                let span = start.merge(expr.span());
+                let target = self.expr_to_lvalue(expr)?;
+                Ok(Expr::Effect {
+                    statement: Box::new(Stmt::IncDec {
+                        target,
+                        delta,
+                        span,
+                    }),
+                    postfix: false,
+                    span,
+                })
+            }
             TokenKind::Await | TokenKind::Spawn => {
                 let op = self.advance();
                 let value = self.parse_unary()?;
@@ -1593,7 +1592,30 @@ impl Parser {
     fn parse_postfix(&mut self) -> Result<Expr, ()> {
         let mut base = self.parse_primary()?;
         loop {
-            if self.at(&TokenKind::LBracket) {
+            if self.eat(&TokenKind::LParen) {
+                let name_span = base.span();
+                let mut args = Vec::new();
+                if !self.at(&TokenKind::RParen) {
+                    loop {
+                        args.push(self.parse_expr()?);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                let close = self.expect(&TokenKind::RParen, "`)` after callable arguments")?;
+                let span = base.span().merge(close.span);
+                // Invokable objects share ordinary checked method dispatch,
+                // receiver evaluation, ownership and GC handling.
+                base = Expr::MethodCall {
+                    base: Box::new(base),
+                    name: "__invoke".into(),
+                    name_span,
+                    type_args: Vec::new(),
+                    args,
+                    span,
+                };
+            } else if self.at(&TokenKind::LBracket) {
                 self.advance();
                 let index = if self.at(&TokenKind::RBracket) {
                     None
@@ -1653,11 +1675,32 @@ impl Parser {
                         span,
                     };
                 }
+            } else if matches!(
+                self.peek().kind,
+                TokenKind::PlusPlus | TokenKind::MinusMinus
+            ) {
+                let token = self.advance();
+                let delta = if token.kind == TokenKind::PlusPlus {
+                    1
+                } else {
+                    -1
+                };
+                let span = base.span().merge(token.span);
+                let target = self.expr_to_lvalue(base)?;
+                return Ok(Expr::Effect {
+                    statement: Box::new(Stmt::IncDec {
+                        target,
+                        delta,
+                        span,
+                    }),
+                    postfix: true,
+                    span,
+                });
             } else {
                 break;
             }
         }
-        Ok(base)
+        self.parse_assignment_tail(base)
     }
 
     fn parse_qualified_member(
@@ -1734,7 +1777,7 @@ impl Parser {
             }
             TokenKind::InterpStr(parts) => {
                 self.advance();
-                Ok(interpolated_string(parts, span))
+                self.interpolated_string(parts, span)
             }
             TokenKind::True => {
                 self.advance();
@@ -2014,21 +2057,45 @@ fn bin_op(k: &TokenKind) -> Option<(BinOp, u8)> {
 /// The chain always begins from an empty string literal so the expression is
 /// string-typed and the first dynamic part undergoes exactly the same
 /// conversion as PHP's `"$x"` (e.g. `true` -> `"1"`, `5` -> `"5"`).
-fn interpolated_string(parts: Vec<StrPart>, span: Span) -> Expr {
-    let mut acc = Expr::StrLit(Vec::new(), span);
-    for part in parts {
-        let rhs = match part {
-            StrPart::Lit(bytes) => Expr::StrLit(bytes, span),
-            StrPart::Var(name) => Expr::Var(name, span),
-        };
-        acc = Expr::Binary {
-            op: BinOp::Concat,
-            lhs: Box::new(acc),
-            rhs: Box::new(rhs),
-            span,
-        };
+impl Parser {
+    fn interpolated_string(&mut self, parts: Vec<StrPart>, span: Span) -> Result<Expr, ()> {
+        let mut acc = Expr::StrLit(Vec::new(), span);
+        for part in parts {
+            let rhs = match part {
+                StrPart::Lit(bytes) => Expr::StrLit(bytes, span),
+                StrPart::Var(name) => Expr::Var(name, span),
+                StrPart::Expression(tokens) => {
+                    let outer_tokens = std::mem::replace(&mut self.toks, tokens);
+                    let outer_pos = std::mem::replace(&mut self.pos, 0);
+                    let result = self.parse_postfix();
+                    let complete = self.at(&TokenKind::Eof);
+                    self.toks = outer_tokens;
+                    self.pos = outer_pos;
+                    let expression = result?;
+                    if !complete
+                        || !matches!(
+                            expression,
+                            Expr::Var(..)
+                                | Expr::Index { .. }
+                                | Expr::Property { .. }
+                                | Expr::MethodCall { .. }
+                        )
+                    {
+                        self.diags.emit(Diagnostic::error("braced interpolation requires a variable, array access or property/method access").with_code("E0008").with_span(expression.span()));
+                        return Err(());
+                    }
+                    expression
+                }
+            };
+            acc = Expr::Binary {
+                op: BinOp::Concat,
+                lhs: Box::new(acc),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(acc)
     }
-    acc
 }
 
 #[cfg(test)]

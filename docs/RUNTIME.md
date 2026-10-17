@@ -327,6 +327,18 @@ sweeping any buffers. Dead copies therefore stop forcing separation after
 collection. Unused entry capacity is zeroed so buffer tracing cannot retain stale
 values. Helpers that mutate nested request data separate the parent before
 descending into a child.
+Keyed foreach reads entries by insertion position through `pxr_array_key_at`,
+which boxes the normalized integer/string key. Mixed key access validates the
+tag before extracting the integer or byte-string payload.
+
+Nested writes prepare receiver/key values once, then read current containers
+and copy modified headers during write-back. `pxr_array_child_or_new` and
+`pxr_mixed_array_or_new` create unattached arrays for missing/null parents;
+the completed write publishes them. `pxr_array_isset` distinguishes an absent
+or boxed-null entry for lazy coalescing assignment. These allocating/read helpers
+remain GC safepoints; only the nonallocating mixed key extractors are leaf calls.
+Prepared values are rooted and preserved in async frames across an awaited RHS.
+
 Canonical decimal‑integer string keys are normalised to integer keys inside
 `pxr_array_set`/`_get_bits`/`_has`, matching PHP (`$a["1"]` ≡ `$a[1]`).
 

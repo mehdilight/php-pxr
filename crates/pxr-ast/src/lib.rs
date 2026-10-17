@@ -180,6 +180,42 @@ impl Stmt {
         }
     }
 
+    /// Expressions evaluated directly by this statement (excluding nested bodies).
+    pub fn expressions(&self) -> Vec<&Expr> {
+        match self {
+            Stmt::Echo(es, _) => es.iter().collect(),
+            Stmt::Print(e, _) | Stmt::Expr(e, _) | Stmt::Return(Some(e), _) => vec![e],
+            Stmt::Assign { target, value, .. } | Stmt::AssignOp { target, value, .. } => {
+                let mut es = target.expressions();
+                es.push(value);
+                es
+            }
+            Stmt::IncDec { target, .. } => target.expressions(),
+            Stmt::If { cond, elifs, .. } => {
+                let mut es = vec![cond];
+                es.extend(elifs.iter().map(|(e, _)| e));
+                es
+            }
+            Stmt::While { cond, .. } | Stmt::DoWhile { cond, .. } => vec![cond],
+            Stmt::For { cond, .. } => cond.iter().collect(),
+            Stmt::Foreach { subject, .. } => vec![subject],
+            Stmt::Switch { subject, cases, .. } => {
+                let mut es = vec![subject];
+                es.extend(cases.iter().filter_map(|c| c.test.as_ref()));
+                es
+            }
+            Stmt::Return(None, _)
+            | Stmt::FnDecl(_)
+            | Stmt::ClassDecl(_)
+            | Stmt::PhpInclude { .. }
+            | Stmt::Require { .. }
+            | Stmt::Break(..)
+            | Stmt::Continue(..)
+            | Stmt::Block(..)
+            | Stmt::Empty => vec![],
+        }
+    }
+
     pub fn span(&self) -> Span {
         match self {
             Stmt::Echo(_, sp)
@@ -245,6 +281,18 @@ pub enum LValue {
 }
 
 impl LValue {
+    pub fn expressions(&self) -> Vec<&Expr> {
+        match self {
+            Self::Index { base, index, .. } => {
+                let mut es = base.expressions();
+                es.extend(index.as_deref());
+                es
+            }
+            Self::Property { base, .. } => vec![base],
+            Self::Var { .. } | Self::StaticProperty { .. } => vec![],
+        }
+    }
+
     pub fn span(&self) -> Span {
         match self {
             LValue::Var { span, .. } => *span,
@@ -447,6 +495,11 @@ impl BinOp {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
+    Effect {
+        statement: Box<Stmt>,
+        postfix: bool,
+        span: Span,
+    },
     IntLit(i64, Span),
     FloatLit(f64, Span),
     StrLit(Vec<u8>, Span),
@@ -569,6 +622,58 @@ pub struct MatchArm {
 }
 
 impl Expr {
+    /// Direct child expressions, including expressions in an effect's target.
+    pub fn children(&self) -> Vec<&Expr> {
+        match self {
+            Self::Effect { statement, .. } => statement.expressions(),
+            Self::Unary { expr, .. } | Self::Instanceof { expr, .. } | Self::Paren(expr, _) => {
+                vec![expr]
+            }
+            Self::Binary { lhs, rhs, .. } => vec![lhs, rhs],
+            Self::Ternary {
+                cond,
+                then,
+                else_branch,
+                ..
+            } => {
+                let mut es = vec![cond.as_ref()];
+                es.extend(then.as_deref());
+                es.push(else_branch);
+                es
+            }
+            Self::Index { base, index, .. } => {
+                let mut es = vec![base.as_ref()];
+                es.extend(index.as_deref());
+                es
+            }
+            Self::ArrayLit { items, .. } => items
+                .iter()
+                .flat_map(|i| i.key.iter().chain(std::iter::once(&i.value)))
+                .collect(),
+            Self::Match { subject, arms, .. } => std::iter::once(subject.as_ref())
+                .chain(
+                    arms.iter()
+                        .flat_map(|a| a.conds.iter().chain(std::iter::once(&a.result))),
+                )
+                .collect(),
+            Self::Call { args, .. }
+            | Self::New { args, .. }
+            | Self::StaticCall { args, .. }
+            | Self::ParentMethodCall { args, .. } => args.iter().collect(),
+            Self::MethodCall { base, args, .. } => {
+                std::iter::once(base.as_ref()).chain(args.iter()).collect()
+            }
+            Self::Property { base, .. } => vec![base],
+            Self::IntLit(..)
+            | Self::FloatLit(..)
+            | Self::StrLit(..)
+            | Self::BoolLit(..)
+            | Self::NullLit(..)
+            | Self::Var(..)
+            | Self::StaticProperty { .. } => vec![],
+        }
+    }
+
     pub fn span(&self) -> Span {
         match self {
             Expr::IntLit(_, s)
@@ -578,7 +683,8 @@ impl Expr {
             | Expr::NullLit(s)
             | Expr::Var(_, s)
             | Expr::Paren(_, s) => *s,
-            Expr::Unary { span, .. }
+            Expr::Effect { span, .. }
+            | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Ternary { span, .. }
             | Expr::Index { span, .. }

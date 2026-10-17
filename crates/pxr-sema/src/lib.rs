@@ -263,6 +263,11 @@ pub enum Callee {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TExpr {
+    Effect {
+        statement: Box<TStmt>,
+        postfix: bool,
+        ty: Ty,
+    },
     /// Internal inference placeholder; never reaches IR generation.
     Deferred,
     /// Ownership-checked argument: transfer/borrow without PHP array copying.
@@ -370,6 +375,7 @@ pub struct TArm {
 impl TExpr {
     pub fn ty(&self) -> Ty {
         match self {
+            TExpr::Effect { ty, .. } => ty.clone(),
             TExpr::Deferred => Ty::Infer,
             TExpr::Pass { expr, .. } => expr.ty(),
             TExpr::Coerce { ty, .. } => ty.clone(),
@@ -414,6 +420,13 @@ pub enum TTarget {
         key: Box<TExpr>,
         key_ty: Ty,
     },
+    /// An array element reached through another writable array/property.
+    Nested {
+        parent: Box<TTarget>,
+        array_ty: Ty,
+        elem_ty: Ty,
+        key: Option<(Box<TExpr>, Ty)>,
+    },
     /// `base[] = ...` (push).
     Push {
         base: Box<TExpr>,
@@ -433,7 +446,9 @@ impl TTarget {
         match self {
             Self::MixedVar { .. } => Ty::Mixed,
             Self::Var { ty, .. } | Self::Property { ty, .. } => ty.clone(),
-            Self::Index { elem_ty, .. } | Self::Push { elem_ty, .. } => elem_ty.clone(),
+            Self::Index { elem_ty, .. }
+            | Self::Push { elem_ty, .. }
+            | Self::Nested { elem_ty, .. } => elem_ty.clone(),
         }
     }
 }
@@ -444,6 +459,7 @@ const SCALAR_MASK: u8 = 15;
 const VALUE_MASK: u8 = 127; // Scalars, null, arrays, and objects.
 #[derive(Clone, Debug)]
 struct FlowState {
+    initialized: std::collections::HashSet<u32>,
     types: HashMap<u32, u8>,
     named: HashMap<u32, String>,
     reachable: bool,
@@ -451,6 +467,7 @@ struct FlowState {
 impl Default for FlowState {
     fn default() -> Self {
         Self {
+            initialized: std::collections::HashSet::new(),
             types: HashMap::new(),
             named: HashMap::new(),
             reachable: true,
@@ -487,6 +504,14 @@ impl FlowState {
         let paths: Vec<_> = paths.iter().filter(|p| p.reachable).collect();
         let mut result = Self::default();
         result.reachable = !paths.is_empty();
+        if let Some(first) = paths.first() {
+            result.initialized = first
+                .initialized
+                .iter()
+                .copied()
+                .filter(|slot| paths.iter().all(|p| p.initialized.contains(slot)))
+                .collect();
+        }
         for slot in paths.iter().flat_map(|p| p.types.keys()) {
             result
                 .types
@@ -694,6 +719,7 @@ pub enum TStmt {
     Foreach {
         base: TExpr,
         base_ty: Ty,
+        key_slot: Option<u32>,
         value_slot: u32,
         value_ty: Ty,
         body: Vec<TStmt>,
@@ -862,6 +888,7 @@ impl FnCtx {
         let slot = self.slots.len() as u32;
         self.slots.push(ty);
         self.vars.insert(name.to_string(), slot);
+        self.flow.initialized.insert(slot);
         slot
     }
 
@@ -2711,24 +2738,31 @@ impl Analyzer {
                 else_branch,
                 ..
             } => {
-                let incoming = ctx.flow.clone();
                 let cond_t = self.infer(cond, ctx)?;
+                let incoming = ctx.flow.clone();
                 let cond_ty = cond_t.ty();
                 self.expect_truthy(&cond_ty, cond.span());
                 ctx.flow = incoming.condition(&cond_t, true);
+                invalidate_expression_writes(cond, ctx);
                 let then_t = self.analyze_stmts(then_branch, ctx);
                 let mut paths = vec![ctx.flow.clone()];
-                let mut pending = incoming.condition(&cond_t, false);
+                ctx.flow = incoming.condition(&cond_t, false);
+                invalidate_expression_writes(cond, ctx);
+                let mut pending = ctx.flow.clone();
                 let mut elifs_t = Vec::new();
                 for (c, b) in elifs {
                     ctx.flow = pending.clone();
                     let ct = self.infer(c, ctx)?;
                     let cty = ct.ty();
                     self.expect_truthy(&cty, c.span());
+                    pending = ctx.flow.clone();
                     ctx.flow = pending.condition(&ct, true);
+                    invalidate_expression_writes(c, ctx);
                     let bt = self.analyze_stmts(b, ctx);
                     paths.push(ctx.flow.clone());
-                    pending = pending.condition(&ct, false);
+                    ctx.flow = pending.condition(&ct, false);
+                    invalidate_expression_writes(c, ctx);
+                    pending = ctx.flow.clone();
                     elifs_t.push((ct, cty, bt));
                 }
                 ctx.flow = pending;
@@ -2745,11 +2779,13 @@ impl Analyzer {
             }
             ast::Stmt::While { cond, body, .. } => {
                 invalidate_writes(body, ctx);
-                let incoming = ctx.flow.clone();
+                invalidate_expression_writes(cond, ctx);
                 let cond_t = self.infer(cond, ctx)?;
+                let incoming = ctx.flow.clone();
                 let cond_ty = cond_t.ty();
                 self.expect_truthy(&cond_ty, cond.span());
                 ctx.flow = incoming.condition(&cond_t, true);
+                invalidate_expression_writes(cond, ctx);
                 ctx.loop_depth += 1;
                 let body_t = self.analyze_stmts(body, ctx);
                 ctx.loop_depth -= 1;
@@ -2769,6 +2805,7 @@ impl Analyzer {
             } => self.analyze_for(init, cond, update, body, ctx),
             ast::Stmt::DoWhile { body, cond, .. } => {
                 invalidate_writes(body, ctx);
+                invalidate_expression_writes(cond, ctx);
                 let incoming = ctx.flow.clone();
                 ctx.loop_depth += 1;
                 let body_t = self.analyze_stmts(body, ctx);
@@ -2843,7 +2880,10 @@ impl Analyzer {
         let init_t = self.analyze_stmts(init, ctx);
         invalidate_writes(body, ctx);
         invalidate_writes(update, ctx);
-        let incoming = ctx.flow.clone();
+        for c in cond {
+            invalidate_expression_writes(c, ctx);
+        }
+        let mut incoming = ctx.flow.clone();
         let mut cond_t = None;
         if !cond.is_empty() {
             if cond.len() > 1 {
@@ -2858,8 +2898,12 @@ impl Analyzer {
             self.expect_truthy(&cty, cond[0].span());
             cond_t = Some((c, cty));
         }
+        incoming.initialized = ctx.flow.initialized.clone();
         if let Some((condition, _)) = &cond_t {
             ctx.flow = incoming.condition(condition, true);
+            for c in cond {
+                invalidate_expression_writes(c, ctx);
+            }
         }
         ctx.loop_depth += 1;
         let body_t = self.analyze_stmts(body, ctx);
@@ -2870,6 +2914,9 @@ impl Analyzer {
             incoming.clone()
         };
         invalidate_writes(body, ctx);
+        for c in cond {
+            invalidate_expression_writes(c, ctx);
+        }
         let update_t = self.analyze_stmts(update, ctx);
         ctx.flow = incoming;
         Some(TStmt::For {
@@ -2899,16 +2946,6 @@ impl Analyzer {
             );
             return None;
         }
-        if key.is_some() {
-            self.diags.emit(
-                Diagnostic::error(
-                    "`foreach` with a key variable is not implemented yet; iterate with an index and `count()` instead",
-                )
-                .with_code("E0242")
-                .with_span(key_span),
-            );
-            return None;
-        }
         let subj = self.infer(subject, ctx)?;
         let sty = subj.ty();
         let elem = match sty.array_elem() {
@@ -2932,6 +2969,18 @@ impl Analyzer {
                 return None;
             }
         };
+        let before_bindings = ctx.flow.initialized.clone();
+        let key_slot = key.map(|name| match ctx.slot_of(name) {
+            Some(slot) => {
+                if ctx.slot_ty(slot) != Ty::Mixed {
+                    self.diags.emit(Diagnostic::error(format!(
+                        "foreach key variable `${name}` must use mixed storage for integer/string keys"
+                    )).with_code("E0242").with_span(key_span));
+                }
+                slot
+            }
+            None => ctx.declare(name, Ty::Mixed),
+        });
         let vslot = match ctx.slot_of(value) {
             Some(s) => {
                 let existing = ctx.slot_ty(s);
@@ -2950,7 +2999,15 @@ impl Analyzer {
         };
         invalidate_writes(body, ctx);
         ctx.flow.forget(vslot);
-        let incoming = ctx.flow.clone();
+        if let Some(slot) = key_slot {
+            ctx.flow.forget(slot);
+        }
+        let mut incoming = ctx.flow.clone();
+        incoming.initialized = before_bindings;
+        ctx.flow.initialized.insert(vslot);
+        if let Some(slot) = key_slot {
+            ctx.flow.initialized.insert(slot);
+        }
         ctx.loop_depth += 1;
         let body_t = self.analyze_stmts(body, ctx);
         ctx.loop_depth -= 1;
@@ -2958,6 +3015,7 @@ impl Analyzer {
         Some(TStmt::Foreach {
             base: subj,
             base_ty: sty,
+            key_slot,
             value_slot: vslot,
             value_ty: ctx.slot_ty(vslot),
             body: body_t,
@@ -3148,6 +3206,7 @@ impl Analyzer {
                 }
 
                 ctx.flow.forget(slot);
+                ctx.flow.initialized.insert(slot);
                 Some(TStmt::Assign {
                     target: TTarget::Var {
                         name: name.clone(),
@@ -3308,7 +3367,44 @@ impl Analyzer {
     /// The element type of a target, refining an `array<null>` slot when the
     /// assigned value reveals the element type.
     fn elem_ty_maybe_refine(&mut self, target: &TTarget, val_ty: &Ty, ctx: &mut FnCtx) -> Ty {
+        if let TTarget::Nested { elem_ty, .. } = target {
+            if *elem_ty != Ty::Null {
+                return elem_ty.clone();
+            }
+            fn root(target: &TTarget, depth: usize) -> Option<(u32, usize)> {
+                match target {
+                    TTarget::Nested { parent, .. } => root(parent, depth + 1),
+                    TTarget::Index { base, .. } | TTarget::Push { base, .. } => {
+                        if let TExpr::Var { slot, .. } = &**base {
+                            Some((*slot, depth + 1))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            fn refine(current: &Ty, depth: usize, value: &Ty) -> Option<Ty> {
+                if depth == 0 {
+                    return (*current == Ty::Null).then(|| value.clone());
+                }
+                let inner = match current {
+                    Ty::Array(inner) => &**inner,
+                    Ty::Null => &Ty::Null,
+                    _ => return None,
+                };
+                refine(inner, depth - 1, value).map(Ty::array)
+            }
+            if let Some((slot, depth)) = root(target, 0) {
+                if let Some(ty) = refine(&ctx.slot_ty(slot), depth, val_ty) {
+                    ctx.slots[slot as usize] = ty;
+                    return val_ty.clone();
+                }
+            }
+            return elem_ty.clone();
+        }
         let (elem, base) = match target {
+            TTarget::Nested { .. } => unreachable!(),
             TTarget::Index { elem_ty, base, .. } => (elem_ty.clone(), base),
             TTarget::Push { elem_ty, base } => (elem_ty.clone(), base),
             TTarget::MixedVar { ty, .. }
@@ -3334,7 +3430,11 @@ impl Analyzer {
         ctx: &mut FnCtx,
     ) -> Option<TStmt> {
         let (ttarget, tty) = self.infer_target_read(target, span, ctx)?;
+        let before_rhs = ctx.flow.clone();
         let val = self.infer(value, ctx)?;
+        if op == ABinOp::NullCoalesce {
+            ctx.flow = FlowState::merge(&[before_rhs, ctx.flow.clone()]);
+        }
         let vty = val.ty();
         let result_ty = self.binary_type(op, &tty, &vty, span)?;
         if !self.is_assignable(&result_ty, &ttarget.storage_ty()) {
@@ -3420,6 +3520,16 @@ impl Analyzer {
                         return None;
                     }
                 };
+                if ctx.flow.reachable && !ctx.flow.initialized.contains(&slot) {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "variable `${name}` may be uninitialized on this path"
+                        ))
+                        .with_code("E0220")
+                        .with_span(span),
+                    );
+                    return None;
+                }
                 let ty = ctx.slot_ty(slot);
                 if ty == Ty::Mixed {
                     if let Some(narrowed) = ctx.flow.narrowed(slot) {
@@ -3443,10 +3553,20 @@ impl Analyzer {
                 ))
             }
             ast::LValue::Index { base, index, .. } => {
+                if index.is_none() {
+                    self.diags.emit(
+                        Diagnostic::error("cannot read [] in a compound assignment or increment")
+                            .with_code("E0249")
+                            .with_span(span),
+                    );
+                    return None;
+                }
                 let t = self.infer_index_target(base, index.as_deref(), span, ctx)?;
                 let ty = match &t {
                     TTarget::Index { elem_ty, .. } => elem_ty.clone(),
-                    TTarget::Push { elem_ty, .. } => elem_ty.clone(),
+                    TTarget::Push { elem_ty, .. } | TTarget::Nested { elem_ty, .. } => {
+                        elem_ty.clone()
+                    }
                     TTarget::MixedVar { ty, .. }
                     | TTarget::Var { ty, .. }
                     | TTarget::Property { ty, .. } => ty.clone(),
@@ -3562,15 +3682,83 @@ impl Analyzer {
         ctx: &mut FnCtx,
     ) -> Option<TTarget> {
         let ast::LValue::Var { name, .. } = base else {
-            self.diags.emit(
-                Diagnostic::error("nested array assignment is not supported yet")
-                    .with_code("E0248")
-                    .with_span(span),
-            );
-            return None;
+            let mut parent = match base {
+                ast::LValue::Index { base, index, .. } => {
+                    self.infer_index_target(base, index.as_deref(), span, ctx)?
+                }
+                _ => self.infer_target_read(base, span, ctx)?.0,
+            };
+            if parent.storage_ty() == Ty::Null {
+                match &mut parent {
+                    TTarget::Index { elem_ty, .. }
+                    | TTarget::Push { elem_ty, .. }
+                    | TTarget::Nested { elem_ty, .. } => *elem_ty = Ty::array(Ty::Null),
+                    _ => {}
+                }
+            }
+            let array_ty = match parent.storage_ty() {
+                Ty::Mixed => Ty::array(Ty::Mixed),
+                ty @ Ty::Array(_) => ty,
+                _ => {
+                    self.diags.emit(
+                        Diagnostic::error("nested write requires an array-valued parent")
+                            .with_code("E0249")
+                            .with_span(span),
+                    );
+                    return None;
+                }
+            };
+            let elem = array_ty.array_elem().unwrap().clone();
+            let key = match index {
+                None => None,
+                Some(index) => {
+                    let key = self.infer(index, ctx)?;
+                    let ty = key.ty();
+                    if !matches!(ty, Ty::Int | Ty::String | Ty::Mixed) {
+                        self.diags.emit(
+                            Diagnostic::error("array keys must be int or string")
+                                .with_code("E0250")
+                                .with_span(index.span()),
+                        );
+                        return None;
+                    }
+                    Some((Box::new(key), ty))
+                }
+            };
+            return Some(TTarget::Nested {
+                parent: Box::new(parent),
+                array_ty,
+                elem_ty: elem,
+                key,
+            });
         };
         let base_expr = self.infer(&ast::Expr::Var(name.clone(), span), ctx)?;
         let bty = base_expr.ty();
+        if bty == Ty::Mixed {
+            let parent = self.infer_target_read(base, span, ctx)?.0;
+            let key = match index {
+                None => None,
+                Some(index) => {
+                    let key = self.infer(index, ctx)?;
+                    let ty = key.ty();
+                    if !matches!(ty, Ty::Int | Ty::String | Ty::Mixed) {
+                        self.diags.emit(
+                            Diagnostic::error("array keys must be int or string")
+                                .with_code("E0250")
+                                .with_span(index.span()),
+                        );
+                        return None;
+                    }
+                    Some((Box::new(key), ty))
+                }
+            };
+            return Some(TTarget::Nested {
+                parent: Box::new(parent),
+                array_ty: Ty::array(Ty::Mixed),
+                elem_ty: Ty::Mixed,
+                key,
+            });
+        }
         let Ty::Array(elem) = bty.clone() else {
             self.diags.emit(
                 Diagnostic::error(format!("cannot index a value of type `{bty}` with `[]`"))
@@ -3588,7 +3776,7 @@ impl Analyzer {
             Some(ie) => {
                 let key = self.infer(ie, ctx)?;
                 let kty = key.ty();
-                if !matches!(kty, Ty::Int | Ty::String) {
+                if !matches!(kty, Ty::Int | Ty::String | Ty::Mixed) {
                     self.diags.emit(
                         Diagnostic::error(format!(
                             "array keys must be `int` or `string`, found `{kty}`"
@@ -3691,6 +3879,22 @@ impl Analyzer {
 
     fn infer(&mut self, expr: &ast::Expr, ctx: &mut FnCtx) -> Option<TExpr> {
         match expr {
+            ast::Expr::Effect {
+                statement, postfix, ..
+            } => {
+                let statement = self.analyze_stmt(statement, ctx)?;
+                let ty = match &statement {
+                    TStmt::Assign { ty, .. } => ty.clone(),
+                    TStmt::AssignOp { target, .. } => target.storage_ty(),
+                    TStmt::IncDec { ty, .. } => ty.clone(),
+                    _ => unreachable!("effect expressions contain assignments or updates"),
+                };
+                Some(TExpr::Effect {
+                    statement: Box::new(statement),
+                    postfix: *postfix,
+                    ty,
+                })
+            }
             ast::Expr::IntLit(v, _) => Some(TExpr::Int(*v)),
             ast::Expr::FloatLit(v, _) => Some(TExpr::Float(*v)),
             ast::Expr::StrLit(s, _) => Some(TExpr::Str(s.clone())),
@@ -3731,6 +3935,16 @@ impl Analyzer {
                 }
                 match ctx.slot_of(name) {
                     Some(slot) => {
+                        if ctx.flow.reachable && !ctx.flow.initialized.contains(&slot) {
+                            self.diags.emit(
+                                Diagnostic::error(format!(
+                                    "variable `${name}` may be uninitialized on this path"
+                                ))
+                                .with_code("E0220")
+                                .with_span(*span),
+                            );
+                            return None;
+                        }
                         let ty = ctx.slot_ty(slot);
                         let expression = TExpr::Var {
                             name: name.clone(),
@@ -4643,9 +4857,12 @@ impl Analyzer {
         let incoming = ctx.flow.clone();
         if matches!(op, ABinOp::And | ABinOp::Or) {
             ctx.flow = incoming.condition(&lt, op == ABinOp::And);
+            invalidate_expression_writes(lhs, ctx);
         }
         let result = self.infer(rhs, ctx);
-        ctx.flow = incoming;
+        if matches!(op, ABinOp::And | ABinOp::Or | ABinOp::NullCoalesce) {
+            ctx.flow = FlowState::merge(&[incoming, ctx.flow.clone()]);
+        }
         let rt = result?;
         let l = lt.ty();
         let r = rt.ty();
@@ -4889,10 +5106,13 @@ impl Analyzer {
         self.expect_truthy(&cty, cond.span());
         let incoming = ctx.flow.clone();
         ctx.flow = incoming.condition(&c, false);
+        invalidate_expression_writes(cond, ctx);
         let eb_result = self.infer(else_branch, ctx);
+        let else_flow = ctx.flow.clone();
         ctx.flow = incoming.condition(&c, true);
+        invalidate_expression_writes(cond, ctx);
         let tt_result = then.map(|t| self.infer(t, ctx));
-        ctx.flow = incoming;
+        ctx.flow = FlowState::merge(&[else_flow, ctx.flow.clone()]);
         let eb = eb_result?;
         match then {
             Some(_) => {
@@ -4926,7 +5146,13 @@ impl Analyzer {
         span: Span,
         ctx: &mut FnCtx,
     ) -> Option<TExpr> {
-        let b = self.infer(base, ctx)?;
+        let mut b = self.infer(base, ctx)?;
+        if b.ty() == Ty::Mixed {
+            b = TExpr::Coerce {
+                expr: Box::new(b),
+                ty: Ty::array(Ty::Mixed),
+            };
+        }
         let bty = b.ty();
         if bty == Ty::Infer {
             return Some(TExpr::Deferred);
@@ -4962,7 +5188,7 @@ impl Analyzer {
         };
         let key = self.infer(ie, ctx)?;
         let kty = key.ty();
-        if !matches!(kty, Ty::Int | Ty::String) {
+        if !matches!(kty, Ty::Int | Ty::String | Ty::Mixed) {
             self.diags.emit(
                 Diagnostic::error(format!(
                     "array keys must be `int` or `string`, found `{kty}`"
@@ -5014,7 +5240,7 @@ impl Analyzer {
                 Some(k) => {
                     let kt = self.infer(k, ctx)?;
                     let kty = kt.ty();
-                    if !matches!(kty, Ty::Int | Ty::String) {
+                    if !matches!(kty, Ty::Int | Ty::String | Ty::Mixed) {
                         self.diags.emit(
                             Diagnostic::error(format!(
                                 "array keys must be `int` or `string`, found `{kty}`"
@@ -6290,7 +6516,7 @@ impl Analyzer {
                 if n != 2 {
                     return self.builtin_arity_err(name, 2, 2, n, span);
                 }
-                if atys[0] != Ty::Int && atys[0] != Ty::String {
+                if !matches!(atys[0], Ty::Int | Ty::String | Ty::Mixed) {
                     return self.builtin_ty_err(
                         name,
                         "an `int` or `string` key",
@@ -6681,8 +6907,21 @@ fn static_initializer(expr: &ast::Expr) -> bool {
 
 // Invalidate values written on any loop/fallthrough path before typing repeated
 // code. Function calls cannot rebind locals: references are not part of PXR yet.
+fn invalidate_expression_writes(expression: &ast::Expr, ctx: &mut FnCtx) {
+    if let ast::Expr::Effect { statement, .. } = expression {
+        invalidate_writes(std::slice::from_ref(statement), ctx);
+    } else {
+        for child in expression.children() {
+            invalidate_expression_writes(child, ctx);
+        }
+    }
+}
+
 fn invalidate_writes(statements: &[ast::Stmt], ctx: &mut FnCtx) {
     for statement in statements {
+        for expression in statement.expressions() {
+            invalidate_expression_writes(expression, ctx);
+        }
         match statement {
             ast::Stmt::Assign { target, .. }
             | ast::Stmt::AssignOp { target, .. }
@@ -6715,7 +6954,12 @@ fn invalidate_writes(statements: &[ast::Stmt], ctx: &mut FnCtx) {
                 invalidate_writes(body, ctx);
                 invalidate_writes(update, ctx);
             }
-            ast::Stmt::Foreach { value, body, .. } => {
+            ast::Stmt::Foreach {
+                key, value, body, ..
+            } => {
+                if let Some(slot) = key.as_ref().and_then(|key| ctx.slot_of(key)) {
+                    ctx.flow.forget(slot);
+                }
                 if let Some(slot) = ctx.slot_of(value) {
                     ctx.flow.forget(slot);
                 }

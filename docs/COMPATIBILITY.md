@@ -27,7 +27,7 @@ and whose output the test suite asserts is byte‑identical.
 | Bitwise `& | ^ ~`, shifts `<< >>` | PHP rules: count ≥ 64 → `0` (or `-1` for `>>` of a negative); negative count is a fatal `ArithmeticError` |
 | `++` / `--`, compound assignment `+=` etc. | as *statements* only (see below) |
 | String literals with escapes; hex / binary / `0o` octal / `_`‑separated ints | |
-| **Double‑quoted interpolation** `"$name"`, `"{$name}"` | equivalent to `"" . $name`; `$` not followed by a name start stays literal (`"$"`, `"$1"`, `"foo$"`, `"$$x"`); the array, property and `${...}` forms are rejected (see below) |
+| **Double‑quoted interpolation** `"$name"`, `"{$name}"` | equivalent to `"" . $name`; `$` not followed by a name start stays literal (`"$"`, `"$1"`, `"foo$"`, `"$$x"`); array/property access and braced access expressions work; deprecated `${...}` is rejected (see below) |
 | Infrastructure: typed params, return types, recursion | parameter annotations required; concrete-body returns inferred when omitted |
 | Arrays `[...]` / `array(...)` | ordered maps, `int`/`string` keys, insertion order |
 | **Array value semantics** | assignment, function arguments, returns and `foreach` all operate on copies (copy-on-write storage) |
@@ -71,12 +71,12 @@ behavioural divergence.
 | Missing abstract/interface return type | **Error** `E0204`; these signatures have no body to infer |
 | Bare `array` type hint | **Error** — write the element type, `array<T>` (a PXR extension) |
 | A concrete variable changing type (`$x = 1; $x = "s";`) | **Error** — opt into `mixed` to allow type changes |
-| Complex interpolation: `"$a[0]"`, `"$a[$k]"`, `"{$a[0]}"`, `"$obj->p"`, `"${name}"` | **Error** `E0008` — simple `"$name"` / `"{$name}"` work; write these as a concatenation instead |
+| Deprecated `${name}` and invalid interpolation | **Error** `E0008`; simple array/property access and braced access expressions are supported |
 | Nullable type annotations | Not yet; null literals work through mixed storage |
-| Assignment as an expression (`$a = $b = 1`, `f($x++)`) | **Error** — `++`/`--`/`=` are statement‑only |
-| Keyed `foreach ($a as $k => $v)` | **Error** `E0242` |
+| Assignment as an expression (`$a = $b = 1`, `f($x++)`) | Supported for shared values; owned/borrowed binding duplication is rejected |
+| Keyed `foreach ($a as $k => $v)` | Supported; key destination uses `mixed` (predeclared concrete destinations: `E0242`) |
 | `echo` / `print` an array, `(string)$array` | **Error** `E0240` — PHP prints `Array` *and* a warning to stdout, which PXR does not reproduce |
-| Nested assignment `$a[0][1] = x` | **Error** `E0248` |
+| Nested array/property assignment | Supported, including COW snapshots, mixed null autovivification and suspended right-hand sides |
 | `**` (exponentiation) | **Error** `E0257` |
 | `+` with numeric strings (`"1" + 2`) | **Error** for concrete operands; numeric strings work through mixed operators |
 | Heterogeneous arrays | Use mixed/array-of-mixed boundaries; unrelated homogeneous array types still cannot merge implicitly |
@@ -128,10 +128,10 @@ desugars to a `"" . …` concatenation, so the value is string‑converted exact
 PHP's echo/concat conversion is (`5` → `"5"`, `3.5` → `"3.5"`, `true` → `"1"`,
 `false` → `""`). A `$` that is not followed by a name start is a literal `$`, as
 in PHP: `"$"`, `"$1"`, `"$ "`, `"foo$"` and `"$$x"` (→ `"$"` then `$x`) all match
-byte‑for‑byte. `\$` is an escaped dollar. PHP's remaining interpolation forms are
-rejected loudly rather than mis‑lexed: simple array access `"$a[0]"`/`"$a[$k]"`,
-property access `"$obj->p"`, complex `"{$expr}"` (only `"{$name}"` is accepted),
-and the deprecated `"${name}"` are all **Errors** `E0008`. Interpolating a value
+byte‑for‑byte. `\$` is an escaped dollar. Simple array accesses (`"$a[0]"`, `"$a[$k]"`, `"$a[name]"`), property access
+(`"$obj->p"`), and braced array/property/method access (`"{$a['name'][0]}"`,
+`"{$obj->label(1)}"`) work. Simple bare keys are string keys. Deprecated
+`"${name}"` and invalid interpolation are **Errors** `E0008`. Interpolating a value
 with no string conversion (an array) is a loud type error (`E0223`), never PHP's
 `"Array"`-plus-warning.
 
@@ -328,8 +328,14 @@ part of this memory-management milestone. Native `__destruct` declarations fail
 explicitly with `E0290`; PHP-boundary destructors remain PHP behavior.
 
 **Fail loud, never silent.** Features not yet implemented (such as
-keyed `foreach`, nested array assignment, complex interpolation forms)
+closures, exceptions and nullable annotations)
 produce a compile error with a specific code — never a silently different program.
+
+**Invokable objects.** `$callback($arg)` lowers to checked `__invoke` dispatch,
+including interface callbacks, inheritance and receiver retention across awaited
+arguments. The method uses the existing visibility/argument/ownership rules.
+Callable strings/arrays, closure capture and `callable` annotations are not yet
+supported. `__invoke` is synchronous under the current magic-method policy.
 
 ## Runtime independence
 

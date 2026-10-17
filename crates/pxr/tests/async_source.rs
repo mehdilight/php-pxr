@@ -2534,3 +2534,93 @@ echo strlen($kept), ":", $alias->value, ":", strlen($parent->textValue()), ":", 
         "4096:42:4096:node\n",
     );
 }
+
+#[test]
+fn keyed_foreach_keeps_keys_and_nested_values_alive_across_await() {
+    run_case(
+        "keyed_foreach_await",
+        r#"<?php
+async function main(): void {
+    $values = ["binary\0key" => [7], 9 => [8], "01" => [9]];
+    $snapshot = $values;
+    foreach ($values as $key => $value) {
+        await sleepAsync(0);
+        echo is_int($key), ":", $key, ":", $value[0], ";";
+        $value[0] = 42; $values[$key] = $value;
+    }
+    $first = $snapshot["binary\0key"];
+    echo $first[0], "\n";
+}
+"#,
+        ":binary\0key:7;1:9:8;:01:9;7\n",
+    );
+}
+
+#[test]
+fn nested_array_property_targets_and_cow_survive_rhs_suspension() {
+    run_case(
+        "nested_write_await",
+        r#"<?php
+class AwaitBag {public array<array<int>> $values = [[7, 8]]; public static array<array<int>> $shared = [[3]];}
+async function nestedNumber(): int {await sleepAsync(0); return 9;}
+function nestedIndex(int $key): int {echo "K"; return $key;}
+async function main(): void {
+    $bag = new AwaitBag(); $copy = $bag->values; $alias = $bag;
+    $bag->values[nestedIndex(0)][nestedIndex(0)] = await nestedNumber();
+    AwaitBag::$shared[0][0] += await nestedNumber();
+    echo ":", $alias->values[0][0], ":", $copy[0][0], ":", AwaitBag::$shared[0][0], "\n";
+    $empty = []; $empty[]["items"][] = await nestedNumber();
+    echo $empty[0]["items"][0], "\n";
+}
+"#,
+        "KK:9:7:12\n9\n",
+    );
+}
+
+#[test]
+fn assignment_results_and_interpolation_survive_suspension() {
+    run_case(
+        "assignment_results",
+        r#"<?php
+async function result(int $n): int { await sleepAsync(0); return $n; }
+async function main(): void {
+    $a = [[1]];
+    $i = 0;
+    echo ($a[$i++][0] += await result(4)), ":", $i, ":", "{$a[0][0]}", "\n";
+    echo ($a[0][2] ??= await result(8)), ":", ($a[0][2] ??= await result(99)), "\n";
+    $b = ($a[0] = [await result(7)]);
+    $b[0]++;
+    echo "{$a[0][0]}:{$b[0]}\n";
+    $mixed: mixed = [["text"]];
+    await sleepAsync(0);
+    echo "{$mixed[0][0]}\n";
+}
+"#,
+        "5:1:5\n8:8\n7:8\ntext\n",
+    );
+}
+
+#[test]
+fn invokable_receivers_and_arguments_survive_await_and_gc() {
+    run_case(
+        "invokable_await",
+        r#"<?php
+interface Callback { public function __invoke(string $value): string; }
+class PrefixCallback implements Callback {
+    public string $prefix;
+    public function __construct(string $prefix) { $this->prefix = $prefix; }
+    public function __invoke(string $value): string { return $this->prefix . $value; }
+}
+function receiver(Callback $callback): Callback { echo "receiver:"; return $callback; }
+async function argument(): string { await sleepAsync(0); return "done"; }
+async function main(): void {
+    $callback = new PrefixCallback("kept:");
+    echo receiver($callback)(await argument()), "\n";
+    echo receiver(new PrefixCallback("temporary:"))(await argument()), "\n";
+    $callbacks = [$callback];
+    foreach ($callbacks as $fn) { await sleepAsync(0); echo $fn("again"), "\n"; }
+}
+"#,
+        "receiver:kept:done\nreceiver:temporary:done\nkept:again\n",
+    );
+}

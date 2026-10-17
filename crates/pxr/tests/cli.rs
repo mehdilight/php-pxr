@@ -1606,13 +1606,9 @@ fn negative_shift_is_a_fatal_error() {
 
 #[test]
 fn unsupported_interpolation_forms_are_rejected() {
-    // Simple `$x` / `{$x}` interpolation works, but PHP's array, property and
-    // `${...}` forms cannot be expanded yet. Rather than silently emitting the
-    // literal (which would diverge from PHP), each is a hard compile error.
     for (name, src) in [
-        ("iarr", "<?php $a = [1]; echo \"$a[0]\";"),
-        ("iprop", "<?php $o = 1; echo \"$o->p\";"),
-        ("icplx", "<?php $a = [1]; echo \"{$a[0]}\";"),
+        ("ibadkey", "<?php $a = [1]; echo \"$a['quoted']\";"),
+        ("ieffect", "<?php $x = 1; echo \"{$x++}\";"),
         ("idoll", "<?php $x = 1; echo \"${x}\";"),
     ] {
         let f = temp_php(name, src);
@@ -2509,7 +2505,7 @@ fn array_misuse_is_rejected() {
 
     let f = temp_php(
         "badforeach",
-        "<?php $a = [1, 2]; foreach ($a as $k => $v) { echo $v; }",
+        "<?php $k = 0; $a = [1, 2]; foreach ($a as $k => $v) { echo $v; }",
     );
     let r = run_ok(&["check", f.to_str().unwrap()]);
     assert_eq!(r.code, 1);
@@ -4217,4 +4213,298 @@ echo $map["k1"], ":", array_key_exists($key, $map), ":", $key, "\n";
 
 "#,
     );
+}
+
+#[test]
+fn keyed_foreach_preserves_key_types_snapshots_and_order() {
+    assert_matches_php(
+        "keyed_foreach",
+        r#"<?php
+$a = [7 => 10, "label" => 20, "01" => 30, "a\0b" => 40, -3 => 50];
+$copy = [];
+foreach ($a as $key => $value) {
+    echo is_int($key), ":", $key, "=", $value, ";";
+    $copy[$key] = $value;
+    $a["added"] = 99;
+}
+echo "\n", count($a), ":", count($copy), ":", $copy["a\0b"], "\n";
+foreach ($copy as $key => $value) {echo array_key_exists($key, $copy), ":", $copy[$key], ";";}
+echo "\n";
+foreach ([10, 20] as $same => $same) {echo $same, ":";}
+echo "\n";
+"#,
+    );
+}
+
+#[test]
+fn nested_writes_preserve_copies_create_paths_and_evaluate_keys_once() {
+    assert_matches_php(
+        "nested_write_values",
+        r#"<?php
+function writeKey(string $label, int $key): int {echo $label; return $key;}
+function writeValue(int $value): int {echo "V"; return $value;}
+$a = [[1, 2], [3, 4]]; $b = $a;
+$a[writeKey("A", 0)][writeKey("B", 1)] = writeValue(42);
+$a[writeKey("C", 1)][writeKey("D", 0)] += writeValue(5);
+$a[writeKey("E", 1)][writeKey("F", 1)]++;
+echo "\n", $a[0][1], ":", $b[0][1], ":", $a[1][0], ":", $a[1][1], "\n";
+$created = []; $created["group"]["items"][] = 7; $created["group"]["items"][] = 8;
+echo $created["group"]["items"][0], ":", $created["group"]["items"][1], "\n";
+$appended = []; $appended[]["id"] = 9; $appended[]["id"] = 10;
+echo count($appended), ":", $appended[0]["id"], ":", $appended[1]["id"], "\n";
+"#,
+    );
+}
+
+#[test]
+fn nested_mixed_and_property_writes_preserve_aliases_and_null_autovivification() {
+    assert_matches_php(
+        "nested_mixed_properties",
+        r#"<?php
+class NestedBag {public mixed $values = [[1, 2]]; public static mixed $shared = [[3]];}
+function nestedBox(mixed $value): mixed {return $value;}
+function nestedBag(NestedBag $bag): NestedBag {echo "O"; return $bag;}
+function nestedKey(int $key): int {echo "K"; return $key;}
+function nestedValue(): int {echo "V"; return 42;}
+function nestedAt(mixed $value, int $i, int $j): int {
+    if (is_array($value)) {$child = $value[$i]; if (is_array($child)) {return intval($child[$j]);}}
+    return -1;
+}
+$bag = new NestedBag(); $alias = $bag; $snapshot = $bag->values;
+nestedBag($bag)->values[nestedKey(0)][nestedKey(1)] = nestedValue();
+NestedBag::$shared[0][0] += 5;
+echo "\n", nestedAt($alias->values, 0, 1), ":", nestedAt($snapshot, 0, 1), ":", nestedAt(NestedBag::$shared, 0, 0), "\n";
+$m = nestedBox(null); $m["path"]["items"][] = 7; $before = $m;
+$m["path"]["items"][] = 8;
+if (is_array($m)) {$path = $m["path"]; if (is_array($path)) {$items = $path["items"]; if (is_array($items)) {echo count($items), ":", $items[1], ":";}}}
+if (is_array($before)) {$path = $before["path"]; if (is_array($path)) {$items = $path["items"]; if (is_array($items)) {echo count($items), "\n";}}}
+$a = [nestedBox(null)]; $a[0]["x"] = 9;
+$v = $a[0]; if (is_array($v)) {echo $v["x"], "\n";}
+"#,
+    );
+}
+
+#[test]
+fn assignment_and_increment_expressions_match_php_evaluation_order() {
+    assert_matches_php(
+        "assignment_expressions",
+        r#"<?php
+function exprKey(): int { echo "K"; return 0; }
+function number(int $x): int { return $x; }
+$a = $b = 3;
+echo $a, ":", $b, ":", number($a++), ":", ++$a, ":", ($b += 2), "\n";
+$arr = [1];
+echo ($arr[exprKey()] += ($arr = [10])[0]), ":", $arr[0], "\n";
+$nested = [[1]];
+echo ($nested[exprKey()][exprKey()] = (($nested = [[9]]) ? 2 : 3)), ":", $nested[0][0], "\n";
+$items = [4];
+echo ($items[0] ??= number(99)), ":", ($items[2] ??= 7), ":", $items[2], "\n";
+$i = 0;
+while (($i += 1) < 4) { echo $i++; }
+echo ":", $i, "\n";
+"#,
+    );
+}
+
+#[test]
+fn array_property_and_braced_interpolation_match_php() {
+    assert_matches_php(
+        "access_interpolation",
+        r#"<?php
+class InterpolationItem {
+    public string $name = "value";
+    public function label(int $i): string { return $this->name . $i; }
+}
+$words = ["a", "b", "name" => "hello", -2 => "negative"];
+$i = 1;
+$obj = new InterpolationItem();
+$nested = [["x\0y"]];
+echo "$words[0]:$words[$i]:$words[name]:$words[-2]:$obj->name\n";
+echo "{$words['name']}:{$nested[0][0]}:{$obj->label($i++)}:$i\n";
+echo "\$words[0]:{$words[0]}suffix\n";
+"#,
+    );
+}
+
+#[test]
+fn narrowed_mixed_coalescing_expression_keeps_boxed_representation() {
+    assert_matches_php(
+        "narrowed_coalescing_result",
+        r#"<?php
+function exprMixed(mixed $v): mixed { return $v; }
+$v = exprMixed(3);
+if (is_int($v)) { $result = ($v ??= 8); echo $result, ":", $v, "\n"; }
+"#,
+    );
+}
+
+#[test]
+fn expression_writes_invalidate_guards_and_append_reads_are_rejected() {
+    for (name, source, diagnostic) in [
+        (
+            "condition_write_guard",
+            r#"<?php
+function guardedResult(mixed $v): int {
+    if (is_int($v) && (($v = "changed") === "changed")) { return $v; }
+    return 0;
+}
+"#,
+            "E0215",
+        ),
+        (
+            "binary_write_guard",
+            r#"<?php
+function guardedResult(mixed $v): int {
+    if (is_int($v)) { echo 1 + ($v = 2); return $v; }
+    return 0;
+}
+"#,
+            "E0215",
+        ),
+        (
+            "loop_write_guard",
+            r#"<?php
+function guardedResult(mixed $v): int {
+    if (is_int($v)) { while (true) { echo ($v = "changed"); break; } return $v; }
+    return 0;
+}
+"#,
+            "E0215",
+        ),
+        ("append_update", "<?php $a = [1]; $a[]++;", "E0249"),
+    ] {
+        let path = temp_php(name, source);
+        let run = run_ok(&["check", path.to_str().unwrap()]);
+        assert_eq!(run.code, 1, "{name}: {}", run.stderr);
+        assert!(run.stderr.contains(diagnostic), "{name}: {}", run.stderr);
+    }
+}
+
+#[test]
+fn conditional_expression_bindings_require_initialization() {
+    for (name, source) in [
+        ("skipped_assignment", "<?php $run = false; echo $run && ($x = 1); echo $x;"),
+        ("skipped_coalescing", "<?php $a = [1]; echo ($a[0] ??= ($x = 2)); echo $x;"),
+        ("skipped_branch", "<?php $run = false; if ($run) { $x = [1]; } echo $x[0];"),
+        ("skipped_foreach", "<?php function f(array<int> $a): int { foreach ($a as $k => $v) {} return intval($k); }"),
+    ] {
+        let path = temp_php(name, source);
+        let run = run_ok(&["check", path.to_str().unwrap()]);
+        assert_eq!(run.code, 1, "{name}: {}", run.stderr);
+        assert!(run.stderr.contains("E0220"), "{name}: {}", run.stderr);
+    }
+    assert_matches_php(
+        "initialized_expression_bindings",
+        r#"<?php
+$run = true;
+if ($run) { $x = 1; } else { $x = 2; }
+echo $x, ":";
+while (($y = 2) < 0) {}
+echo $y, ":";
+for (; ($z = 3) < 0;) {}
+echo $z, "\n";
+"#,
+    );
+}
+
+#[test]
+fn unsupported_attributes_cannot_be_silently_ignored_as_comments() {
+    let path = temp_php(
+        "attribute_not_comment",
+        "<?php\n#[Example]\nfunction attributed(): int { return 1; }\necho attributed();",
+    );
+    let run = run_ok(&["check", path.to_str().unwrap()]);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(run.stderr.contains("E0009"), "{}", run.stderr);
+}
+
+#[test]
+fn unparenthesized_assignment_operands_follow_php_grammar() {
+    assert_matches_php(
+        "assignment_operand_grammar",
+        r#"<?php
+$c = false;
+echo ($c ? $x = 7 : $x = 8), ":", $x, "\n";
+echo 1 + $n = 2, ":", $n, "\n";
+$v = null;
+echo ($v ?? $q = 9), "\n";
+// A skipped coalescing operand does not initialize its binding.
+$ready = 4;
+echo ($ready ?? $skipped = 10), "\n";
+"#,
+    );
+}
+
+#[test]
+fn mixed_array_reads_check_containers_and_preserve_nested_values() {
+    assert_matches_php(
+        "mixed_array_reads",
+        r#"<?php
+function arrayReadBox(mixed $value): mixed { return $value; }
+class ArrayReadContainer { public mixed $data = [["a\0b"]]; }
+$v = arrayReadBox([[1, 2]]);
+$key = arrayReadBox(0);
+echo $v[$key][1], ":";
+$obj = new ArrayReadContainer();
+echo "{$obj->data[0][0]}\n";
+"#,
+    );
+    if !have_cc() {
+        return;
+    }
+    let path = temp_php(
+        "mixed_array_read_wrong_container",
+        r#"<?php
+function arrayReadBox(mixed $v): mixed { return $v; }
+$v = arrayReadBox(7); echo $v[0];
+"#,
+    );
+    let run = run_ok(&["run", path.to_str().unwrap()]);
+    assert_eq!(run.code, 255, "{}", run.stderr);
+    assert!(run.stderr.contains("TypeError"), "{}", run.stderr);
+}
+
+#[test]
+fn invokable_objects_and_typed_callbacks_match_php() {
+    assert_matches_php(
+        "invokable_callbacks",
+        r#"<?php
+interface IntCallback { public function __invoke(int $value): int; }
+class OffsetCallback implements IntCallback {
+    public int $offset;
+    public function __construct(int $offset) { $this->offset = $offset; }
+    public function __invoke(int $value): int { $this->offset++; return $value + $this->offset; }
+}
+class DoubleCallback extends OffsetCallback {
+    public function __invoke(int $value): int { return parent::__invoke($value) * 2; }
+}
+function applyCallback(IntCallback $callback, int $value): int { return $callback($value); }
+function chooseCallback(IntCallback $callback): IntCallback { echo "receiver:"; return $callback; }
+function callbackArgument(): int { echo "argument:"; return 3; }
+$a = new OffsetCallback(4);
+$b = new DoubleCallback(5);
+echo $a(2), ":", ($b)(2), ":", applyCallback($b, 2), "\n";
+echo chooseCallback($a)(callbackArgument()), "\n";
+echo (new OffsetCallback(10))(4), "\n";
+function callbackView(IntCallback $callback): IntCallback { return $callback; }
+$callbacks = [callbackView($a), callbackView($b)];
+foreach ($callbacks as $callback) { echo $callback(1), ":"; }
+echo "\n";
+"#,
+    );
+}
+
+#[test]
+fn invokable_object_calls_keep_static_argument_and_receiver_checks() {
+    for (name, source, diagnostic) in [
+        ("invoke_non_object", "<?php $f = 1; echo $f(2);", "E0260"),
+        ("invoke_missing", "<?php class F {} $f = new F(); $f();", "E0262"),
+        ("invoke_wrong_arity", "<?php class F { public function __invoke(int $x): int { return $x; } } $f = new F(); $f();", "E0207"),
+        ("invoke_wrong_argument", "<?php class F { public function __invoke(int $x): int { return $x; } } $f = new F(); $f(\"x\");", "E0208"),
+    ] {
+        let path = temp_php(name, source);
+        let run = run_ok(&["check", path.to_str().unwrap()]);
+        assert_eq!(run.code, 1, "{name}: {}", run.stderr);
+        assert!(run.stderr.contains(diagnostic), "{name}: {}", run.stderr);
+    }
 }

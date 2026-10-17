@@ -152,6 +152,31 @@ fn lower_func(tf: &TFunc) -> Function {
     lw.into_function()
 }
 
+enum ArrayBase {
+    Slot { slot: u32, storage: Ty, view: Ty },
+    Value(Value),
+}
+enum PreparedTarget {
+    Slot {
+        slot: u32,
+        storage: Ty,
+    },
+    Array {
+        base: ArrayBase,
+        key: Option<(Value, Value, Value)>,
+    },
+    Property {
+        object: Value,
+        index: Value,
+    },
+    Nested {
+        parent: Box<PreparedTarget>,
+        parent_ty: Ty,
+        array_ty: Ty,
+        key: Option<(Value, Value, Value)>,
+    },
+}
+
 struct Lowerer {
     f: Function,
     prelude: Vec<Inst>,
@@ -305,55 +330,8 @@ impl Lowerer {
                     self.rt_call("pxr_async_drop", vec![value], Ty::Void);
                 }
             }
-            TStmt::Assign { target, ty, value } => {
-                let mut v = self.lower_expr(value);
-                let vt = value.ty();
-                if vt != *ty {
-                    v = self.cast(v, &vt, ty);
-                }
-                if is_pass(value) {
-                    if let TTarget::Var { slot, .. } = target {
-                        self.emit(Inst::SlotSet {
-                            slot: *slot,
-                            src: v,
-                            ty: ty.clone(),
-                        });
-                    } else {
-                        self.lower_store(target, ty.clone(), v);
-                    }
-                } else {
-                    self.lower_store(target, ty.clone(), v);
-                }
-            }
-            TStmt::AssignOp {
-                target,
-                ty,
-                op,
-                value,
-            } => {
-                // `??=` must not evaluate its right-hand side when the target
-                // is already set (and for a plain variable it is always set).
-                if *op == pxr_sema::TBinOp::NullCoalesce {
-                    self.lower_coalesce_assign(target, ty, value);
-                    return;
-                }
-                // Read the current value, apply the operation, store back.
-                let (cur, cur_ty) = self.lower_load(target, ty.clone());
-                let v = self.lower_expr(value);
-                let vt = value.ty();
-                let result = self.lower_bin_expr(*op, &cur_ty, cur, &vt, v);
-                // Coerce the operator result to the destination representation.
-                let storage = target.storage_ty();
-                let value = self.cast(result.0, &result.1, &storage);
-                self.lower_store(target, storage, value);
-            }
-            TStmt::IncDec { target, ty, delta } => {
-                let (cur, cur_ty) = self.lower_load(target, ty.clone());
-                let dx = self.emit_const(Literal::Int(*delta));
-                let res = self.lower_bin_expr(pxr_sema::TBinOp::Add, &cur_ty, cur, &Ty::Int, dx);
-                let storage = target.storage_ty();
-                let value = self.cast(res.0, &res.1, &storage);
-                self.lower_store(target, storage, value);
+            TStmt::Assign { .. } | TStmt::AssignOp { .. } | TStmt::IncDec { .. } => {
+                self.lower_assignment(stmt, false);
             }
             TStmt::If {
                 cond,
@@ -381,10 +359,11 @@ impl Lowerer {
             TStmt::Foreach {
                 base,
                 base_ty,
+                key_slot,
                 value_slot,
                 value_ty,
                 body,
-            } => self.lower_foreach(base, base_ty, *value_slot, value_ty, body),
+            } => self.lower_foreach(base, base_ty, *key_slot, *value_slot, value_ty, body),
             TStmt::Switch {
                 subject,
                 subject_ty,
@@ -494,8 +473,78 @@ impl Lowerer {
 
     // ---- Expressions ------------------------------------------------------
 
+    fn lower_assignment(&mut self, statement: &TStmt, postfix: bool) -> Value {
+        match statement {
+            TStmt::Assign { target, ty, value } => {
+                let place = self.prepare_target(target);
+                let mut v = self.lower_expr(value);
+                let vt = value.ty();
+                if vt != *ty {
+                    v = self.cast(v, &vt, ty);
+                }
+                if is_pass(value) {
+                    if let TTarget::Var { slot, .. } = target {
+                        self.emit(Inst::SlotSet {
+                            slot: *slot,
+                            src: v,
+                            ty: ty.clone(),
+                        });
+                    } else {
+                        self.write_target(&place, ty, v);
+                    }
+                } else {
+                    self.write_target(&place, ty, v);
+                }
+                v
+            }
+            TStmt::AssignOp {
+                target,
+                ty,
+                op,
+                value,
+            } => {
+                // `??=` must not evaluate its right-hand side when the target
+                // is already set (and for a plain variable it is always set).
+                if *op == pxr_sema::TBinOp::NullCoalesce {
+                    return self.lower_coalesce_assign(target, &target.storage_ty(), value);
+                }
+                // Read the current value, apply the operation, store back.
+                let place = self.prepare_target(target);
+                let v = self.lower_expr(value);
+                let vt = value.ty();
+                let cur_ty = ty.clone();
+                let cur = self.read_target(&place, &cur_ty);
+                let result = self.lower_bin_expr(*op, &cur_ty, cur, &vt, v);
+                // Coerce the operator result to the destination representation.
+                let storage = target.storage_ty();
+                let value = self.cast(result.0, &result.1, &storage);
+                self.write_target(&place, &storage, value);
+                value
+            }
+            TStmt::IncDec { target, ty, delta } => {
+                let place = self.prepare_target(target);
+                let cur_ty = ty.clone();
+                let cur = self.read_target(&place, &cur_ty);
+                let dx = self.emit_const(Literal::Int(*delta));
+                let res = self.lower_bin_expr(pxr_sema::TBinOp::Add, &cur_ty, cur, &Ty::Int, dx);
+                let storage = target.storage_ty();
+                let value = self.cast(res.0, &res.1, &storage);
+                self.write_target(&place, &storage, value);
+                if postfix {
+                    cur
+                } else {
+                    res.0
+                }
+            }
+            _ => unreachable!("effect expression must contain an assignment"),
+        }
+    }
+
     fn lower_expr(&mut self, e: &TExpr) -> Value {
         match e {
+            TExpr::Effect {
+                statement, postfix, ..
+            } => self.lower_assignment(statement, *postfix),
             TExpr::Deferred => unreachable!("deferred inference cannot reach lowering"),
             TExpr::Pass { expr, .. } => self.lower_expr(expr),
             TExpr::Coerce { expr, ty } => {
@@ -1494,6 +1543,10 @@ impl Lowerer {
     /// Produce the `(tag, int, str)` triple for an array key.
     fn lower_key(&mut self, key: &TExpr, kty: &Ty) -> (Value, Value, Value) {
         let kv = self.lower_expr(key);
+        self.lower_key_value(kv, kty)
+    }
+
+    fn lower_key_value(&mut self, kv: Value, kty: &Ty) -> (Value, Value, Value) {
         match kty {
             Ty::Int => {
                 let ktag = self.emit_const(Literal::Int(1));
@@ -1504,6 +1557,12 @@ impl Lowerer {
                 let ktag = self.emit_const(Literal::Int(4));
                 let kint = self.emit_const(Literal::Int(0));
                 (ktag, kint, kv)
+            }
+            Ty::Mixed => {
+                let tag = self.rt_call("pxr_mixed_key_tag", vec![kv], Ty::Int);
+                let integer = self.rt_call("pxr_mixed_key_int", vec![kv], Ty::Int);
+                let string = self.rt_call("pxr_mixed_key_str", vec![kv], Ty::String);
+                (tag, integer, string)
             }
             _ => unreachable!("array key types are enforced by sema"),
         }
@@ -1533,119 +1592,205 @@ impl Lowerer {
         arr
     }
 
-    fn lower_store(&mut self, target: &TTarget, ty: Ty, v: Value) {
-        // Storing an array value copies it (PHP value semantics). Assignments
-        // through an index target store the element's value, so the copy below
-        // covers both plain variables and array elements.
+    fn prepare_target(&mut self, target: &TTarget) -> PreparedTarget {
         match target {
-            TTarget::MixedVar { slot, .. } => {
-                let value = self.cast(v, &ty, &Ty::Mixed);
-                let value = self.maybe_copy_array(value, &Ty::Mixed);
-                self.emit(Inst::SlotSet {
-                    slot: *slot,
-                    src: value,
-                    ty: Ty::Mixed,
-                });
-            }
-            TTarget::Var { slot, .. } => {
-                let v = self.maybe_copy_array(v, &ty);
-                self.emit(Inst::SlotSet {
-                    slot: *slot,
-                    src: v,
-                    ty,
-                })
-            }
+            TTarget::Var { slot, ty, .. } => PreparedTarget::Slot {
+                slot: *slot,
+                storage: ty.clone(),
+            },
+            TTarget::MixedVar { slot, .. } => PreparedTarget::Slot {
+                slot: *slot,
+                storage: Ty::Mixed,
+            },
             TTarget::Index {
-                base,
-                elem_ty: _,
-                key,
-                key_ty,
+                base, key, key_ty, ..
             } => {
-                // Use the statement's element type, not the target's: they can
-                // differ on the assignment that refines an empty `array<null>`.
-                let arr = self.lower_expr(base);
-                let (ktag, kint, kstr) = self.lower_key(key, key_ty);
-                let vtag = self.emit_const(Literal::Int(Self::tag_of(&ty)));
-                let v = self.maybe_copy_array(v, &ty);
-                let bits = self.encode_bits(v, &ty);
-                self.array_set(arr, ktag, kint, kstr, vtag, bits);
+                let base = self.prepare_array_base(base);
+                let key = Some(self.lower_key(key, key_ty));
+                PreparedTarget::Array { base, key }
             }
-            TTarget::Push { base, elem_ty: _ } => {
-                let arr = self.lower_expr(base);
-                let vtag = self.emit_const(Literal::Int(Self::tag_of(&ty)));
-                let v = self.maybe_copy_array(v, &ty);
-                let bits = self.encode_bits(v, &ty);
-                self.array_push(arr, vtag, bits);
+            TTarget::Push { base, .. } => {
+                let base = self.prepare_array_base(base);
+                PreparedTarget::Array { base, key: None }
             }
-            TTarget::Property {
-                base,
-                prop_idx,
-                ty: _,
+            TTarget::Property { base, prop_idx, .. } => {
+                let object = self.lower_expr(base);
+                let index = self.emit_const(Literal::Int(*prop_idx as i64));
+                PreparedTarget::Property { object, index }
+            }
+            TTarget::Nested {
+                parent,
+                array_ty,
+                key,
                 ..
             } => {
-                let obj = self.lower_expr(base);
-                let p_idx = self.emit_const(Literal::Int(*prop_idx as i64));
-                let vtag = self.emit_const(Literal::Int(Self::tag_of(&ty)));
-                let v = self.maybe_copy_array(v, &ty);
-                let bits = self.encode_bits(v, &ty);
-                self.rt_call(
-                    "pxr_object_set_bits",
-                    vec![obj, p_idx, vtag, bits],
-                    Ty::Void,
-                );
+                let parent_ty = parent.storage_ty();
+                let parent = Box::new(self.prepare_target(parent));
+                let key = key.as_ref().map(|(key, ty)| self.lower_key(key, ty));
+                PreparedTarget::Nested {
+                    parent,
+                    parent_ty,
+                    array_ty: array_ty.clone(),
+                    key,
+                }
             }
         }
     }
 
-    /// Read the current value of an assignment target (used by `op=` and
-    /// `++`/`--`).
-    fn lower_load(&mut self, target: &TTarget, ty: Ty) -> (Value, Ty) {
-        match target {
-            TTarget::MixedVar {
-                slot, ty: narrowed, ..
+    fn prepare_array_base(&mut self, base: &TExpr) -> ArrayBase {
+        match base {
+            TExpr::Var { slot, ty, .. } => ArrayBase::Slot {
+                slot: *slot,
+                storage: ty.clone(),
+                view: ty.clone(),
+            },
+            TExpr::Coerce { expr, ty } if matches!(&**expr, TExpr::Var { .. }) => {
+                let TExpr::Var {
+                    slot, ty: storage, ..
+                } = &**expr
+                else {
+                    unreachable!()
+                };
+                ArrayBase::Slot {
+                    slot: *slot,
+                    storage: storage.clone(),
+                    view: ty.clone(),
+                }
+            }
+            _ => ArrayBase::Value(self.lower_expr(base)),
+        }
+    }
+
+    fn array_base_value(&mut self, base: &ArrayBase) -> Value {
+        match base {
+            ArrayBase::Value(value) => *value,
+            ArrayBase::Slot {
+                slot,
+                storage,
+                view,
             } => {
-                let value = self.fresh();
-                self.emit(Inst::SlotGet {
-                    dst: value,
-                    slot: *slot,
-                    ty: Ty::Mixed,
-                });
-                (self.cast(value, &Ty::Mixed, narrowed), narrowed.clone())
+                let value = self.load_slot(*slot, storage.clone());
+                self.cast(value, storage, view)
             }
-            TTarget::Var { slot, .. } => {
-                let dst = self.fresh();
-                self.emit(Inst::SlotGet {
-                    dst,
-                    slot: *slot,
-                    ty: ty.clone(),
-                });
-                (dst, ty)
-            }
-            TTarget::Index {
-                base,
-                elem_ty: _,
+        }
+    }
+
+    fn array_location(&mut self, place: &PreparedTarget) -> (Value, Option<(Value, Value, Value)>) {
+        match place {
+            PreparedTarget::Array { base, key } => (self.array_base_value(base), *key),
+            PreparedTarget::Nested {
+                parent,
+                parent_ty,
+                array_ty,
                 key,
-                key_ty,
-            } => {
-                let arr = self.lower_expr(base);
-                let (ktag, kint, kstr) = self.lower_key(key, key_ty);
-                let bits = self.array_get(arr, ktag, kint, kstr);
-                let v = self.decode_bits(bits, &ty);
-                (v, ty)
+            } => (self.read_container(parent, parent_ty, array_ty), *key),
+            _ => unreachable!("array location"),
+        }
+    }
+
+    // Reading a missing intermediate creates an unattached empty array. It is
+    // published only by write-back after the RHS successfully completes.
+    fn read_container(&mut self, place: &PreparedTarget, storage: &Ty, view: &Ty) -> Value {
+        match place {
+            PreparedTarget::Array { .. } | PreparedTarget::Nested { .. } => {
+                let (array, key) = self.array_location(place);
+                if let Some((tag, integer, string)) = key {
+                    let boxed = self.emit_const(Literal::Int(i64::from(*storage == Ty::Mixed)));
+                    self.rt_call(
+                        "pxr_array_child_or_new",
+                        vec![array, tag, integer, string, boxed],
+                        view.clone(),
+                    )
+                } else {
+                    self.array_new()
+                }
             }
-            TTarget::Push { .. } => (self.emit_const(Literal::Int(0)), ty),
-            TTarget::Property {
-                base,
-                prop_idx,
-                ty: _,
-                ..
-            } => {
-                let obj = self.lower_expr(base);
-                let p_idx = self.emit_const(Literal::Int(*prop_idx as i64));
-                let bits = self.rt_call("pxr_object_get_bits", vec![obj, p_idx], Ty::Int);
-                let v = self.decode_bits(bits, &ty);
-                (v, ty)
+            _ => {
+                let value = self.read_target(place, storage);
+                if *storage == Ty::Mixed {
+                    self.rt_call("pxr_mixed_array_or_new", vec![value], view.clone())
+                } else {
+                    self.cast(value, storage, view)
+                }
             }
+        }
+    }
+
+    fn read_target(&mut self, place: &PreparedTarget, ty: &Ty) -> Value {
+        match place {
+            PreparedTarget::Slot { slot, storage } => {
+                let value = self.load_slot(*slot, storage.clone());
+                self.cast(value, storage, ty)
+            }
+            PreparedTarget::Property { object, index } => {
+                let bits = self.rt_call("pxr_object_get_bits", vec![*object, *index], Ty::Int);
+                self.decode_bits(bits, ty)
+            }
+            PreparedTarget::Array { .. } | PreparedTarget::Nested { .. } => {
+                let (array, key) = self.array_location(place);
+                let Some((tag, integer, string)) = key else {
+                    return self.emit_const(Literal::Int(0));
+                };
+                let bits = self.array_get(array, tag, integer, string);
+                self.decode_bits(bits, ty)
+            }
+        }
+    }
+
+    fn write_target(&mut self, place: &PreparedTarget, ty: &Ty, value: Value) {
+        match place {
+            PreparedTarget::Slot { slot, storage } => {
+                let value = self.cast(value, ty, storage);
+                let value = self.maybe_copy_array(value, storage);
+                self.emit(Inst::SlotSet {
+                    slot: *slot,
+                    src: value,
+                    ty: storage.clone(),
+                });
+            }
+            PreparedTarget::Property { object, index } => {
+                let value = self.maybe_copy_array(value, ty);
+                let tag = self.emit_const(Literal::Int(Self::tag_of(ty)));
+                let bits = self.encode_bits(value, ty);
+                self.rt_call(
+                    "pxr_object_set_bits",
+                    vec![*object, *index, tag, bits],
+                    Ty::Void,
+                );
+            }
+            PreparedTarget::Array { base, key } => {
+                let array = self.array_base_value(base);
+                self.write_array_element(array, *key, ty, value);
+            }
+            PreparedTarget::Nested {
+                parent,
+                parent_ty,
+                array_ty,
+                key,
+            } => {
+                let array = self.read_container(parent, parent_ty, array_ty);
+                let array = self.maybe_copy_array(array, array_ty);
+                self.write_array_element(array, *key, ty, value);
+                let value = self.cast(array, array_ty, parent_ty);
+                self.write_target(parent, parent_ty, value);
+            }
+        }
+    }
+
+    fn write_array_element(
+        &mut self,
+        array: Value,
+        key: Option<(Value, Value, Value)>,
+        ty: &Ty,
+        value: Value,
+    ) {
+        let value = self.maybe_copy_array(value, ty);
+        let tag = self.emit_const(Literal::Int(Self::tag_of(ty)));
+        let bits = self.encode_bits(value, ty);
+        if let Some((key_tag, integer, string)) = key {
+            self.array_set(array, key_tag, integer, string, tag, bits);
+        } else {
+            self.array_push(array, tag, bits);
         }
     }
 
@@ -1757,96 +1902,65 @@ impl Lowerer {
         }
     }
 
-    fn lower_coalesce_assign(&mut self, target: &TTarget, ty: &Ty, value: &TExpr) {
-        match target {
-            TTarget::MixedVar { .. } | TTarget::Var { .. } | TTarget::Property { .. } => {
-                // A proven concrete value cannot be null. Evaluate property bases
-                // even when the assignment is skipped, as PHP does.
-                let property = if let TTarget::Property { base, prop_idx, .. } = target {
-                    let obj = self.lower_expr(base);
-                    let idx = self.emit_const(Literal::Int(*prop_idx as i64));
-                    Some((obj, idx))
+    fn lower_coalesce_assign(&mut self, target: &TTarget, ty: &Ty, value: &TExpr) -> Value {
+        let place = self.prepare_target(target);
+        let present = match &place {
+            PreparedTarget::Array { .. } | PreparedTarget::Nested { .. } => {
+                let (array, key) = self.array_location(&place);
+                if let Some((tag, integer, string)) = key {
+                    let present = self.rt_call(
+                        "pxr_array_isset",
+                        vec![array, tag, integer, string],
+                        Ty::Int,
+                    );
+                    self.to_bool(present, &Ty::Int)
                 } else {
-                    None
-                };
-                if *ty != Ty::Mixed {
-                    return;
+                    self.emit_const(Literal::Bool(false))
                 }
-                let current = if let Some((obj, idx)) = property {
-                    let bits = self.rt_call("pxr_object_get_bits", vec![obj, idx], Ty::Int);
-                    self.decode_bits(bits, ty)
-                } else {
-                    self.lower_load(target, ty.clone()).0
-                };
-                let is_null = self.mixed_is_null(current);
-                let set_l = self.fresh_label();
-                let skip_l = self.fresh_label();
-                self.terminator(Inst::Branch {
-                    cond: is_null,
-                    then_label: set_l,
-                    else_label: skip_l,
-                });
-                self.switch_to(set_l);
-                let v = self.lower_expr(value);
-                let v = self.cast(v, &value.ty(), ty);
-                let v = self.maybe_copy_array(v, ty);
-                if let Some((obj, idx)) = property {
-                    let tag = self.emit_const(Literal::Int(Self::tag_of(ty)));
-                    let bits = self.encode_bits(v, ty);
-                    self.rt_call("pxr_object_set_bits", vec![obj, idx, tag, bits], Ty::Void);
-                } else {
-                    self.lower_store(target, ty.clone(), v);
-                }
-                self.terminator(Inst::Jump(skip_l));
-                self.switch_to(skip_l);
             }
-            TTarget::Index {
-                base,
-                elem_ty: _,
-                key,
-                key_ty,
-            } => {
-                let arr = self.lower_expr(base);
-                let (ktag, kint, kstr) = self.lower_key(key, key_ty);
-                let has = self.array_has(arr, ktag, kint, kstr);
-                let set_l = self.fresh_label();
-                let skip_l = self.fresh_label();
-                let check_l = if *ty == Ty::Mixed {
-                    self.fresh_label()
-                } else {
-                    skip_l
-                };
-                self.terminator(Inst::Branch {
-                    cond: has,
-                    then_label: check_l,
-                    else_label: set_l,
-                });
-                if *ty == Ty::Mixed {
-                    self.switch_to(check_l);
-                    let bits = self.array_get(arr, ktag, kint, kstr);
-                    let current = self.decode_bits(bits, ty);
-                    let is_null = self.mixed_is_null(current);
-                    self.terminator(Inst::Branch {
-                        cond: is_null,
-                        then_label: set_l,
-                        else_label: skip_l,
-                    });
-                }
-                self.switch_to(set_l);
-                let mut v = self.lower_expr(value);
-                let vt = value.ty();
-                if vt != *ty {
-                    v = self.cast(v, &vt, ty);
-                }
-                let vtag = self.emit_const(Literal::Int(Self::tag_of(ty)));
-                let v = self.maybe_copy_array(v, ty);
-                let bits = self.encode_bits(v, ty);
-                self.array_set(arr, ktag, kint, kstr, vtag, bits);
-                self.terminator(Inst::Jump(skip_l));
-                self.switch_to(skip_l);
+            _ if *ty == Ty::Mixed => {
+                let current = self.read_target(&place, ty);
+                let null = self.mixed_is_null(current);
+                let no = self.emit_const(Literal::Bool(false));
+                self.bin(IBinOp::Eq, null, &Ty::Bool, no, &Ty::Bool, &Ty::Bool)
             }
-            TTarget::Push { .. } => {}
-        }
+            _ => return self.read_target(&place, ty),
+        };
+        let result = self.alloc_temp_slot(ty.clone());
+        let done = self.fresh_label();
+        let set = self.fresh_label();
+        let skip = self.fresh_label();
+        self.terminator(Inst::Branch {
+            cond: present,
+            then_label: skip,
+            else_label: set,
+        });
+        self.switch_to(set);
+        let v = self.lower_expr(value);
+        let v = self.cast(v, &value.ty(), ty);
+        self.write_target(&place, ty, v);
+        self.emit(Inst::SlotSet {
+            slot: result,
+            src: v,
+            ty: ty.clone(),
+        });
+        self.terminator(Inst::Jump(done));
+        self.switch_to(skip);
+        let current = self.read_target(&place, ty);
+        self.emit(Inst::SlotSet {
+            slot: result,
+            src: current,
+            ty: ty.clone(),
+        });
+        self.terminator(Inst::Jump(done));
+        self.switch_to(done);
+        let dst = self.fresh();
+        self.emit(Inst::SlotGet {
+            dst,
+            slot: result,
+            ty: ty.clone(),
+        });
+        dst
     }
 
     // ---- Loops and switches --------------------------------------------
@@ -1944,6 +2058,7 @@ impl Lowerer {
         &mut self,
         base: &TExpr,
         base_ty: &Ty,
+        key_slot: Option<u32>,
         value_slot: u32,
         value_ty: &Ty,
         body: &[TStmt],
@@ -1983,6 +2098,12 @@ impl Lowerer {
 
         self.switch_to(body_l);
         let iv2 = self.load_slot(idx, Ty::Int);
+        let key_value = key_slot.map(|slot| {
+            (
+                slot,
+                self.rt_call("pxr_array_key_at", vec![arr, iv2], Ty::Mixed),
+            )
+        });
         let bits = self.array_val_at(arr, iv2);
         let element_ty = base_ty.array_elem().expect("foreach subject is an array");
         let v = self.decode_bits(bits, element_ty);
@@ -1995,6 +2116,14 @@ impl Lowerer {
             src: v,
             ty: value_ty.clone(),
         });
+        // PHP binds the value first, then the key when destinations alias.
+        if let Some((slot, key)) = key_value {
+            self.emit(Inst::SlotSet {
+                slot,
+                src: key,
+                ty: Ty::Mixed,
+            });
+        }
         self.lower_stmts(body);
         if !self.terminated {
             self.terminator(Inst::Jump(step));
@@ -2446,19 +2575,7 @@ impl Lowerer {
                 self.rt_call("pxr_array_fill", vec![a[0], a[1], vtag, vbits], ret.clone())
             }
             ArrayKeyExists => {
-                let (ktag, ki, ks) = match arg_tys[0] {
-                    Ty::Int => (
-                        self.emit_const(Literal::Int(1)),
-                        a[0],
-                        self.emit_const(Literal::Str(Vec::new())),
-                    ),
-                    Ty::String => (
-                        self.emit_const(Literal::Int(4)),
-                        self.emit_const(Literal::Int(0)),
-                        a[0],
-                    ),
-                    _ => unreachable!("key type is enforced by sema"),
-                };
+                let (ktag, ki, ks) = self.lower_key_value(a[0], &arg_tys[0]);
                 let v = self.rt_call("pxr_array_has", vec![a[1], ktag, ki, ks], Ty::Int);
                 self.to_bool(v, &Ty::Int)
             }

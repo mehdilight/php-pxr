@@ -122,9 +122,14 @@ Operator precedence follows PHP 8 (in particular `.` binds looser than `+`/`-`,
 and `!` binds tighter than both). `??` is right‑associative and sits just below
 `?:`; `?:` is right‑associative.
 
-Only `+=`‑style assignment, `++`/`--` and plain `=` are *statements* — PXR
-deliberately does **not** allow assignment expressions (so `$a = $b = 1` and
-`f($x++)` are rejected).
+Assignments and increments also produce values: `$a = $b = 1`, `f($x++)`,
+`++$x`, `($a[0] += 2)` and `($a[0] ??= 3)` are supported. Postfix returns the
+previous value; prefix returns the updated value. Targets are prepared once,
+before the right-hand side, including across `await`. Assignment expressions
+cannot duplicate owned or borrowed bindings.
+Bindings introduced only on a conditional path must be initialized on every
+reachable path before a read. A skipped expression or zero-iteration foreach
+does not initialize a destination.
 
 ## Function declarations
 
@@ -185,9 +190,11 @@ converted to their string form.
 A double‑quoted string may interpolate a variable with `"$name"` or `"{$name}"`;
 this is syntactic sugar for `"" . $name`, so the value is string‑converted like
 any other `.` operand. A `$` that is not followed by a name start is an ordinary
-`$` (`"$1"`, `"foo$"`, `"$$x"` behave as in PHP). PHP's richer interpolation
-forms — `"$a[0]"`, `"$a[$k]"`, `"{$a[0]}"`, `"$obj->p"` and the deprecated
-`"${name}"` — are not implemented and are rejected with `E0008`.
+`$` (`"$1"`, `"foo$"`, `"$$x"` behave as in PHP). Interpolation also supports `$a[0]`, `$a[$k]`, `$a[name]`, `$obj->p`, and
+braced accesses such as `{$a['name'][0]}` and `{$obj->label($i)}`. Bare keys in
+simple interpolation are string keys. Braced forms use ordinary expression
+rules inside indices and method arguments. Deprecated `${name}` and invalid
+interpolation syntax are rejected with `E0008`.
 
 Equality:
 
@@ -243,19 +250,34 @@ Rules and limitations:
 * An empty `[]` has an as‑yet‑unknown element type that is **refined** by the
   first `push`/`set`; reading an element of a still‑empty array is an error
   (`E0243`).
-* Keys must be `int` or `string` (`E0250`). A `float` key is rejected.
+* Keys must be `int` or `string` (`E0250`), or `mixed` checked at runtime. A `float` key is rejected.
 * You cannot `echo`/`print` an array (`E0240`); index it or use a loop.
-* Nested assignment `$a[0][1] = x` is not supported yet (`E0248`); assign the
-  inner array to a variable first.
-* `foreach` currently supports the **value‑only** form `foreach ($a as $v)`. The
-  keyed form `foreach ($a as $k => $v)` is rejected (`E0242`); iterate with an
-  explicit index and `count()` instead.
+* Nested array/property writes such as `$a[0][1] = 7`, `$obj->items[0][] = 8`,
+  and static-property paths are supported, including compound updates. Missing
+  nested paths and mixed null parents become arrays on a successful write.
+* Both `foreach ($a as $v)` and `foreach ($a as $k => $v)` work. A key binding
+  has type `mixed` because keys may be integers or strings. A predeclared key
+  destination must also be `mixed` (`E0242`).
 * Arrays have PHP **value semantics**: `$b = $a`, passing `$a` to a function,
   returning an array, and `foreach` all operate on a copy. Copies share storage
   until mutation separates it, including nested arrays, so mutating a copy never
   affects the original. Objects stored inside arrays keep reference identity.
 * Canonical decimal‑integer string keys **are** the integer key (`$a["1"]` is
   `$a[1]`), exactly as in PHP; `"01"`, `"1.5"`, `"+1"` and `" 1"` stay strings.
+
+## Invokable object callbacks
+
+An object with a checked `__invoke` method can be called as `$callback($value)`.
+Parenthesized receivers, `(new Handler())($value)` and function-result receivers
+work too. A callback interface can declare `__invoke` and be accepted by an
+ordinary typed function; inherited overrides dispatch normally. See
+[`callback_objects.php`](../examples/callback_objects.php).
+
+The receiver evaluates once before its arguments and remains rooted across
+argument suspension. Visibility, arity, argument types and ownership checks are
+the same as method calls. Current magic-method rules require synchronous,
+nongeneric `__invoke`. Callable strings/arrays, closures, `callable` annotations
+and first-class callable references remain separate, unfinished M10 features.
 
 ## Control flow
 
@@ -264,7 +286,7 @@ Rules and limitations:
 * `for (init; cond; update) body` — `init` and `update` are lists of assignment
   statements; `cond` may be omitted for an infinite loop. The `continue` target
   is the `update` step.
-* `foreach ($arr as $v) body` — value‑only (see arrays above).
+* `foreach ($arr as $v)` and `foreach ($arr as $k => $v)` (see arrays above).
 * `break` / `continue` with an optional level: `break 2;` exits two nested
   loops. A `switch` counts as one level, so `continue` inside a `switch` behaves
   like `break` (as in PHP).
@@ -366,7 +388,8 @@ are `W020x`.
 | `E0006` | Integer literal out of range |
 | `E0007` | Unterminated string literal |
 | `W0001` | Leading‑zero octal treated as decimal |
-| `E0008` | Unsupported double‑quoted interpolation form (`$a[...]`, `{$expr}`, `$obj->p`, `${...}`) |
+| `E0008` | Invalid or deprecated double‑quoted interpolation form |
+| `E0009` | Attributes are not implemented; `#[...]` cannot be ignored as a comment |
 | `E0100` | Syntax error (with the unexpected token described) |
 | `E0201` | Duplicate function definition or parameter |
 | `E0202` | Parameter needs an explicit type |
@@ -382,7 +405,7 @@ are `W020x`.
 | `E0213` | Function must return a value |
 | `E0214` | `void` function must not return a value |
 | `E0215` | Return type mismatch |
-| `E0220` | Undefined variable |
+| `E0220` | Undefined or potentially uninitialized variable |
 | `E0221` | Unary operand type error |
 | `E0222` | `%` requires two `int`s |
 | `E0223` | `.` operand type error |

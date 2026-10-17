@@ -55,7 +55,7 @@ today     typed scalars, arrays, control flow, LLVM backend, tests, benchmarks
   ├─ M7  async/await + structured tasks, then threads      ✅ done
   ├─ M8  C interoperability (extern "C", FFI)             (systems access)
   ├─ M9  package tooling, LSP, cross-compile, JIT         (parallel tooling track)
-  ├─ M10 PHP language compatibility foundations          (planned)
+  ├─ M10 PHP language compatibility foundations          (in progress)
   ├─ M11 reflection and dynamic object behavior          (planned)
   ├─ M12 Composer dependencies and autoloading            (planned)
   ├─ M13 standard library and native service integrations (planned)
@@ -107,7 +107,7 @@ The planned M10–M15 track broadens language behavior, reflection/dynamic dispa
 Composer dependency loading, runtime libraries and request lifecycle support.
 It uses version-pinned, framework-agnostic package, CLI and HTTP fixtures, with
 explicit acceptance gates in [MILESTONES.md](MILESTONES.md#planned-php-application-compatibility-track).
-M8 remains next; M9 tooling can progress alongside this compatibility work.
+M10 is the current implementation focus. M8 remains planned; M9 tooling can progress alongside this compatibility work.
 
 Native support and explicit PHP boundaries remain separate execution modes.
 Current typed checks stay the default; any broader package compatibility policy

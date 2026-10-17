@@ -133,6 +133,8 @@ fn owned_values_moves_borrows_and_generic_methods() {
 #[test]
 fn ownership_violations_fail_before_lowering() {
     let cases = [
+        ("assignment-result-copy", "$x: owned<int> = 1; $y = ($x = 2);"),
+        ("increment-result-copy", "$x: owned<int> = 1; echo $x++;"),
         ("copy", "$x: owned<string> = \"x\"; $y = $x;"),
         ("move-use", "$x: owned<string> = \"x\"; $y = move($x); echo $x;"),
         ("drop-use", "$x: owned<string> = \"x\"; drop($x); echo $x;"),

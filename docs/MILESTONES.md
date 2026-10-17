@@ -930,7 +930,12 @@ native type checks as the default; define an explicit package/module compatibili
 policy before accepting untyped declarations or broader dynamic behavior. A
 compiler failure must never silently switch execution to PHP.
 
-### ⛔ M10 — PHP language compatibility foundations
+### 🚧 M10 — PHP language compatibility foundations
+
+**Current focus.** M10 is being implemented ahead of M8/M9 at the user's request.
+The milestone remains in progress until every scoped subfeature passes its
+acceptance checks. Delivered slices and outstanding work are tracked in
+[M10.md](M10.md).
 
 **Scope.**
 

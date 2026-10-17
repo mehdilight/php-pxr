@@ -22,6 +22,8 @@ pub enum StrPart {
     Lit(Vec<u8>),
     /// A `$name` / `{$name}` variable reference.
     Var(String),
+    /// Tokenized access expression inside a string; spans refer to the source file.
+    Expression(Vec<Token>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -290,6 +292,22 @@ pub struct Token {
     pub span: Span,
 }
 
+impl Token {
+    pub fn shift(&mut self, offset: usize) {
+        self.span.start += offset;
+        self.span.end += offset;
+        if let TokenKind::InterpStr(parts) = &mut self.kind {
+            for part in parts {
+                if let StrPart::Expression(tokens) = part {
+                    for token in tokens {
+                        token.shift(offset);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
@@ -366,6 +384,9 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                 }
                 Some(b'#') => {
+                    if self.peek_at(1) == Some(b'[') {
+                        self.diags.emit(Diagnostic::error("attributes are not implemented yet; #[...] cannot be treated as a comment").with_code("E0009").with_span(Span::new(self.pos, self.pos + 2)));
+                    }
                     while let Some(b) = self.peek() {
                         if b == b'\n' {
                             break;
@@ -906,25 +927,65 @@ impl<'a> Lexer<'a> {
                             parts.push(StrPart::Lit(std::mem::take(&mut cur)));
                         }
                         has_var = true;
-                        parts.push(StrPart::Var(name));
-                        // PHP's "simple" syntax also allows `$a[0]` / `$a[$k]`
-                        // and `$obj->prop`; reject these rather than mis-lex.
+                        let access_start = self.pos - name.len() - 1;
+                        let mut bare_key = None;
                         if self.peek() == Some(b'[') {
-                            self.diags.emit(
-                                Diagnostic::error(
-                                    "array interpolation (`$a[...]`) is not implemented yet; write a concatenation instead",
-                                )
-                                .with_code("E0008")
-                                .with_span(Span::new(self.pos, self.pos + 1)),
-                            );
+                            self.pos += 1;
+                            let key_start = self.pos;
+                            if self.peek() == Some(b'$') {
+                                self.pos += 1;
+                                self.read_ident_body();
+                            } else if self.peek().is_some_and(is_ident_start) {
+                                let key = self.read_ident_body();
+                                bare_key = Some(key);
+                            } else {
+                                if self.peek() == Some(b'-') {
+                                    self.pos += 1;
+                                }
+                                while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+                                    self.pos += 1;
+                                }
+                            }
+                            if self.pos == key_start || self.peek() != Some(b']') {
+                                self.diags.emit(Diagnostic::error("invalid simple array interpolation; use {$array[expression]} for complex keys").with_code("E0008").with_span(Span::new(access_start, self.pos)));
+                            } else {
+                                self.pos += 1;
+                            }
                         } else if self.peek() == Some(b'-') && self.peek_at(1) == Some(b'>') {
-                            self.diags.emit(
-                                Diagnostic::error(
-                                    "property interpolation (`$obj->prop`) is not implemented yet; write a concatenation instead",
-                                )
-                                .with_code("E0008")
-                                .with_span(Span::new(self.pos, self.pos + 2)),
-                            );
+                            self.pos += 2;
+                            let property = self.read_ident_body();
+                            if property.is_empty() {
+                                self.diags.emit(
+                                    Diagnostic::error("expected property name in interpolation")
+                                        .with_code("E0008")
+                                        .with_span(Span::new(access_start, self.pos)),
+                                );
+                            }
+                        }
+                        if self.pos == access_start + name.len() + 1 {
+                            parts.push(StrPart::Var(name));
+                        } else {
+                            let source =
+                                std::str::from_utf8(&self.src[access_start..self.pos]).unwrap();
+                            let (mut tokens, diagnostics) = lex(source);
+                            for token in &mut tokens {
+                                token.shift(access_start);
+                            }
+                            if let Some(key) = bare_key {
+                                // A bare simple-interpolation key is a string, never a constant.
+                                if let Some(token) = tokens.get_mut(2) {
+                                    token.kind = TokenKind::Str(key.into_bytes());
+                                }
+                            }
+                            for diagnostic in diagnostics.items() {
+                                let mut diagnostic = diagnostic.clone();
+                                if let Some(span) = &mut diagnostic.span {
+                                    span.start += access_start;
+                                    span.end += access_start;
+                                }
+                                self.diags.emit(diagnostic);
+                            }
+                            parts.push(StrPart::Expression(tokens));
                         }
                     }
                     _ => {
@@ -935,30 +996,75 @@ impl<'a> Lexer<'a> {
                     }
                 },
                 Some(b'{') if self.peek_at(1) == Some(b'$') => {
-                    // `{$name}` (simple) is supported; anything more complex is
-                    // rejected so it is never silently treated as literal.
-                    let save = self.pos;
-                    self.pos += 2; // `{` `$`
-                    let name = self.read_ident_body();
-                    if !name.is_empty() && self.peek() == Some(b'}') {
-                        self.pos += 1;
-                        if !cur.is_empty() {
-                            parts.push(StrPart::Lit(std::mem::take(&mut cur)));
+                    self.pos += 1;
+                    let begin = self.pos;
+                    let mut depth = 1;
+                    let mut quote = None;
+                    while let Some(b) = self.peek() {
+                        if let Some(q) = quote {
+                            self.pos += 1;
+                            if b == b'\\' {
+                                if self.peek().is_some() {
+                                    self.pos += 1;
+                                }
+                            } else if b == q {
+                                quote = None;
+                            }
+                        } else {
+                            match b {
+                                b'\'' | b'"' => {
+                                    quote = Some(b);
+                                    self.pos += 1;
+                                }
+                                b'{' => {
+                                    depth += 1;
+                                    self.pos += 1;
+                                }
+                                b'}' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                    self.pos += 1;
+                                }
+                                _ => self.pos += 1,
+                            }
                         }
-                        has_var = true;
-                        parts.push(StrPart::Var(name));
-                    } else {
-                        self.pos = save;
-                        self.diags.emit(
-                            Diagnostic::error(
-                                "complex string interpolation (`{$...}`) is not implemented yet; only `{$name}` is supported",
-                            )
-                            .with_code("E0008")
-                            .with_span(Span::new(self.pos, self.pos + 1)),
-                        );
-                        cur.push(b'{');
-                        self.pos += 1;
                     }
+                    if depth != 0 {
+                        self.diags.emit(
+                            Diagnostic::error("unterminated braced interpolation")
+                                .with_code("E0008")
+                                .with_span(Span::new(begin - 1, self.pos)),
+                        );
+                        break;
+                    }
+                    let source = std::str::from_utf8(&self.src[begin..self.pos]).unwrap();
+                    let (mut tokens, diagnostics) = lex(source);
+                    for token in &mut tokens {
+                        token.shift(begin);
+                    }
+                    for diagnostic in diagnostics.items() {
+                        let mut diagnostic = diagnostic.clone();
+                        if let Some(span) = &mut diagnostic.span {
+                            span.start += begin;
+                            span.end += begin;
+                        }
+                        self.diags.emit(diagnostic);
+                    }
+                    self.pos += 1;
+                    if !cur.is_empty() {
+                        parts.push(StrPart::Lit(std::mem::take(&mut cur)));
+                    }
+                    has_var = true;
+                    // Keep the existing simple-variable token representation.
+                    if tokens.len() == 2 {
+                        if let TokenKind::Variable(name) = &tokens[0].kind {
+                            parts.push(StrPart::Var(name.clone()));
+                            continue;
+                        }
+                    }
+                    parts.push(StrPart::Expression(tokens));
                 }
                 Some(b) => {
                     cur.push(b);
@@ -1168,21 +1274,11 @@ mod tests {
     }
 
     #[test]
-    fn interpolation_complex_forms_are_rejected() {
-        for src in [
-            r#""$a[0]""#,
-            r#""$a[k]""#,
-            r#""$a[$j]""#,
-            r#""{$a[0]}""#,
-            r#""$obj->prop""#,
-            r#""${x}""#,
-        ] {
+    fn interpolation_invalid_and_deprecated_forms_are_rejected() {
+        for src in [r#""${x}""#, r#""$a['quoted']""#, r#""{$a[0]""#] {
             let (_, diags) = lex(src);
             assert!(diags.has_errors(), "expected a diagnostic for {src}");
-            assert!(
-                diags.items().iter().any(|d| d.code == Some("E0008")),
-                "expected E0008 for {src}"
-            );
+            assert!(diags.items().iter().any(|d| d.code == Some("E0008")));
         }
     }
 

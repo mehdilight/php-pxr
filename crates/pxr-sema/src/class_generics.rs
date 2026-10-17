@@ -699,6 +699,7 @@ impl ClassExpander {
     fn expression(&mut self, expression: &mut ast::Expr, bindings: &Bindings) {
         use ast::Expr as E;
         match expression {
+            E::Effect { statement, .. } => self.statement(statement, bindings),
             E::Unary { expr, .. } | E::Paren(expr, _) | E::Property { base: expr, .. } => {
                 self.expression(expr, bindings)
             }

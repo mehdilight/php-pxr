@@ -33,6 +33,7 @@ fn argument(e: &TExpr, want: &Ty, d: &mut Diagnostics) {
 }
 fn expression(e: &TExpr, d: &mut Diagnostics) {
     match e {
+        TExpr::Effect { statement, .. } => statements(std::slice::from_ref(statement), d),
         TExpr::Pass { expr, .. }
         | TExpr::Coerce { expr, .. }
         | TExpr::Un { expr, .. }
@@ -116,6 +117,12 @@ fn target(t: &TTarget, d: &mut Diagnostics) {
             expression(key, d);
         }
         TTarget::Property { base, .. } | TTarget::Push { base, .. } => expression(base, d),
+        TTarget::Nested { parent, key, .. } => {
+            target(parent, d);
+            if let Some((key, _)) = key {
+                expression(key, d);
+            }
+        }
         TTarget::Var { .. } | TTarget::MixedVar { .. } => {}
     }
 }

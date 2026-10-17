@@ -2469,6 +2469,65 @@ void *pxr_array_to_mixed(void *p) {
     return copy;
 }
 
+/* A missing intermediate is not published until the completed write-back. */
+void *pxr_mixed_array_or_new(void *p) {
+    const pxr_mixed *value = pxr_mixed_checked(p);
+    if (value->tag == PXR_TAG_NULL) return pxr_array_new();
+    if (value->tag == PXR_TAG_ARR) return (void *)(intptr_t)value->bits;
+    fprintf(stderr, "Fatal error: Uncaught TypeError: nested write requires an array\n");
+    exit(255);
+}
+void *pxr_array_child_or_new(void *p, long long tag, long long integer, const pxr_str *string, long long boxed) {
+    pxr_array *array = p;
+    pxr_norm_key(&tag, &integer, &string);
+    long index = pxr_array_find(array, tag, integer, string);
+    if (index < 0) return pxr_array_new();
+    pxr_ent *entry = &array->ents[index];
+    if (entry->vt == PXR_TAG_MIXED) return pxr_mixed_array_or_new((void *)(intptr_t)entry->bits);
+    if (entry->vt == PXR_TAG_NULL) return pxr_array_new();
+    if (entry->vt == PXR_TAG_ARR && entry->bits) {
+        void *child = (void *)(intptr_t)entry->bits;
+        return boxed ? pxr_array_to_mixed(child) : child;
+    }
+    fprintf(stderr, "Fatal error: Uncaught TypeError: nested write requires an array\n");
+    exit(255);
+}
+long long pxr_array_isset(void *p, long long tag, long long integer, const pxr_str *string) {
+    pxr_array *array = p;
+    pxr_norm_key(&tag, &integer, &string);
+    long index = pxr_array_find(array, tag, integer, string);
+    if (index < 0) return 0;
+    pxr_ent *entry = &array->ents[index];
+    if (entry->vt == PXR_TAG_NULL) return 0;
+    return entry->vt != PXR_TAG_MIXED || pxr_mixed_checked((void *)(intptr_t)entry->bits)->tag != PXR_TAG_NULL;
+}
+
+long long pxr_mixed_key_tag(void *p) {
+    const pxr_mixed *value = pxr_mixed_checked(p);
+    if (value->tag != PXR_TAG_INT && value->tag != PXR_TAG_STR) {
+        fprintf(stderr, "Fatal error: Uncaught TypeError: array key must be int or string\n");
+        exit(255);
+    }
+    return value->tag;
+}
+long long pxr_mixed_key_int(void *p) {
+    const pxr_mixed *value = pxr_mixed_checked(p);
+    return value->tag == PXR_TAG_INT ? value->bits : 0;
+}
+pxr_str *pxr_mixed_key_str(void *p) {
+    const pxr_mixed *value = pxr_mixed_checked(p);
+    return value->tag == PXR_TAG_STR ? (void *)(intptr_t)value->bits : NULL;
+}
+
+/* Keys preserve their normalized integer/string tag and insertion order. */
+void *pxr_array_key_at(void *p, long long i) {
+    pxr_array *array = p;
+    if (i < 0 || (size_t)i >= array->len) abort();
+    pxr_ent *entry = &array->ents[(size_t)i];
+    return pxr_mixed_box(entry->ks ? PXR_TAG_STR : PXR_TAG_INT,
+        entry->ks ? (intptr_t)entry->ks : entry->ki);
+}
+
 void *pxr_mixed_copy(void *p) {
     const pxr_mixed *value = pxr_mixed_checked(p);
     if (value->tag != PXR_TAG_ARR) return p;
@@ -2483,7 +2542,7 @@ void *pxr_mixed_copy(void *p) {
 static void *pxr_mixed_payload(const void *p, int tag) {
     const pxr_mixed *value = pxr_mixed_checked(p);
     if (value->tag != tag) {
-        fputs("Fatal error: mixed value does not satisfy its guarded type\n", stderr);
+        fputs("Fatal error: Uncaught TypeError: mixed value does not satisfy the required type\n", stderr);
         exit(255);
     }
     return (void *)(intptr_t)value->bits;

@@ -71,6 +71,15 @@ Mixed arithmetic results remain mixed. Assigning one to a concrete destination
 requires a guard or explicit conversion; concrete arithmetic keeps its original
 static ABI and overflow rules. `**` is outside the current compiled subset.
 
+## Array access
+
+Mixed array reads such as `$value[$key][0]` and `$obj->data['name']` check that
+each container is an array and return mixed elements. A key may be int, string,
+or mixed with a checked int/string tag. String offsets and scalar/null offset
+coercion are not implemented by this array path; a wrong container tag raises
+a fatal TypeError. Array guards are still required for iteration and typed array
+transforms. Nested writes can create arrays from missing/null parents.
+
 ## Narrowing
 
 Scalar predicates narrow local variables and parameters. `is_array` narrows to

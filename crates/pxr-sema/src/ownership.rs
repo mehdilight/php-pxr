@@ -1515,6 +1515,30 @@ impl Checker {
     }
     fn expr(&mut self, e: &Expr) -> Value {
         match e {
+            Expr::Effect {
+                statement, span, ..
+            } => {
+                self.stmt(statement);
+                if let Stmt::Assign {
+                    target: LValue::Var { name, .. },
+                    ..
+                }
+                | Stmt::AssignOp {
+                    target: LValue::Var { name, .. },
+                    ..
+                }
+                | Stmt::IncDec {
+                    target: LValue::Var { name, .. },
+                    ..
+                } = &**statement
+                {
+                    if self.env.get(name).is_some_and(|b| b.mode != Mode::Shared) {
+                        self.error(*span, "an assignment expression cannot duplicate an owned or borrowed binding");
+                    }
+                    return Value::plain(self.env.get(name).and_then(|b| b.ty.clone()));
+                }
+                Value::plain(None)
+            }
             Expr::IntLit(..) => Value {
                 fresh: true,
                 ..Value::plain(Some(TypeRef::Int))
@@ -2380,6 +2404,7 @@ fn erase_type(t: &mut TypeRef) {
 }
 fn erase_expr(e: &mut Expr) {
     match e {
+        Expr::Effect { statement, .. } => erase_stmt(statement),
         Expr::Call {
             callee,
             args,

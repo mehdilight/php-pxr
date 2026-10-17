@@ -51,6 +51,9 @@ fn runtime_leaf(callee: &str) -> bool {
             | "pxr_str_cmp"
             | "pxr_str_cmp_loose"
             | "pxr_str_freeze"
+            | "pxr_mixed_key_tag"
+            | "pxr_mixed_key_int"
+            | "pxr_mixed_key_str"
     )
 }
 
