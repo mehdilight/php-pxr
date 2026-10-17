@@ -6,6 +6,8 @@
 //! a diagnostic and resynchronizes at the next statement boundary so that a
 //! single run reports as many independent syntax errors as possible.
 
+mod closures;
+
 use pxr_ast::*;
 use pxr_diag::{Diagnostic, Diagnostics, Span};
 use pxr_lexer::{StrPart, Token, TokenKind};
@@ -27,6 +29,8 @@ pub struct Parser {
     declared_functions: Vec<String>,
     type_params: Vec<String>,
     future_type_params: Vec<String>,
+    generated_items: Vec<Stmt>,
+    in_method: bool,
 }
 
 pub fn parse(src: &str) -> (Option<Program>, Diagnostics) {
@@ -63,6 +67,8 @@ pub fn parse_at(src: &str, offset: usize) -> (Option<Program>, Diagnostics) {
         declared_functions: Vec::new(),
         type_params: Vec::new(),
         future_type_params: Vec::new(),
+        generated_items: Vec::new(),
+        in_method: false,
     };
     let program = p.parse_program();
     let mut diags = shifted;
@@ -158,6 +164,7 @@ impl Parser {
             last = self.pos;
         }
         let end = self.peek().span;
+        items.append(&mut self.generated_items);
         Some(Program {
             items,
             span: start.merge(end),
@@ -404,6 +411,9 @@ impl Parser {
                 let e = self.parse_expr()?;
                 let semi = self.expect(&TokenKind::Semicolon, "`;` after `print`")?;
                 Ok(Some(Stmt::Print(e, start.merge(semi.span))))
+            }
+            TokenKind::Function if self.peek_at(1).kind == TokenKind::LParen => {
+                self.parse_simple().map(Some)
             }
             TokenKind::Function | TokenKind::Async => {
                 self.parse_fn().map(|f| Some(Stmt::FnDecl(Box::new(f))))
@@ -909,7 +919,10 @@ impl Parser {
             self.expect(&TokenKind::Semicolon, "`;` after abstract method signature")?;
             Vec::new()
         } else {
-            self.parse_block()?
+            let previous = std::mem::replace(&mut self.in_method, true);
+            let result = self.parse_block();
+            self.in_method = previous;
+            result?
         };
         let end = self.peek().span;
         Ok(MethodDecl {
@@ -1763,6 +1776,7 @@ impl Parser {
         let tok = self.peek().clone();
         let span = tok.span;
         match tok.kind {
+            TokenKind::Function | TokenKind::Fn => self.parse_closure(),
             TokenKind::Int(v) => {
                 self.advance();
                 Ok(Expr::IntLit(v, span))

@@ -43,6 +43,7 @@ pub enum TokenKind {
 
     // Keywords.
     Function,
+    Fn,
     Async,
     Await,
     Spawn,
@@ -178,6 +179,7 @@ impl TokenKind {
     pub fn symbol(&self) -> &'static str {
         match self {
             TokenKind::Function => "function",
+            TokenKind::Fn => "fn",
             TokenKind::Async => "async",
             TokenKind::Await => "await",
             TokenKind::Spawn => "spawn",
@@ -1115,6 +1117,7 @@ fn keyword(word: &str) -> Option<TokenKind> {
     // PHP keywords are case-insensitive; PXR preserves that behaviour.
     Some(match word.to_ascii_lowercase().as_str() {
         "function" => TokenKind::Function,
+        "fn" => TokenKind::Fn,
         "async" => TokenKind::Async,
         "await" => TokenKind::Await,
         "spawn" => TokenKind::Spawn,

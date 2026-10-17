@@ -4508,3 +4508,88 @@ fn invokable_object_calls_keep_static_argument_and_receiver_checks() {
         assert!(run.stderr.contains(diagnostic), "{name}: {}", run.stderr);
     }
 }
+
+#[test]
+fn by_value_closures_and_arrows_preserve_capture_snapshots_and_locals() {
+    assert_matches_php(
+        "closure_values",
+        r#"<?php
+$x = 1;
+$f = function(int $n) use ($x): int { return ++$x + $n; };
+$x = 20;
+echo $f(3), ":", $f(3), ":", $x, "\n";
+$a = [1, 2];
+$read = function() use ($a): int { $a[0]++; return $a[0]; };
+$a[0] = 8;
+echo $read(), ":", $read(), ":", $a[0], "\n";
+$scale = 3;
+$arrow = fn(int $n): int => $n * $scale;
+$scale = 9;
+echo $arrow(4), "\n";
+$text = "a"; $text .= "b"; $stringRead = fn(): string => $text; $text .= "c";
+echo $stringRead(), ":", $text, "\n";
+class CaptureObject { public int $value = 5; }
+$obj = new CaptureObject();
+$objectRead = fn(): int => $obj->value;
+$obj->value = 7;
+echo $objectRead(), "\n";
+$plain = fn(int $n): int => $n + 1;
+echo $plain(6), ":", (function(int $n): int { return $n * 2; })(4), "\n";
+"#,
+    );
+}
+
+#[test]
+fn escaping_nested_and_inferred_closures_match_php() {
+    assert_matches_php(
+        "escaping_closures",
+        r#"<?php
+function makeAdder(int $seed) { return fn(int $n) => $seed + $n; }
+$add = makeAdder(5);
+echo $add(7), "\n";
+$make = fn(int $x) => fn(int $y) => $x + $y;
+$inner = $make(8);
+echo $inner(3), "\n";
+$increment = 1;
+$mutate = fn() => ++$increment;
+echo $mutate(), ":", $mutate(), ":", $increment, "\n";
+function() { echo "unused"; };
+"#,
+    );
+}
+
+#[test]
+fn unsupported_closure_aliases_and_binding_fail_explicitly() {
+    for (name, source, message) in [
+        (
+            "closure_empty_use",
+            "<?php $f=function() use (): int { return 1; };",
+            "at least one captured variable",
+        ),
+        (
+            "closure_reference",
+            "<?php $x=1; $f=function() use (&$x): int { return $x; };",
+            "reference captures",
+        ),
+        (
+            "closure_method_scope",
+            "<?php class C { public function make() { return fn(): int => 1; } }",
+            "lexical receiver binding",
+        ),
+        (
+            "closure_this",
+            "<?php $f=fn() => $this;",
+            "bound closure receivers",
+        ),
+        (
+            "closure_duplicate",
+            "<?php $x=1; $f=function() use ($x,$x): int { return $x; };",
+            "invalid or duplicate closure capture",
+        ),
+    ] {
+        let path = temp_php(name, source);
+        let run = run_ok(&["check", path.to_str().unwrap()]);
+        assert_eq!(run.code, 1, "{name}: {}", run.stderr);
+        assert!(run.stderr.contains(message), "{name}: {}", run.stderr);
+    }
+}

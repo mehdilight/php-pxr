@@ -133,6 +133,8 @@ fn owned_values_moves_borrows_and_generic_methods() {
 #[test]
 fn ownership_violations_fail_before_lowering() {
     let cases = [
+        ("owned-closure-capture", "$x: owned<int> = 1; $f = fn(): int => $x;"),
+        ("borrow-closure-capture", "function f(&array<int> $a): void { $g = fn(): int => count($a); }"),
         ("assignment-result-copy", "$x: owned<int> = 1; $y = ($x = 2);"),
         ("increment-result-copy", "$x: owned<int> = 1; echo $x++;"),
         ("copy", "$x: owned<string> = \"x\"; $y = $x;"),

@@ -2624,3 +2624,27 @@ async function main(): void {
         "receiver:kept:done\nreceiver:temporary:done\nkept:again\n",
     );
 }
+
+#[test]
+fn closure_environments_escape_factories_and_survive_suspension() {
+    run_case(
+        "closure_lifetime",
+        r#"<?php
+function makeText(string $seed) { return fn(int $n): string => $seed . $n; }
+async function number(): int { await sleepAsync(0); return 7; }
+async function main(): void {
+    $format = makeText("retained:");
+    await sleepAsync(0);
+    echo $format(await number()), "\n";
+    $values = [3];
+    $snapshot = function() use ($values): int { $values[0]++; return $values[0]; };
+    $values[0] = 99;
+    $make = fn(int $x) => fn(int $y): int => $x + $y;
+    $inner = $make(5);
+    for ($i=0; $i<50; $i++) { $temporary = makeText("temporary:"); await sleepAsync(0); }
+    echo $snapshot(), ":", $snapshot(), ":", $values[0], ":", $inner(8), "\n";
+}
+"#,
+        "retained:7\n4:4:99:13\n",
+    );
+}

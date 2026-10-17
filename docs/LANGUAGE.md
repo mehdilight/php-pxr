@@ -276,8 +276,9 @@ ordinary typed function; inherited overrides dispatch normally. See
 The receiver evaluates once before its arguments and remains rooted across
 argument suspension. Visibility, arity, argument types and ownership checks are
 the same as method calls. Current magic-method rules require synchronous,
-nongeneric `__invoke`. Callable strings/arrays, closures, `callable` annotations
+nongeneric `__invoke`. Callable strings/arrays, `callable` annotations
 and first-class callable references remain separate, unfinished M10 features.
+Local by-value closures and arrow functions are described in [CALLABLES.md](CALLABLES.md).
 
 ## Control flow
 
