@@ -31,6 +31,9 @@ pub struct Parser {
     future_type_params: Vec<String>,
     generated_items: Vec<Stmt>,
     in_method: bool,
+    method_static: bool,
+    method_generic: bool,
+    closure_class: Option<closures::ClassScope>,
 }
 
 pub fn parse(src: &str) -> (Option<Program>, Diagnostics) {
@@ -69,6 +72,9 @@ pub fn parse_at(src: &str, offset: usize) -> (Option<Program>, Diagnostics) {
         future_type_params: Vec::new(),
         generated_items: Vec::new(),
         in_method: false,
+        method_static: false,
+        method_generic: false,
+        closure_class: None,
     };
     let program = p.parse_program();
     let mut diags = shifted;
@@ -660,8 +666,10 @@ impl Parser {
 
     fn parse_class(&mut self) -> Result<ClassDecl, ()> {
         let previous = std::mem::take(&mut self.type_params);
+        let previous_scope = self.closure_class.take();
         let result = self.parse_class_inner();
         self.type_params = previous;
+        self.closure_class = previous_scope;
         result
     }
 
@@ -703,6 +711,12 @@ impl Parser {
         if !is_interface && self.eat(&TokenKind::Implements) {
             interfaces = self.parse_interface_names()?;
         }
+        self.closure_class = Some(closures::ClassScope {
+            name: name.clone(),
+            generic: !type_params.is_empty(),
+            is_trait,
+            methods: Vec::new(),
+        });
         self.expect(&TokenKind::LBrace, "`{` after class header")?;
         let mut members = Vec::new();
         let mut trait_uses = Vec::new();
@@ -722,6 +736,13 @@ impl Parser {
             }
         }
         let close = self.expect(&TokenKind::RBrace, "`}` after class body")?;
+        if let Some(scope) = &mut self.closure_class {
+            members.extend(
+                std::mem::take(&mut scope.methods)
+                    .into_iter()
+                    .map(ClassMember::Method),
+            );
+        }
         Ok(ClassDecl {
             is_trait,
             trait_uses,
@@ -920,8 +941,13 @@ impl Parser {
             Vec::new()
         } else {
             let previous = std::mem::replace(&mut self.in_method, true);
+            let previous_static = std::mem::replace(&mut self.method_static, is_static);
+            let previous_generic =
+                std::mem::replace(&mut self.method_generic, !type_params.is_empty());
             let result = self.parse_block();
             self.in_method = previous;
+            self.method_static = previous_static;
+            self.method_generic = previous_generic;
             result?
         };
         let end = self.peek().span;
@@ -1776,7 +1802,13 @@ impl Parser {
         let tok = self.peek().clone();
         let span = tok.span;
         match tok.kind {
-            TokenKind::Function | TokenKind::Fn => self.parse_closure(),
+            TokenKind::Function | TokenKind::Fn => self.parse_closure(false),
+            TokenKind::Static
+                if matches!(self.peek_at(1).kind, TokenKind::Function | TokenKind::Fn) =>
+            {
+                self.advance();
+                self.parse_closure(true)
+            }
             TokenKind::Int(v) => {
                 self.advance();
                 Ok(Expr::IntLit(v, span))
@@ -2018,6 +2050,7 @@ fn set_stmt_span(s: &mut Stmt, span: Span) {
         | Stmt::Print(_, sp)
         | Stmt::Expr(_, sp)
         | Stmt::Return(_, sp)
+        | Stmt::ForwardReturn(_, sp)
         | Stmt::Break(_, sp)
         | Stmt::Continue(_, sp) => *sp = span,
         Stmt::PhpInclude { span: sp, .. }

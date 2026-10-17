@@ -85,7 +85,7 @@ behavioural divergence.
 | Leading‑zero octal literal (`0755`) | **Warning** `W0001`, read as decimal |
 | Functions that return `string|false` / `int|false` (`strpos`, `strstr`, `base64_decode`, `hex2bin`, `substr_compare`, …) | Not yet — needs a union / `false` value type; only the never-failing encoders above are provided |
 | `number_format` | Not yet |
-| Enums, bound/reference closures | Not yet; native traits and local by-value closures/arrow functions are supported |
+| Enums, reference closures, generic closure scopes | Not yet; native traits and ordinary by-value/bound/static closures are supported |
 | Runtime include/require | Supported for explicitly marked PHP files; see [interop](INTEROP.md) |
 | `global`, function-local `static`, PHP reference aliases | Available inside PHP boundaries; compiled syntax remains restricted |
 | Exceptions, generators, attributes | Not yet |
@@ -328,15 +328,15 @@ part of this memory-management milestone. Native `__destruct` declarations fail
 explicitly with `E0290`; PHP-boundary destructors remain PHP behavior.
 
 **Fail loud, never silent.** Features not yet implemented (such as
-bound closures, exceptions and nullable annotations)
+reference closures, exceptions and nullable annotations)
 produce a compile error with a specific code — never a silently different program.
 
 **Invokable objects.** `$callback($arg)` lowers to checked `__invoke` dispatch,
 including interface callbacks, inheritance and receiver retention across awaited
 arguments. The method uses the existing visibility/argument/ownership rules.
-Local by-value closures and arrow functions are supported; see [CALLABLES.md](CALLABLES.md).
-Callable strings/arrays, bound/reference captures and `callable` annotations remain
-unsupported. `__invoke` is synchronous under the current magic-method policy.
+By-value, bound and static closures/arrow functions are supported; see
+[CALLABLES.md](CALLABLES.md). Callable strings/arrays, reference captures, generic
+closure scopes and `callable` annotations remain unsupported. `__invoke` is synchronous under the current magic-method policy.
 
 ## Runtime independence
 

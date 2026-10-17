@@ -2726,6 +2726,36 @@ impl Analyzer {
                 );
                 None
             }
+            ast::Stmt::ForwardReturn(value, span) => {
+                let ret = ctx.ret.clone();
+                let value = self.infer_for_type(value, ctx, &ret)?;
+                let actual = value.ty();
+                if ctx.infer_return {
+                    ctx.return_types.push((actual.clone(), *span));
+                } else if !self.is_assignable(&actual, &ret) {
+                    self.diags.emit(
+                        Diagnostic::error(format!("cannot forward `{actual}` as `{ret}`"))
+                            .with_code("E0215")
+                            .with_span(*span),
+                    );
+                    return None;
+                }
+                ctx.flow.reachable = false;
+                Some(if actual == Ty::Void {
+                    TStmt::Block(vec![
+                        TStmt::Expr(value),
+                        TStmt::Return {
+                            value: None,
+                            ret: Ty::Void,
+                        },
+                    ])
+                } else {
+                    TStmt::Return {
+                        value: Some(value),
+                        ret,
+                    }
+                })
+            }
             ast::Stmt::Return(value, span) => {
                 let result = self.analyze_return(value.as_ref(), *span, ctx);
                 ctx.flow.reachable = false;
@@ -6674,7 +6704,7 @@ fn comparable_eq(a: &Ty, b: &Ty) -> bool {
 /// Does this statement provably end with a `return` on all paths?
 fn stmt_terminates(stmt: &ast::Stmt) -> bool {
     match stmt {
-        ast::Stmt::Return(..) => true,
+        ast::Stmt::Return(..) | ast::Stmt::ForwardReturn(..) => true,
         ast::Stmt::Block(b, _) => b.last().is_some_and(stmt_terminates),
         ast::Stmt::If {
             then_branch,

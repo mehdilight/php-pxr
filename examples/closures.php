@@ -15,3 +15,17 @@ function makePrefix(string $prefix) {
 }
 $format = makePrefix("kept:");
 echo $format("value"), "\n";
+
+class Prefix {
+    private string $text;
+    public function __construct(string $text) { $this->text = $text; }
+    public function formatter() {
+        return fn(string $value): string => $this->text . $value;
+    }
+    public function staticFormatter(string $prefix) {
+        return static fn(string $value): string => $prefix . $value;
+    }
+}
+$bound = (new Prefix("bound:"))->formatter();
+$unbound = (new Prefix("unused:"))->staticFormatter("static:");
+echo $bound("value"), ":", $unbound("value"), "\n";

@@ -55,6 +55,8 @@ pub enum Stmt {
         span: Span,
     },
     Return(Option<Expr>, Span),
+    /// Internal closure adapter: forward a call result, including inferred void.
+    ForwardReturn(Expr, Span),
     If {
         cond: Expr,
         then_branch: Vec<Stmt>,
@@ -184,7 +186,10 @@ impl Stmt {
     pub fn expressions(&self) -> Vec<&Expr> {
         match self {
             Stmt::Echo(es, _) => es.iter().collect(),
-            Stmt::Print(e, _) | Stmt::Expr(e, _) | Stmt::Return(Some(e), _) => vec![e],
+            Stmt::Print(e, _)
+            | Stmt::Expr(e, _)
+            | Stmt::Return(Some(e), _)
+            | Stmt::ForwardReturn(e, _) => vec![e],
             Stmt::Assign { target, value, .. } | Stmt::AssignOp { target, value, .. } => {
                 let mut es = target.expressions();
                 es.push(value);
@@ -222,6 +227,7 @@ impl Stmt {
             | Stmt::Print(_, sp)
             | Stmt::Expr(_, sp)
             | Stmt::Return(_, sp)
+            | Stmt::ForwardReturn(_, sp)
             | Stmt::Break(_, sp)
             | Stmt::Continue(_, sp) => *sp,
             Stmt::PhpInclude { span, .. }

@@ -2648,3 +2648,61 @@ async function main(): void {
         "retained:7\n4:4:99:13\n",
     );
 }
+
+#[test]
+fn bound_closures_retain_temporary_receivers_across_suspension() {
+    run_case(
+        "bound_closure_lifetime",
+        r#"<?php
+class BoundLifetime {
+    private string $prefix;
+    public function __construct(string $prefix) { $this->prefix = $prefix; }
+    public function callback(string $suffix) {
+        return function(int $n) use ($suffix): string { return $this->prefix . $suffix . $n; };
+    }
+    public function nested() { return fn(int $x) => fn(int $y): string => $this->prefix . ($x + $y); }
+    public function makeStatic() { return static fn(int $n): int => $n + 1; }
+    public async function asyncCallback() { await sleepAsync(0); return fn(int $n): string => $this->prefix . $n; }
+}
+async function value(): int { await sleepAsync(0); return 7; }
+async function main(): void {
+    $callback = (new BoundLifetime("kept:"))->callback("!");
+    $make = (new BoundLifetime("nested:"))->nested();
+    $inner = $make(5);
+    $static = (new BoundLifetime("unused:"))->makeStatic();
+    $fromAsync = await (new BoundLifetime("async:"))->asyncCallback();
+    for ($i=0; $i<50; $i++) { $temporary = new BoundLifetime("temporary"); await sleepAsync(0); }
+    echo $callback(await value()), "\n", $inner(await value()), "\n", $static(await value()), "\n", $fromAsync(await value()), "\n";
+}
+"#,
+        "kept:!7\nnested:12\n8\nasync:7\n",
+    );
+}
+
+#[test]
+fn workers_keep_bound_closure_heaps_and_lexical_statics_isolated() {
+    run_case(
+        "worker_bound_closures",
+        r#"<?php
+class WorkerClosure {
+    private int $value;
+    private static int $calls = 0;
+    public function __construct(int $value) { $this->value = $value; }
+    public function callback() {
+        return fn(int $n): int => $this->value + $n + (self::$calls += 1);
+    }
+}
+async function closureWorker(int $n): int {
+    $callback = (new WorkerClosure($n))->callback();
+    await sleepAsync(0);
+    return $callback(10);
+}
+async function main(): void {
+    $a = spawn parallelAsync("closureWorker", 1);
+    $b = spawn parallelAsync("closureWorker", 2);
+    echo await $a, ":", await $b, "\n";
+}
+"#,
+        "12:13\n",
+    );
+}

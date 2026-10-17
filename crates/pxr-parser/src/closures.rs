@@ -3,6 +3,15 @@
 //! locals so mutation has PHP's per-invocation behavior.
 use super::*;
 
+pub(super) struct ClassScope {
+    pub name: String,
+    pub generic: bool,
+    pub is_trait: bool,
+    pub methods: Vec<MethodDecl>,
+}
+
+const BOUND_RECEIVER: &str = "$bound$this";
+
 fn variable(name: &str, span: Span) -> Expr {
     Expr::Var(name.into(), span)
 }
@@ -113,13 +122,45 @@ fn body_has_lexical_receiver(body: &[Stmt]) -> bool {
     })
 }
 
+fn forward_argument(parameter: &Param, span: Span) -> Expr {
+    let value = variable(&parameter.name, span);
+    let intrinsic = match &parameter.ty {
+        Some(TypeRef::Applied(name, _, _)) if name == "$pxr_owned" => "$pxr_move",
+        Some(TypeRef::Applied(name, _, _)) if name == "$pxr_borrow" => "$pxr_borrow",
+        Some(TypeRef::Applied(name, _, _)) if name == "$pxr_borrow_mut" => "$pxr_borrow_mut",
+        _ => return value,
+    };
+    Expr::Call {
+        fallback: None,
+        callee: intrinsic.into(),
+        callee_span: span,
+        type_args: vec![],
+        args: vec![value],
+        span,
+    }
+}
+
 impl Parser {
-    pub(super) fn parse_closure(&mut self) -> Result<Expr, ()> {
+    pub(super) fn parse_closure(&mut self, is_static: bool) -> Result<Expr, ()> {
         let token = self.advance();
         let arrow = token.kind == TokenKind::Fn;
         let span = token.span;
-        if self.in_method {
-            self.error(span, "closures in class scope require lexical receiver binding and are not implemented yet");
+        let scope = if self.in_method {
+            self.closure_class
+                .as_ref()
+                .map(|scope| (scope.name.clone(), scope.generic, scope.is_trait))
+        } else {
+            None
+        };
+        if scope.as_ref().is_some_and(|(_, generic, _)| *generic)
+            || self.in_method && self.method_generic
+        {
+            self.error(span, "closures in generic class/method scope require lexical type binding and are not implemented yet");
+            return Err(());
+        }
+        let bound = scope.is_some() && !is_static && !self.method_static;
+        if scope.as_ref().is_some_and(|(_, _, is_trait)| *is_trait) && !bound {
+            self.error(span, "static trait closure scope is not implemented yet");
             return Err(());
         }
         self.expect(&TokenKind::LParen, "`(` after anonymous function keyword")?;
@@ -193,20 +234,32 @@ impl Parser {
             self.error(span, "closure annotations referring to enclosing generic or lexical class types are not implemented yet");
             return Err(());
         }
-        let mut body = if arrow {
-            self.expect(&TokenKind::DoubleArrow, "`=>` in arrow function")?;
-            let expression = self.parse_expr()?;
-            free_variables(&expression, &params, &mut captures);
-            vec![Stmt::Return(Some(expression), span)]
-        } else {
-            self.parse_block()?
-        };
-        if body_has_lexical_receiver(&body) {
+        let previous_static = self.method_static;
+        self.method_static |= is_static;
+        let body_result = (|| {
+            if arrow {
+                self.expect(&TokenKind::DoubleArrow, "`=>` in arrow function")?;
+                let expression = self.parse_expr()?;
+                free_variables(&expression, &params, &mut captures);
+                Ok(vec![Stmt::Return(Some(expression), span)])
+            } else {
+                self.parse_block()
+            }
+        })();
+        self.method_static = previous_static;
+        let mut body = body_result?;
+        if scope.is_none() && body_has_lexical_receiver(&body) {
             self.error(
                 span,
-                "bound closure receivers and lexical class access are not implemented yet",
+                "bound closure receivers and lexical class access require a class scope",
             );
             return Err(());
+        }
+        // `$this` is implicit, never a by-value local capture. Instance bodies
+        // execute on the retained receiver; static bodies have no `$this` slot.
+        captures.retain(|name| name != "this");
+        if bound {
+            captures.push(BOUND_RECEIVER.into());
         }
         // The source grammar cannot spell these symbols, preventing collisions.
         let id = format!("{}${}", span.start, self.generated_items.len());
@@ -229,6 +282,62 @@ impl Parser {
             .zip(&types)
             .map(|(n, t)| parameter(n, t.clone(), span))
             .collect();
+        if let Some((owner, _, _)) = &scope {
+            let bridge = format!("$closure_body${id}");
+            // The receiver also supplies its concrete specialization type.
+            // Keep bound bridges lazy: a class can override a trait factory
+            // without instantiating the discarded trait closure's body.
+            let mut bridge_params = capture_params.clone();
+            let bridge_types: Vec<_> = bridge_params
+                .iter()
+                .filter_map(|p| match &p.ty {
+                    Some(TypeRef::Param(name, span)) => Some((name.clone(), *span)),
+                    _ => None,
+                })
+                .collect();
+            bridge_params.extend(params.clone());
+            self.closure_class
+                .as_mut()
+                .unwrap()
+                .methods
+                .push(MethodDecl {
+                    is_async: false,
+                    type_params: bridge_types,
+                    bounds: vec![],
+                    is_static: !bound,
+                    is_abstract: false,
+                    // The source grammar cannot spell this internal method name.
+                    visibility: Visibility::Public,
+                    name: bridge.clone(),
+                    name_span: span,
+                    params: bridge_params,
+                    ret: ret.clone(),
+                    body,
+                    span,
+                });
+            let mut args: Vec<_> = captures.iter().map(|n| variable(n, span)).collect();
+            args.extend(params.iter().map(|p| forward_argument(p, span)));
+            let call = if bound {
+                Expr::MethodCall {
+                    base: Box::new(variable(BOUND_RECEIVER, span)),
+                    name: bridge,
+                    name_span: span,
+                    type_args: vec![],
+                    args,
+                    span,
+                }
+            } else {
+                Expr::StaticCall {
+                    class_name: owner.clone(),
+                    type_args: vec![],
+                    method: bridge,
+                    method_type_args: vec![],
+                    args,
+                    span,
+                }
+            };
+            body = vec![Stmt::ForwardReturn(call, span)];
+        }
         let mut members: Vec<_> = captures
             .iter()
             .zip(&types)
@@ -341,7 +450,10 @@ impl Parser {
             callee: factory,
             callee_span: span,
             type_args: vec![],
-            args: captures.iter().map(|n| variable(n, span)).collect(),
+            args: captures
+                .iter()
+                .map(|n| variable(if n == BOUND_RECEIVER { "this" } else { n }, span))
+                .collect(),
             span,
         })
     }

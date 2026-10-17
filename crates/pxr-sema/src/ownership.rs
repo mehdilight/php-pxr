@@ -83,7 +83,7 @@ fn copy_safe(t: Option<&TypeRef>) -> bool {
         Some(TypeRef::Int | TypeRef::Float | TypeRef::Bool | TypeRef::String | TypeRef::Void)
     )
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct Signature {
     is_static: bool,
     is_async: bool,
@@ -860,6 +860,9 @@ impl Checker {
             Stmt::IncDec { target, .. } => {
                 self.target(target, true);
             }
+            Stmt::ForwardReturn(value, span) => {
+                return self.stmt(&Stmt::Return(Some(value.clone()), *span));
+            }
             Stmt::Return(value, span) => {
                 let want = mode(self.ret.as_ref());
                 if let Some(e) = value {
@@ -1276,6 +1279,27 @@ impl Checker {
             }
         }
         None
+    }
+    fn closure_bridge_signature(&self, name: &str) -> Option<Signature> {
+        // Before specialization, the environment receiver is a type parameter.
+        // These unspellable names identify one generated source body. Trait
+        // composition can copy it to several classes: require identical full
+        // contracts rather than guessing an ownership mode from the receiver.
+        if !name.starts_with("$closure_body$") {
+            return None;
+        }
+        let suffix = format!("::{}", name.to_ascii_lowercase());
+        let mut candidates = self
+            .signatures
+            .iter()
+            .filter(|(key, _)| key.ends_with(&suffix))
+            .map(|(_, signature)| signature);
+        let first = candidates.next()?;
+        if first.is_async || first.is_static || candidates.any(|other| other != first) {
+            return None;
+        }
+        // Semantic analysis still checks the concrete target after expansion.
+        Some(first.clone())
     }
     fn audit_new(&mut self, expr: &Expr) {
         match unparen(expr) {
@@ -2162,6 +2186,7 @@ impl Checker {
                     .ty
                     .as_ref()
                     .and_then(|t| self.method_for_type(t, name))
+                    .or_else(|| self.closure_bridge_signature(name))
                     .map(|s| specialize_signature(s, type_args));
                 let bindings = self.arguments(args, sig.as_ref(), false, *span, false);
                 self.loans.truncate(base_loans);
@@ -2584,7 +2609,10 @@ fn erase_stmt(s: &mut Stmt) {
                 erase_expr(e);
             }
         }
-        Stmt::Print(e, _) | Stmt::Expr(e, _) | Stmt::Return(Some(e), _) => erase_expr(e),
+        Stmt::Print(e, _)
+        | Stmt::Expr(e, _)
+        | Stmt::Return(Some(e), _)
+        | Stmt::ForwardReturn(e, _) => erase_expr(e),
         Stmt::If { cond, elifs, .. } => {
             erase_expr(cond);
             for (c, _) in elifs {

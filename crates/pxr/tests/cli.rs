@@ -4572,9 +4572,9 @@ fn unsupported_closure_aliases_and_binding_fail_explicitly() {
             "reference captures",
         ),
         (
-            "closure_method_scope",
-            "<?php class C { public function make() { return fn(): int => 1; } }",
-            "lexical receiver binding",
+            "closure_generic_method_scope",
+            "<?php class C { public function make<T>(T $value) { return fn() => $value; } }",
+            "lexical type binding",
         ),
         (
             "closure_this",
@@ -4591,5 +4591,112 @@ fn unsupported_closure_aliases_and_binding_fail_explicitly() {
         let run = run_ok(&["check", path.to_str().unwrap()]);
         assert_eq!(run.code, 1, "{name}: {}", run.stderr);
         assert!(run.stderr.contains(message), "{name}: {}", run.stderr);
+    }
+}
+
+#[test]
+fn bound_and_static_closures_preserve_lexical_member_access() {
+    assert_matches_php(
+        "bound_closure_scope",
+        r#"<?php
+class ClosureParent {
+    protected function prefix(): string { return "base"; }
+}
+class ClosureOwner extends ClosureParent {
+    private int $value = 10;
+    private static int $shared = 20;
+    private function hidden(int $n): int { return $this->value + $n; }
+    public function make(int $offset) {
+        return function(int $n) use ($offset): int {
+            $this->value++;
+            return $this->hidden($n + $offset) + self::$shared + strlen(parent::prefix());
+        };
+    }
+    public function arrow() { return fn(int $n): int => $this->hidden($n); }
+    public function makeStatic(int $offset) {
+        return static fn(int $n): int => self::$shared + $offset + $n;
+    }
+    public static function fromStatic(int $offset) {
+        return function(int $n) use ($offset): int { return self::$shared + $offset + $n; };
+    }
+    public function nestedStatic() { return static fn(int $x) => fn(int $y): int => self::$shared + $x + $y; }
+    public function arrayCapture() { $values=[1]; return function() use ($values): int { $values[0]++; return $values[0]; }; }
+}
+$obj = new ClosureOwner();
+$bound = $obj->make(2);
+$arrow = $obj->arrow();
+$static = $obj->makeStatic(3);
+$fromStatic = ClosureOwner::fromStatic(4);
+$arrayCapture = $obj->arrayCapture(); echo $arrayCapture(), ":", $arrayCapture(), "\n";
+$makeNested = $obj->nestedStatic(); $nested = $makeNested(3); echo $nested(4), "\n";
+echo $bound(1), ":", $bound(1), ":", $arrow(1), ":", $static(1), ":", $fromStatic(1), "\n";
+$global = static function(int $n): int { return $n * 2; };
+$globalArrow = static fn(int $n): int => $n + 3;
+echo $global(4), ":", $globalArrow(4), "\n";
+"#,
+    );
+}
+
+#[test]
+fn nested_inherited_and_trait_closures_keep_the_declaring_scope() {
+    assert_matches_php(
+        "nested_bound_closure_scope",
+        r#"<?php
+namespace BoundFixture;
+trait ClosureFactory {
+    public function fromTrait() { return fn(int $n): int => $this->secret + $n; }
+}
+class Base {
+    private int $secret = 3;
+    protected function marker(): int { return 1; }
+    public function inherited() { return fn(): int => $this->secret + $this->marker(); }
+    public function nested() { return fn(int $n) => fn(int $m): int => $this->secret + $n + $m; }
+    public function action() { return function() { echo $this->secret, ":action\n"; }; }
+    public function typedAction() { return function(): void { echo $this->secret, ":void\n"; }; }
+    public function unreachableReturn() { return function() { if (false) { return 1; } echo $this->secret, ":unreachable\n"; }; }
+    public function other(Base $other) { return static fn(): int => $other->secret; }
+}
+class Child extends Base {
+    protected function marker(): int { return 10; }
+}
+class Consumer {
+    use ClosureFactory;
+    private int $secret = 8;
+}
+trait OverriddenFactory {
+    public function make() { return fn(): int => $this->notPresent; }
+}
+class OverridesFactory {
+    use OverriddenFactory;
+    public function make() { return fn(): int => 42; }
+}
+$overridden = (new OverridesFactory())->make(); echo $overridden(), "\n";
+$child = new Child();
+$inherited = $child->inherited();
+$outer = $child->nested();
+$inner = $outer(4);
+$trait = (new Consumer())->fromTrait();
+echo $inherited(), ":", $inner(5), ":", $trait(2), "\n";
+$action = $child->action(); $action();
+$typed = $child->typedAction(); $typed();
+$unreachable = $child->unreachableReturn(); $unreachable();
+$other = $child->other(new Base()); echo $other(), "\n";
+"#,
+    );
+}
+
+#[test]
+fn bound_closure_scope_rejects_missing_receivers_and_unrelated_private_access() {
+    for (name, source, diagnostic) in [
+        ("static_closure_this", "<?php class C { public int $x=1; public function make() { return static fn(): int => $this->x; } } $f=(new C())->make();", "E0268"),
+        ("closure_in_static_method_this", "<?php class C { public int $x=1; public static function make() { return fn(): int => $this->x; } } $f=C::make();", "E0268"),
+        ("closure_unrelated_private", "<?php class Other { private int $x=1; } class C { public function make(Other $o) { return fn(): int => $o->x; } } $f=(new C())->make(new Other());", "E0265"),
+        ("generic_class_closure", "<?php class C<T> { public function make() { return fn(): int => 1; } }", "lexical type binding"),
+        ("static_trait_closure", "<?php trait T { public function make() { return static fn(): int => 1; } }", "static trait closure scope"),
+    ] {
+        let path = temp_php(name, source);
+        let run = run_ok(&["check", path.to_str().unwrap()]);
+        assert_eq!(run.code, 1, "{name}: {}", run.stderr);
+        assert!(run.stderr.contains(diagnostic), "{name}: {}", run.stderr);
     }
 }

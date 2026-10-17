@@ -655,7 +655,9 @@ impl ClassExpander {
                     self.expression(value, bindings);
                 }
             }
-            S::Print(value, _) | S::Expr(value, _) => self.expression(value, bindings),
+            S::Print(value, _) | S::Expr(value, _) | S::ForwardReturn(value, _) => {
+                self.expression(value, bindings)
+            }
             S::Return(value, _) => {
                 if let Some(value) = value {
                     self.expression(value, bindings);

@@ -133,6 +133,9 @@ fn owned_values_moves_borrows_and_generic_methods() {
 #[test]
 fn ownership_violations_fail_before_lowering() {
     let cases = [
+        ("bound-closure-implicit-transfer", "class C { public function take() { return function(owned<int> $x): int { drop($x); return 1; }; } } $f=(new C())->take(); $x: owned<int>=1; $f($x);"),
+        ("owned-bound-closure", "class C { public int $x=1; public function make() { return fn(): int => $this->x; } } $c: owned<C>=new C; $f=$c->make();"),
+        ("owned-implicit-closure-receiver", "class C { public function make() { return fn(): int => 1; } } $c: owned<C>=new C; $f=$c->make();"),
         ("owned-closure-capture", "$x: owned<int> = 1; $f = fn(): int => $x;"),
         ("borrow-closure-capture", "function f(&array<int> $a): void { $g = fn(): int => count($a); }"),
         ("assignment-result-copy", "$x: owned<int> = 1; $y = ($x = 2);"),
@@ -536,4 +539,96 @@ echo $made->copyValue(), "\n";
     assert_eq!(out.stdout, b"42:42\nancestor\n4:4\nfactory\n");
     assert!(out.stderr.is_empty());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn static_closures_can_escape_owned_receivers_without_retaining_them() {
+    if !have_cc() {
+        return;
+    }
+    let source = r#"<?php
+class StaticFactory {
+    public function make() { return static fn(int $n): int => $n + 1; }
+}
+$owner: owned<StaticFactory> = new StaticFactory();
+$callback = $owner->make();
+drop($owner);
+echo $callback(7), "\n";
+"#;
+    for opt in [0, 3] {
+        let executable = build("static_closure_owned_receiver", source, opt);
+        let out = Command::new(&executable)
+            .env("PXR_GC_STRESS", "1")
+            .env("PXR_PHP", "/missing/php")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"8\n");
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn bound_closures_forward_owned_parameters_returns_and_mutable_reborrows() {
+    if !have_cc() {
+        return;
+    }
+    let source = r#"<?php
+class ForwardFactory {
+    public function take() {
+        return function(owned<string> $input): owned<string> { return move($input); };
+    }
+    public function mutate() {
+        return function(&mut array<int> $values): int { $values[0] += 1; return $values[0]; };
+    }
+}
+trait ForwardTrait {
+    public function mutate() {
+        return function(&mut array<int> $values): int { $values[0] += 1; return $values[0]; };
+    }
+}
+class FirstConsumer { use ForwardTrait; }
+class SecondConsumer { use ForwardTrait; }
+$factory = new ForwardFactory();
+$take = $factory->take();
+$mutate = $factory->mutate();
+$values: owned<array<int>> = [2];
+echo $mutate(&mut $values), ":", $values[0], "\n";
+$input: owned<string> = "kept";
+$output = $take(move($input));
+echo $output, "\n";
+$first = (new FirstConsumer())->mutate();
+$second = (new SecondConsumer())->mutate();
+echo $first(&mut $values), ":", $second(&mut $values), ":", $values[0], "\n";
+drop($output); drop($values);
+"#;
+    for opt in [0, 3] {
+        let executable = build("bound_closure_forwarding", source, opt);
+        let out = Command::new(&executable)
+            .env("PXR_GC_STRESS", "1")
+            .env("PXR_PHP", "/missing/php")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"3:3\nkept\n4:5:5\n");
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+    }
 }

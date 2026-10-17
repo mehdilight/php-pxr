@@ -1,6 +1,6 @@
 # Native callable support
 
-M10 is in progress. Invokable objects, local by-value closures and arrow functions
+M10 is in progress. Invokable objects, by-value closures and arrow functions
 have independent native acceptance tests. This is not yet the full PHP callable
 contract.
 
@@ -26,6 +26,33 @@ generic specialization, ownership checks and precise GC. Each closure expression
 has a distinct inferred concrete native type. Existing fixed-storage rules still
 apply when assigning a different closure expression to the same variable.
 
+Closures in ordinary class methods retain their instance receiver, including
+when the body does not read `$this`. Bodies execute with the declaring class's
+visibility and `self`/`parent` context. Inherited and nested closures keep that
+scope while ordinary virtual calls still dispatch to overrides. Instance trait
+methods preserve the consuming class's scope.
+
+```php
+class Prefix {
+    private string $text;
+    public function __construct(string $text) { $this->text = $text; }
+    public function formatter() {
+        return fn(string $value): string => $this->text . $value;
+    }
+}
+$format = (new Prefix("kept:"))->formatter();
+echo $format("value"), "\n";
+```
+
+`static function (...) { ... }` and `static fn(...) => ...` do not retain an
+instance receiver. They retain ordinary class visibility, including `self::`
+access in non-generic classes. A closure created in a static method also has no
+`$this`. Creating a synchronous closure after an await in an async method is
+supported; the returned environment outlives the creating frame. Owned parameters/returns and
+read/exclusive borrow parameters keep their normal contracts through invocation;
+forwarding moves owners and reborrows borrowed parameters. Inferred `void` is
+forwarded as a call followed by a bare return.
+
 A class may implement `__invoke` and be called with `$object($arg)`. Typed
 interfaces declaring `__invoke` support callback parameters and virtual dispatch.
 Receiver expressions evaluate once before arguments, including awaited arguments.
@@ -38,12 +65,17 @@ See [callback_objects.php](../examples/callback_objects.php) and
   implemented. Call-scoped borrows cannot substitute for a PHP reference capture.
 - Owned and borrowed bindings cannot be captured implicitly into shared closure
   storage. They retain the ordinary ownership diagnostics.
-- Closures declared in class methods, `$this`, lexical class access and closure
-  annotations referring to enclosing generic types are rejected until lexical
-  receiver/type binding is implemented.
-- Static and async closures, callable strings/arrays, first-class callable
-  references, `callable`/`Closure` annotations and Closure reflection/binding APIs
-  are not implemented. These forms remain compile errors.
+- Implicit receiver capture from an owned or borrowed receiver is rejected,
+  even if the closure body does not read `$this`. Static closures can escape an
+  owned receiver because they do not capture it.
+- Closures in generic class/method scope and annotations using enclosing generic
+  or lexical class types remain rejected until lexical type binding is supplied.
+  Static closures in trait scope also remain rejected.
+- Async closures, callable strings/arrays, first-class callable references,
+  `callable`/`Closure` annotations and Closure reflection/binding APIs are not
+  implemented. Late static binding (`static::`) retains its existing restriction.
+- Native callbacks are not implicitly exported across the legacy PHP boundary;
+  the existing [interop restrictions](INTEROP.md) still apply.
 - Invokable magic methods remain synchronous and cannot declare method generics.
 - Untyped parameters, optional/variadic/named arguments and unpacking retain their
   current restrictions; accepting a closure does not bypass argument checks.
