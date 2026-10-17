@@ -6,6 +6,14 @@
 
 use pxr_diag::Span;
 
+/// Unspellable lexical type witnesses for closures composed from traits.
+/// These never retain a runtime receiver or implement late static binding.
+pub const CLOSURE_TRAIT_SELF: &str = "$closure_trait$self";
+pub const CLOSURE_TRAIT_PARENT: &str = "$closure_trait$parent";
+pub const CLOSURE_CONSUMER_SELF: &str = "$closure_consumer$self";
+pub const CLOSURE_CONSUMER_PARENT: &str = "$closure_consumer$parent";
+pub const CLOSURE_MISSING_PARENT: &str = "$closure_missing_parent$";
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Program {
     pub items: Vec<Stmt>,

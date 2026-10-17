@@ -29,8 +29,8 @@ apply when assigning a different closure expression to the same variable.
 Closures in ordinary class methods retain their instance receiver, including
 when the body does not read `$this`. Bodies execute with the declaring class's
 visibility and `self`/`parent` context. Inherited and nested closures keep that
-scope while ordinary virtual calls still dispatch to overrides. Instance trait
-methods preserve the consuming class's scope. In ordinary and generic classes, parameter
+scope while ordinary virtual calls still dispatch to overrides. Instance and
+static trait methods preserve the consuming class's scope. In ordinary and generic classes, parameter
 and return annotations may use `self` and `parent`, including inside native
 container and ownership types. `self` names the declaring class even when the
 factory is inherited; `parent` names its declared parent.
@@ -55,6 +55,13 @@ supported; the returned environment outlives the creating frame. Owned parameter
 read/exclusive borrow parameters keep their normal contracts through invocation;
 forwarding moves owners and reborrows borrowed parameters. Inferred `void` is
 forwarded as a call followed by a bare return.
+
+Trait closure annotations bind `self` to the consuming class and `parent` to its
+parent, including concrete generic arguments. An inherited factory keeps the
+original consuming class; another class using the trait gets its own binding.
+This also applies to nested and async closures. Static closures use these lexical
+types and visibility without retaining `$this`. See
+[trait_closures.php](../examples/trait_closures.php).
 
 ## Enclosing generic types
 
@@ -124,8 +131,8 @@ See [callback_objects.php](../examples/callback_objects.php) and
 - Implicit receiver capture from an owned or borrowed receiver is rejected,
   even if the closure body does not read `$this`. Static closures can escape an
   owned receiver because they do not capture it.
-- Static closures and lexical `self`/`parent` annotations in trait scope
-  remain rejected. `parent` requires a declared parent class.
+- `parent` annotations require a parent on the declaring/consuming class.
+  `static` return annotations and `static::` late binding remain unsupported.
 - Callable strings/arrays, first-class callable references,
   `callable`/`Closure` annotations and Closure reflection/binding APIs are not
   implemented. Late static binding (`static::`) retains its existing restriction.
@@ -137,4 +144,5 @@ See [callback_objects.php](../examples/callback_objects.php) and
   current restrictions; accepting a closure does not bypass argument checks.
 
 Behavioral references: [PHP anonymous functions](https://www.php.net/manual/en/functions.anonymous.php)
-and [PHP arrow functions](https://www.php.net/manual/en/functions.arrow.php).
+and [PHP arrow functions](https://www.php.net/manual/en/functions.arrow.php), and
+[PHP traits](https://www.php.net/manual/en/language.oop5.traits.php).

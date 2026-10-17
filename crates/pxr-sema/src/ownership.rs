@@ -1268,11 +1268,50 @@ impl Checker {
                 name.to_ascii_lowercase()
             )) {
                 let mut sig = sig.clone();
+                // Return inference can carry lexical trait witnesses through
+                // factories and nested environments. Resolve them in the source
+                // consumer, or in the environment's retained owner type, before
+                // checking invariant borrow representations. Keep caller type
+                // arguments separate from the callee's witness substitution.
+                let owner = bindings
+                    .get(a::CLOSURE_TRAIT_SELF)
+                    .cloned()
+                    .unwrap_or_else(|| view_type(&decl, &bindings));
+                let parent = bindings
+                    .get(a::CLOSURE_TRAIT_PARENT)
+                    .cloned()
+                    .or_else(|| {
+                        self.class_views(&owner).into_iter().next().and_then(
+                            |(owner, owner_bindings)| {
+                                owner.extends.as_ref().map(|parent| {
+                                    let ty = if parent.type_args.is_empty() {
+                                        TypeRef::Named(parent.name.clone())
+                                    } else {
+                                        TypeRef::Applied(
+                                            parent.name.clone(),
+                                            parent.type_args.clone(),
+                                            parent.span,
+                                        )
+                                    };
+                                    substitute(&ty, &owner_bindings)
+                                })
+                            },
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        TypeRef::Param(a::CLOSURE_CONSUMER_PARENT.into(), Span::synthetic())
+                    });
+                let witnesses = BTreeMap::from([
+                    (a::CLOSURE_CONSUMER_SELF.into(), owner),
+                    (a::CLOSURE_CONSUMER_PARENT.into(), parent),
+                ]);
                 bindings.retain(|n, _| !sig.type_params.contains(n));
                 for t in sig.params.iter_mut().flatten() {
+                    *t = substitute(t, &witnesses);
                     *t = substitute(t, &bindings);
                 }
                 if let Some(t) = &mut sig.ret {
+                    *t = substitute(t, &witnesses);
                     *t = substitute(t, &bindings);
                 }
                 return Some(sig);
@@ -1280,7 +1319,7 @@ impl Checker {
         }
         None
     }
-    fn closure_bridge_signature(&self, name: &str) -> Option<Signature> {
+    fn closure_bridge_signature(&self, name: &str, is_static: bool) -> Option<Signature> {
         // Before specialization, the environment receiver is a type parameter.
         // These unspellable names identify one generated source body. Trait
         // composition can copy it to several classes: require identical full
@@ -1295,7 +1334,7 @@ impl Checker {
             .filter(|(key, _)| key.ends_with(&suffix))
             .map(|(_, signature)| signature);
         let first = candidates.next()?;
-        if first.is_static || candidates.any(|other| other != first) {
+        if first.is_static != is_static || candidates.any(|other| other != first) {
             return None;
         }
         // Semantic analysis still checks the concrete target after expansion.
@@ -2186,7 +2225,7 @@ impl Checker {
                     .ty
                     .as_ref()
                     .and_then(|t| self.method_for_type(t, name))
-                    .or_else(|| self.closure_bridge_signature(name))
+                    .or_else(|| self.closure_bridge_signature(name, false))
                     .map(|s| specialize_signature(s, type_args));
                 let bindings = self.arguments(args, sig.as_ref(), false, *span, false);
                 self.loans.truncate(base_loans);
@@ -2210,6 +2249,13 @@ impl Checker {
                 }
                 let sig = self
                     .method_for_type(&self.class_type(class_name, type_args, *span), method)
+                    .or_else(|| {
+                        if class_name == a::CLOSURE_TRAIT_SELF {
+                            self.closure_bridge_signature(method, true)
+                        } else {
+                            None
+                        }
+                    })
                     .map(|s| specialize_signature(s, method_type_args));
                 if sig.as_ref().is_some_and(|s| s.is_async && !s.is_static)
                     && self.env.get("this").is_some_and(|b| b.mode != Mode::Shared)

@@ -4686,7 +4686,6 @@ fn bound_closure_scope_rejects_missing_receivers_and_unrelated_private_access() 
         ("static_closure_this", "<?php class C { public int $x=1; public function make() { return static fn(): int => $this->x; } } $f=(new C())->make();", "E0268"),
         ("closure_in_static_method_this", "<?php class C { public int $x=1; public static function make() { return fn(): int => $this->x; } } $f=C::make();", "E0268"),
         ("closure_unrelated_private", "<?php class Other { private int $x=1; } class C { public function make(Other $o) { return fn(): int => $o->x; } } $f=(new C())->make(new Other());", "E0265"),
-        ("static_trait_closure", "<?php trait T { public function make() { return static fn(): int => 1; } }", "static trait closure scope"),
     ] {
         let path = temp_php(name, source);
         let run = run_ok(&["check", path.to_str().unwrap()]);
@@ -4733,7 +4732,6 @@ fn closure_lexical_annotation_boundaries_reject_wrong_types_and_scopes() {
         ("closure_static_return", "<?php class C { public function make() { return fn(): static => $this; } }", "late static binding"),
         ("closure_self_outside_class", "<?php $f=fn(self $x): self => $x;", "require a class scope"),
         ("closure_parent_without_parent", "<?php class C { public function make() { return fn(parent $x): parent => $x; } }", "requires a parent class"),
-        ("closure_trait_self_annotation", "<?php trait T { public function make() { return fn(self $x): self => $x; } }", "annotations in trait scope"),
         ("closure_self_type_arguments", "<?php class C { public function make() { return fn(self<int> $x) => $x; } }", "do not accept type arguments"),
     ] {
         let path = temp_php(name, source);
@@ -4908,4 +4906,103 @@ echo $first("unused"), ":", $second("argument"), "\n";
     let run = run_ok(&["run", path.to_str().unwrap()]);
     assert_eq!(run.code, 0, "{}", run.stderr);
     assert_eq!(run.stdout, "kept:argument\n");
+}
+
+#[test]
+fn trait_static_closures_and_lexical_annotations_bind_each_consuming_class() {
+    assert_matches_php(
+        "trait_closure_types",
+        r#"<?php
+namespace TraitScope;
+class Ancestor { public int $value=3; protected static function base(): int { return 5; } }
+trait Factory {
+    public static function make(int $offset) { return static fn(int $n): int => self::$counter + parent::base() + $offset + $n; }
+    public function identity() { return fn(self $value): self => $value; }
+    public function ancestor() { return static fn(parent $value): parent => $value; }
+    public static function read() { return static fn(self $value): int => $value->secret; }
+    public function ordinaryStaticContext() { return static function(): int { return self::$counter; }; }
+    public static function implicitStaticContext() { return function(): int { return self::$counter; }; }
+}
+trait ComposedFactory { use Factory; }
+class First extends Ancestor { use ComposedFactory; private static int $counter=10; private int $secret=7; }
+class Second extends Ancestor { use Factory; private static int $counter=20; private int $secret=8; }
+class Child extends First { private static int $counter=99; }
+$first=First::make(1); $second=Second::make(2); $inherited=Child::make(3);
+echo $first(1), ":", $second(1), ":", $inherited(1), "\n";
+$id=(new Child())->identity(); $parent=(new First())->ancestor();
+$readFirst=First::read(); $readSecond=Second::read();
+echo $id(new First())->value, ":", $parent(new Ancestor())->value, ":", $readFirst(new First()), ":", $readSecond(new Second()), "\n";
+$ordinary=(new First())->ordinaryStaticContext(); $implicit=Second::implicitStaticContext();
+echo $ordinary(), ":", $implicit(), "\n";
+"#,
+    );
+}
+
+#[test]
+fn nested_trait_closures_preserve_lexical_types_and_discarded_bodies_stay_lazy() {
+    assert_matches_php(
+        "nested_trait_closure_types",
+        r#"<?php
+trait NestedFactory {
+    public static function nested() { return static fn() => static fn(self $value): self => $value; }
+    public function boundNested() { return fn() => fn(self $value): self => $value; }
+}
+class First { use NestedFactory; public int $value=7; }
+class Second { use NestedFactory; public int $value=8; }
+trait DiscardedFactory {
+    public function make() { return static fn() => static fn(): parent => new MissingClass(); }
+}
+class OverrideFactory { use DiscardedFactory; public function make() { return static fn(): int => 42; } }
+$outer=First::nested(); $inner=$outer();
+$boundOuter=(new Second())->boundNested(); $boundInner=$boundOuter();
+$overridden=(new OverrideFactory())->make();
+echo $inner(new First())->value, ":", $boundInner(new Second())->value, ":", $overridden(), "\n";
+"#,
+    );
+}
+
+#[test]
+fn trait_closure_type_witnesses_preserve_generic_consumers_and_method_shadowing() {
+    if !have_cc() {
+        return;
+    }
+    let path = temp_php(
+        "trait_generic_witnesses",
+        r#"<?php
+class ParentBox<T> { public T $value; public function __construct(T $value) { $this->value=$value; } }
+trait TypedFactory {
+    public static function own() { return static fn(self $value): self => $value; }
+    public static function ancestor() { return static fn(parent $value): parent => $value; }
+    public function shadow<T>(T $seed) { return static fn(self $owner, T $value): T => $value; }
+    public static function nested<T>(T $seed) { return static fn(self $owner) => static fn(T $value): T => $seed; }
+    public static function arrays() { return static fn(array<self> $values): array<self> => $values; }
+}
+class Consumer<T> extends ParentBox<array<T>> { use TypedFactory; }
+$owner=new Consumer<int>([7]);
+$own=Consumer<int>::own(); $parent=Consumer<int>::ancestor();
+$shadow=$owner->shadow<string>("ignored");
+$outer=Consumer<int>::nested<string>("nested"); $inner=$outer($owner);
+$arrays=Consumer<int>::arrays(); $values=$arrays([$owner]);
+echo $own($owner)->value[0], ":", $parent(new ParentBox<array<int>>([8]))->value[0], ":", $shadow($owner,"shadow"), ":", $inner("ignored"), ":", $values[0]->value[0], "\n";
+"#,
+    );
+    let run = run_ok(&["run", path.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "7:8:shadow:nested:7\n");
+}
+
+#[test]
+fn trait_closure_scopes_reject_wrong_consumers_missing_parents_and_receivers() {
+    for (name,source,diagnostic) in [
+        ("trait_closure_wrong_consumer", "<?php trait T { public static function make() { return static fn(self $x): self => $x; } } class A { use T; } class B { use T; } $f=A::make(); $f(new B());", "E0208"),
+        ("trait_closure_inherited_self", "<?php class Base {} trait T { public function make() { return fn(self $x): self => $x; } } class A extends Base { use T; } class B extends A {} $f=(new B())->make(); $f(new Base());", "E0208"),
+        ("trait_closure_missing_parent", "<?php trait T { public function make() { return fn(parent $x): parent => $x; } } class A { use T; } $f=(new A())->make();", "E0268"),
+        ("trait_closure_static_this", "<?php trait T { public function make() { return static fn(): int => $this->value; } } class A { use T; public int $value=1; } $f=(new A())->make();", "E0268"),
+        ("trait_closure_unrelated_private", "<?php class Other { private int $value=1; } trait T { public static function make() { return static fn(Other $x): int => $x->value; } } class A { use T; } $f=A::make();", "E0265"),
+    ] {
+        let path=temp_php(name,source);
+        let run=run_ok(&["check",path.to_str().unwrap()]);
+        assert_eq!(run.code,1,"{name}: {}",run.stderr);
+        assert!(run.stderr.contains(diagnostic),"{name}: {}",run.stderr);
+    }
 }

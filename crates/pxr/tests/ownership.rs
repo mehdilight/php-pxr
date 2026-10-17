@@ -133,6 +133,11 @@ fn owned_values_moves_borrows_and_generic_methods() {
 #[test]
 fn ownership_violations_fail_before_lowering() {
     let cases = [
+        ("trait-nested-borrow-wrong-consumer", "trait T { public static function make() { return static fn() => static function(&mut array<self> $x): void {}; } } class A { use T; } class B { use T; } $outer=A::make(); $f=$outer(); $x: owned<array<B>>=[]; $f(&mut $x);"),
+        ("trait-nested-borrow-wrong-parent", "class P {} class Q {} trait T { public static function make() { return static fn() => static function(&mut array<parent> $x): void {}; } } class A extends P { use T; } $outer=A::make(); $f=$outer(); $x: owned<array<Q>>=[]; $f(&mut $x);"),
+        ("trait-bound-owned-receiver", "trait T { public function make() { return fn(self $x): self => $x; } } class C { use T; } $c: owned<C>=new C; $f=$c->make();"),
+        ("trait-static-implicit-transfer", "trait T { public static function make() { return static fn(owned<self> $x): owned<self> => move($x); } } class C { use T; } $f=C::make(); $c: owned<C>=new C; $result=$f($c);"),
+        ("trait-async-borrow-param", "trait T { public static function make() { return static async fn(&self $x): int => 1; } } class C { use T; }"),
         ("generic-closure-owned-capture", "function make<T>(owned<T> $value) { return fn(): T => $value; }"),
         ("generic-closure-borrow-capture", "function make<T>(&T $value) { return fn(): T => $value; }"),
         ("generic-bound-closure-owned-receiver", "class C<T> { public function make<U>() { return fn(U $value): U => $value; } } $c: owned<C<int>>=new C<int>; $f=$c->make<string>();"),
@@ -734,6 +739,70 @@ $selfOutput=$selfTransfer(move($selfInput)); drop($selfOutput);
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(out.stdout, b"kept\nstatic\nfirst:second\n7\n");
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn trait_static_closure_witnesses_preserve_owned_and_borrowed_contracts() {
+    if !have_cc() {
+        return;
+    }
+    let source = r#"<?php
+class ParentValue { public int $value=3; }
+class OtherParent { public int $value=4; }
+trait StaticFactory {
+    public function fromOwner() { return static fn(owned<self> $value): owned<self> => move($value); }
+    public static function transfer() { return static fn(owned<self> $value): owned<self> => move($value); }
+    public static function parentTransfer() { return static fn(owned<parent> $value): owned<parent> => move($value); }
+    public static function read() { return static fn(&self $value): int => $value->value; }
+    public static function mutate() { return static function(&mut array<self> $values, self $value): void { $values[]=$value; }; }
+    public static function nestedMutate() { return static fn() => static function(&mut array<self> $values, self $value): void { $values[]=$value; }; }
+    public static function nestedParent() { return static fn() => static function(&mut array<parent> $values, parent $value): void { $values[]=$value; }; }
+    public static function shadow<T>(T $seed) { return static function(&mut array<self> $values, self $value, T $extra): T { $values[]=$value; return $extra; }; }
+}
+class First extends ParentValue { use StaticFactory; }
+class Second extends OtherParent { use StaticFactory; }
+class GenericConsumer<T> extends ParentValue { use StaticFactory; }
+$creator: owned<First>=new First(); $fromOwner=$creator->fromOwner(); drop($creator);
+$first: owned<First>=new First(); $keptFirst=$fromOwner(move($first));
+$readFirst=First::read(); echo $readFirst(&$keptFirst), ":"; drop($keptFirst);
+$second: owned<Second>=new Second(); $transferSecond=Second::transfer(); $keptSecond=$transferSecond(move($second));
+$readSecond=Second::read(); echo $readSecond(&$keptSecond), "\n"; drop($keptSecond);
+$parent: owned<ParentValue>=new ParentValue(); $parentTransfer=First::parentTransfer(); $keptParent=$parentTransfer(move($parent));
+echo $keptParent->value, ":"; drop($keptParent);
+$otherParent: owned<OtherParent>=new OtherParent(); $otherTransfer=Second::parentTransfer(); $keptOther=$otherTransfer(move($otherParent));
+echo $keptOther->value, "\n"; drop($keptOther);
+$values: owned<array<First>>=[]; $mutate=First::mutate(); $mutate(&mut $values,new First());
+echo $values[0]->value, "\n"; drop($values);
+$nestedOuter=First::nestedMutate(); $nested=$nestedOuter();
+$nestedValues: owned<array<First>>=[]; $nested(&mut $nestedValues,new First());
+echo $nestedValues[0]->value, ":"; drop($nestedValues);
+$parentOuter=Second::nestedParent(); $nestedParent=$parentOuter();
+$parentValues: owned<array<OtherParent>>=[]; $nestedParent(&mut $parentValues,new OtherParent());
+echo $parentValues[0]->value, "\n"; drop($parentValues);
+$shadow=GenericConsumer<int>::shadow<string>("ignored");
+$genericValues: owned<array<GenericConsumer<int>>>=[];
+echo $shadow(&mut $genericValues,new GenericConsumer<int>(),"typed"), "\n"; drop($genericValues);
+"#;
+    for opt in [0, 3] {
+        let executable = build("trait_static_closure_contracts", source, opt);
+        let out = Command::new(&executable)
+            .env("PXR_GC_STRESS", "1")
+            .env("PXR_PHP", "/missing/php")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"3:4\n3:4\n3\n3:4\ntyped\n");
         assert!(
             out.stderr.is_empty(),
             "{}",

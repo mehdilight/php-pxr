@@ -1,5 +1,11 @@
 <?php
+trait AsyncIdentity {
+    public static function identity() {
+        return static async fn(self $value): self => $value;
+    }
+}
 class Prefix {
+    use AsyncIdentity;
     private string $text;
     public function __construct(string $text) { $this->text = $text; }
     public function formatter() {
@@ -24,4 +30,8 @@ async function main(): void {
     echo await $text, ":", await $number, "\n";
     $identity = delayedIdentity<string>();
     echo await $identity("generic"), "\n";
+    $traitIdentity = Prefix::identity();
+    $prefix = await $traitIdentity(new Prefix("trait:"));
+    $traitFormat = $prefix->formatter();
+    echo await $traitFormat("value"), "\n";
 }

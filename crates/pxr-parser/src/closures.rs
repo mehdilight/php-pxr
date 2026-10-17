@@ -89,7 +89,16 @@ fn bind_annotation(t: &mut TypeRef, scope: Option<&ClassScope>) -> Result<(), &'
         TypeRef::Named(n) if matches!(n.to_ascii_lowercase().as_str(), "self" | "parent") => {
             let scope = scope.ok_or("lexical closure annotations require a class scope")?;
             if scope.is_trait {
-                return Err("lexical closure annotations in trait scope are not implemented yet");
+                *t = TypeRef::Param(
+                    if n.eq_ignore_ascii_case("self") {
+                        CLOSURE_TRAIT_SELF
+                    } else {
+                        CLOSURE_TRAIT_PARENT
+                    }
+                    .into(),
+                    Span::synthetic(),
+                );
+                return Ok(());
             }
             *t = if n.eq_ignore_ascii_case("self") {
                 if scope.type_params.is_empty() {
@@ -137,6 +146,15 @@ fn bind_annotation(t: &mut TypeRef, scope: Option<&ClassScope>) -> Result<(), &'
         _ => {}
     }
     Ok(())
+}
+
+fn needs_trait_parent(ty: &TypeRef) -> bool {
+    match ty {
+        TypeRef::Param(name, _) => name == CLOSURE_TRAIT_PARENT,
+        TypeRef::Array(element) => needs_trait_parent(element),
+        TypeRef::Applied(_, arguments, _) => arguments.iter().any(needs_trait_parent),
+        _ => false,
+    }
 }
 fn lexical_receiver(e: &Expr) -> bool {
     let direct = match e {
@@ -190,15 +208,15 @@ impl Parser {
         } else {
             None
         };
-        let lexical_params: Vec<_> = self
+        let trait_scope = scope.as_ref().is_some_and(|(_, is_trait)| *is_trait);
+        let mut lexical_params: Vec<_> = self
             .type_params
             .iter()
             .map(|name| (name.clone(), span))
             .collect();
-        let lexical_types: Vec<_> = lexical_params
-            .iter()
-            .map(|(name, span)| TypeRef::Param(name.clone(), *span))
-            .collect();
+        if trait_scope {
+            lexical_params.push((CLOSURE_TRAIT_SELF.into(), span));
+        }
         let lexical_bounds = self.type_bounds.clone();
         let class_params = if self.in_method {
             self.closure_class
@@ -209,10 +227,6 @@ impl Parser {
             vec![]
         };
         let bound = scope.is_some() && !is_static && !self.method_static;
-        if scope.as_ref().is_some_and(|(_, is_trait)| *is_trait) && !bound {
-            self.error(span, "static trait closure scope is not implemented yet");
-            return Err(());
-        }
         self.expect(&TokenKind::LParen, "`(` after anonymous function keyword")?;
         let mut params = Vec::new();
         while !self.at(&TokenKind::RParen) {
@@ -294,6 +308,19 @@ impl Parser {
                 return Err(());
             }
         }
+        if trait_scope
+            && params
+                .iter()
+                .filter_map(|p| p.ty.as_ref())
+                .chain(ret.iter())
+                .any(needs_trait_parent)
+        {
+            lexical_params.push((CLOSURE_TRAIT_PARENT.into(), span));
+        }
+        let lexical_types: Vec<_> = lexical_params
+            .iter()
+            .map(|(name, span)| TypeRef::Param(name.clone(), *span))
+            .collect();
         let previous_static = self.method_static;
         self.method_static |= is_static;
         let body_result = (|| {
@@ -404,7 +431,11 @@ impl Parser {
                 }
             } else {
                 Expr::StaticCall {
-                    class_name: owner.clone(),
+                    class_name: if trait_scope {
+                        CLOSURE_TRAIT_SELF.into()
+                    } else {
+                        owner.clone()
+                    },
                     type_args: class_params
                         .iter()
                         .map(|(name, span)| TypeRef::Param(name.clone(), *span))
@@ -589,7 +620,18 @@ impl Parser {
                 })));
             Ok(Expr::StaticCall {
                 class_name: carrier,
-                type_args: lexical_types,
+                type_args: lexical_types
+                    .into_iter()
+                    .map(|ty| match ty {
+                        TypeRef::Param(name, span) if name == CLOSURE_TRAIT_SELF => {
+                            TypeRef::Param(CLOSURE_CONSUMER_SELF.into(), span)
+                        }
+                        TypeRef::Param(name, span) if name == CLOSURE_TRAIT_PARENT => {
+                            TypeRef::Param(CLOSURE_CONSUMER_PARENT.into(), span)
+                        }
+                        other => other,
+                    })
+                    .collect(),
                 method: factory,
                 method_type_args: vec![],
                 args,

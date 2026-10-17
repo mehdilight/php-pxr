@@ -335,8 +335,8 @@ produce a compile error with a specific code — never a silently different prog
 including interface callbacks, inheritance and receiver retention across awaited
 arguments. The method uses the existing visibility/argument/ownership rules.
 By-value, bound, static and PXR async closures/arrow functions are supported; see
-[CALLABLES.md](CALLABLES.md). Callable strings/arrays, reference captures, static trait
-closure scopes, lexical trait annotations and `callable` annotations remain unsupported. User-declared `__invoke` remains synchronous under the current magic-method policy.
+[CALLABLES.md](CALLABLES.md). Callable strings/arrays, reference captures and `callable` annotations remain
+unsupported. Trait closures bind lexical types to the consuming class. User-declared `__invoke` remains synchronous under the current magic-method policy.
 
 ## Runtime independence
 

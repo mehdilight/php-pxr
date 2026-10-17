@@ -2938,3 +2938,87 @@ async function main(): void {
         "argument:bound:created:nested\nvoid\nowned\n",
     );
 }
+
+#[test]
+fn trait_closure_type_witnesses_survive_nested_async_frames_and_generic_creators() {
+    run_case(
+        "trait_async_closure_types",
+        r#"<?php
+class Ancestor<T> { public T $value; public function __construct(T $value) { $this->value=$value; } }
+trait AsyncFactory {
+    public function receiver() { return async function(): self { await sleepAsync(0); return $this; }; }
+    public static function identity() { return static async function(self $value): parent { await sleepAsync(0); return $value; }; }
+    public static function nested() { return static async fn(self $owner) => static async fn(parent $value): parent => $value; }
+    public async function create<T>(T $seed) { await sleepAsync(0); return static async fn(self $owner, T $value): T => $seed; }
+}
+class Consumer<T> extends Ancestor<array<T>> { use AsyncFactory; }
+async function main(): void {
+    $receiver=(new Consumer<int>([7]))->receiver();
+    $identity=Consumer<int>::identity();
+    $outer=Consumer<int>::nested();
+    $inner=await $outer(new Consumer<int>([8]));
+    $created=await (new Consumer<int>([9]))->create<string>("created");
+    for ($i=0; $i<30; $i++) { $garbage=new Consumer<int>([99]); await sleepAsync(0); }
+    $owner=await $receiver(); $parent=await $identity(new Consumer<int>([10]));
+    $nested=await $inner(new Ancestor<array<int>>([11]));
+    echo $owner->value[0], ":", $parent->value[0], ":", $nested->value[0], ":", await $created($owner,"ignored"), "\n";
+}
+"#,
+        "7:10:11:created\n",
+    );
+}
+
+#[test]
+fn trait_static_async_closures_transfer_and_cancel_owned_environments() {
+    run_case(
+        "trait_async_closure_owners",
+        r#"<?php
+trait AsyncOwnerFactory {
+    public static function transfer() { return static async function(owned<self> $value): owned<self> { await sleepAsync(0); return move($value); }; }
+    public static function hold() { return static async function(owned<self> $value): void { await sleepAsync(10000); echo "unexpected"; }; }
+}
+class First { use AsyncOwnerFactory; public string $text="first"; }
+class Second { use AsyncOwnerFactory; public string $text="second"; }
+async function main(): void {
+    $first=First::transfer(); $second=Second::transfer(); $hold=First::hold();
+    $firstValue: owned<First>=new First(); $keptFirst=await $first(move($firstValue));
+    $secondValue: owned<Second>=new Second(); $keptSecond=await $second(move($secondValue));
+    echo $keptFirst->text, ":", $keptSecond->text, "\n"; drop($keptFirst); drop($keptSecond);
+    for ($i=0; $i<20; $i++) {
+        $lazyValue: owned<First>=new First(); $lazy=$hold(move($lazyValue)); cancelTask($lazy);
+        $startedValue: owned<First>=new First(); $started=spawn $hold(move($startedValue));
+        await sleepAsync(0); await sleepAsync(0); cancelTask($started);
+    }
+    echo "cleaned\n";
+}
+"#,
+        "first:second\ncleaned\n",
+    );
+}
+
+#[test]
+fn workers_keep_static_trait_closure_types_and_statics_isolated() {
+    run_case(
+        "worker_trait_closure_types",
+        r#"<?php
+trait WorkerFactory {
+    public static function callback() {
+        return static async function(self $value): int {
+            await sleepAsync(0); self::$calls++;
+            return $value->number + self::$calls;
+        };
+    }
+}
+class WorkerConsumer { use WorkerFactory; private static int $calls=0; public int $number; public function __construct(int $number) { $this->number=$number; } }
+async function worker(int $number): int {
+    $callback=WorkerConsumer::callback();
+    return await $callback(new WorkerConsumer($number));
+}
+async function main(): void {
+    $a=spawn parallelAsync("worker",1); $b=spawn parallelAsync("worker",2);
+    echo await $a, ":", await $b, "\n";
+}
+"#,
+        "2:3\n",
+    );
+}

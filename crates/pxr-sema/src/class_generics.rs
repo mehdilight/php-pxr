@@ -303,6 +303,13 @@ impl ClassExpander {
                 }
                 self.validate_type(element);
             }
+            ast::TypeRef::Named(name) if name.starts_with(ast::CLOSURE_MISSING_PARENT) => {
+                self.error(
+                    "E0268",
+                    ty.span(),
+                    "`parent` closure annotation requires a parent class".into(),
+                );
+            }
             ast::TypeRef::Named(name) if !self.names.contains_key(&name.to_ascii_lowercase()) => {
                 self.error("E0205", ty.span(), format!("unknown type `{name}`"));
             }
@@ -505,6 +512,46 @@ impl ClassExpander {
                 bindings,
             );
         }
+        // Trait closure factories bind to their consuming declaration, including
+        // its concrete class arguments. Distinct internal names avoid capturing
+        // an identically spelled generic parameter on an imported trait method.
+        let mut bindings = bindings.clone();
+        let witnesses = [
+            (
+                ast::CLOSURE_CONSUMER_SELF.into(),
+                ast::TypeRef::Named(class.name.clone()),
+            ),
+            (
+                ast::CLOSURE_CONSUMER_PARENT.into(),
+                class
+                    .extends
+                    .as_ref()
+                    .map(|parent| {
+                        if parent.type_args.is_empty() {
+                            ast::TypeRef::Named(parent.name.clone())
+                        } else {
+                            ast::TypeRef::Applied(
+                                parent.name.clone(),
+                                parent.type_args.clone(),
+                                parent.span,
+                            )
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        ast::TypeRef::Named(format!(
+                            "{}{}",
+                            ast::CLOSURE_MISSING_PARENT,
+                            class.name
+                        ))
+                    }),
+            ),
+        ];
+        bindings.extend(witnesses.clone());
+        self.class_bindings
+            .entry(class.name.to_ascii_lowercase())
+            .or_default()
+            .extend(witnesses);
+        let bindings = &bindings;
         for member in &mut class.members {
             match member {
                 ast::ClassMember::Property(property) => {
@@ -581,7 +628,9 @@ impl ClassExpander {
         span: Span,
         bindings: &Bindings,
     ) {
-        let mut reference = if args.is_empty() {
+        let mut reference = if name == ast::CLOSURE_TRAIT_SELF && args.is_empty() {
+            ast::TypeRef::Param(name.clone(), span)
+        } else if args.is_empty() {
             ast::TypeRef::Named(name.clone())
         } else {
             ast::TypeRef::Applied(name.clone(), args.clone(), span)
@@ -592,10 +641,16 @@ impl ClassExpander {
                 *name = concrete;
                 args.clear();
             }
-            ast::TypeRef::Applied(_, arguments, _) => {
+            ast::TypeRef::Applied(concrete, arguments, _) => {
+                *name = concrete;
                 *args = arguments;
             }
-            _ => unreachable!(),
+            ast::TypeRef::Param(..) => {}
+            _ => self.error(
+                "E0280",
+                span,
+                "class reference must resolve to a class type".into(),
+            ),
         }
     }
 
