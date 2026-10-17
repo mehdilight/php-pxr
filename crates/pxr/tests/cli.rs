@@ -4700,3 +4700,75 @@ fn bound_closure_scope_rejects_missing_receivers_and_unrelated_private_access() 
         assert!(run.stderr.contains(diagnostic), "{name}: {}", run.stderr);
     }
 }
+
+#[test]
+fn closure_self_and_parent_annotations_keep_the_lexical_class() {
+    assert_matches_php(
+        "closure_lexical_annotations",
+        r#"<?php
+namespace ClosureTypes;
+class Ancestor { public int $value = 3; }
+class Declaring extends Ancestor {
+    private int $secret = 7;
+    public function identity() { return fn(self $value): self => $value; }
+    public function ancestor() { return function(parent $value): parent { return $value; }; }
+    public function receiver() { return fn(): self => $this; }
+    public static function unbound() { return static fn(self $value): self => $value; }
+    public function nested() { return fn() => fn(self $value): self => $value; }
+    public function read() { return static fn(self $value): int => $value->secret; }
+}
+class Descendant extends Declaring {}
+$owner = new Descendant();
+$identity = $owner->identity();
+$ancestor = $owner->ancestor();
+$receiver = $owner->receiver();
+$unbound = Descendant::unbound();
+$outer = $owner->nested(); $nested = $outer();
+$read = $owner->read();
+echo $identity(new Declaring())->value, ":", $ancestor(new Ancestor())->value, ":", $receiver()->value, "\n";
+echo $unbound(new Declaring())->value, ":", $nested(new Descendant())->value, ":", $read(new Declaring()), "\n";
+"#,
+    );
+}
+
+#[test]
+fn closure_lexical_annotation_boundaries_reject_wrong_types_and_scopes() {
+    for (name, source, diagnostic) in [
+        ("closure_self_wrong_argument", "<?php class Base {} class Child extends Base { public function make() { return fn(self $x): self => $x; } } $f=(new Child())->make(); $f(new Base());", "E0208"),
+        ("closure_self_wrong_return", "<?php class Base {} class Child extends Base { public function make() { return fn(): self => new Base(); } } $f=(new Child())->make(); $f();", "E0215"),
+        ("closure_static_return", "<?php class C { public function make() { return fn(): static => $this; } }", "late static binding"),
+        ("closure_self_outside_class", "<?php $f=fn(self $x): self => $x;", "require a class scope"),
+        ("closure_parent_without_parent", "<?php class C { public function make() { return fn(parent $x): parent => $x; } }", "requires a parent class"),
+        ("closure_trait_self_annotation", "<?php trait T { public function make() { return fn(self $x): self => $x; } }", "annotations in trait scope"),
+        ("closure_self_type_arguments", "<?php class C { public function make() { return fn(self<int> $x) => $x; } }", "do not accept type arguments"),
+    ] {
+        let path = temp_php(name, source);
+        let run = run_ok(&["check", path.to_str().unwrap()]);
+        assert_eq!(run.code, 1, "{name}: {}", run.stderr);
+        assert!(run.stderr.contains(diagnostic), "{name}: {}", run.stderr);
+    }
+}
+
+#[test]
+fn closure_lexical_annotations_bind_inside_native_container_types() {
+    let path = temp_php(
+        "closure_nested_annotations",
+        r#"<?php
+class Box<T> { public T $value; public function __construct(T $value) { $this->value=$value; } }
+class ParentBox<T> { public T $value; public function __construct(T $value) { $this->value=$value; } }
+class TypedClosure extends ParentBox<int> {
+    public function identity() { return static fn(array<Box<self>> $values): array<Box<self>> => $values; }
+    public function ancestor() { return static fn(parent $value): parent => $value; }
+}
+$factory = new TypedClosure(8);
+$identity = $factory->identity();
+$values = $identity([new Box<TypedClosure>($factory)]);
+$first = $values[0];
+$ancestor = $factory->ancestor();
+echo $first->value->value, ":", $ancestor(new ParentBox<int>(9))->value, "\n";
+"#,
+    );
+    let run = run_ok(&["run", path.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "8:9\n");
+}

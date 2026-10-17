@@ -30,7 +30,10 @@ Closures in ordinary class methods retain their instance receiver, including
 when the body does not read `$this`. Bodies execute with the declaring class's
 visibility and `self`/`parent` context. Inherited and nested closures keep that
 scope while ordinary virtual calls still dispatch to overrides. Instance trait
-methods preserve the consuming class's scope.
+methods preserve the consuming class's scope. In non-generic classes, parameter
+and return annotations may use `self` and `parent`, including inside native
+container and ownership types. `self` names the declaring class even when the
+factory is inherited; `parent` names its declared parent.
 
 ```php
 class Prefix {
@@ -69,8 +72,9 @@ See [callback_objects.php](../examples/callback_objects.php) and
   even if the closure body does not read `$this`. Static closures can escape an
   owned receiver because they do not capture it.
 - Closures in generic class/method scope and annotations using enclosing generic
-  or lexical class types remain rejected until lexical type binding is supplied.
-  Static closures in trait scope also remain rejected.
+  types remain rejected until generic lexical type binding is supplied.
+  Static closures and lexical `self`/`parent` annotations in trait scope also
+  remain rejected. `parent` requires a declared parent class.
 - Async closures, callable strings/arrays, first-class callable references,
   `callable`/`Closure` annotations and Closure reflection/binding APIs are not
   implemented. Late static binding (`static::`) retains its existing restriction.

@@ -715,6 +715,7 @@ impl Parser {
             name: name.clone(),
             generic: !type_params.is_empty(),
             is_trait,
+            parent: extends.clone(),
             methods: Vec::new(),
         });
         self.expect(&TokenKind::LBrace, "`{` after class header")?;
@@ -981,6 +982,8 @@ impl Parser {
                 | TokenKind::Ident(_)
                 | TokenKind::Backslash
                 | TokenKind::Namespace
+                | TokenKind::Parent
+                | TokenKind::Static
         )
     }
 
@@ -1007,6 +1010,20 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<TypeRef, ()> {
+        if matches!(self.peek().kind, TokenKind::Parent | TokenKind::Static) {
+            let token = self.advance();
+            let name = if token.kind == TokenKind::Parent {
+                "parent"
+            } else {
+                "static"
+            };
+            let args = self.parse_type_arguments()?;
+            return Ok(if args.is_empty() {
+                TypeRef::Named(name.into())
+            } else {
+                TypeRef::Applied(name.into(), args, token.span)
+            });
+        }
         if self.at(&TokenKind::Amp) {
             let start = self.advance().span;
             let mutable = matches!(&self.peek().kind, TokenKind::Ident(n) if n == "mut");

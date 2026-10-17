@@ -7,6 +7,7 @@ pub(super) struct ClassScope {
     pub name: String,
     pub generic: bool,
     pub is_trait: bool,
+    pub parent: Option<ClassRef>,
     pub methods: Vec<MethodDecl>,
 }
 
@@ -83,22 +84,52 @@ fn free_variables(e: &Expr, params: &[Param], captures: &mut Vec<String>) {
         free_variables(child, params, captures);
     }
 }
-fn lexical_type(t: &TypeRef) -> bool {
+fn bind_annotation(t: &mut TypeRef, scope: Option<&ClassScope>) -> Result<(), &'static str> {
     match t {
-        TypeRef::Param(..) => true,
-        TypeRef::Named(n) => matches!(
-            n.to_ascii_lowercase().as_str(),
-            "self" | "parent" | "static"
-        ),
+        TypeRef::Param(..) => {
+            return Err(
+                "closure annotations referring to enclosing generic types are not implemented yet",
+            );
+        }
+        TypeRef::Named(n) if matches!(n.to_ascii_lowercase().as_str(), "self" | "parent") => {
+            let scope = scope.ok_or("lexical closure annotations require a class scope")?;
+            if scope.is_trait {
+                return Err("lexical closure annotations in trait scope are not implemented yet");
+            }
+            *t = if n.eq_ignore_ascii_case("self") {
+                TypeRef::Named(scope.name.clone())
+            } else {
+                let parent = scope
+                    .parent
+                    .as_ref()
+                    .ok_or("`parent` closure annotation requires a parent class")?;
+                if parent.type_args.is_empty() {
+                    TypeRef::Named(parent.name.clone())
+                } else {
+                    TypeRef::Applied(parent.name.clone(), parent.type_args.clone(), parent.span)
+                }
+            };
+        }
+        TypeRef::Named(n) if n.eq_ignore_ascii_case("static") => {
+            return Err("late static binding in closure annotations is not implemented yet");
+        }
         TypeRef::Applied(n, args, _) => {
-            matches!(
+            if matches!(
                 n.to_ascii_lowercase().as_str(),
                 "self" | "parent" | "static"
-            ) || args.iter().any(lexical_type)
+            ) {
+                return Err(
+                    "lexical class names in closure annotations do not accept type arguments",
+                );
+            }
+            for argument in args {
+                bind_annotation(argument, scope)?;
+            }
         }
-        TypeRef::Array(t) => lexical_type(t),
-        _ => false,
+        TypeRef::Array(t) => bind_annotation(t, scope)?,
+        _ => {}
     }
+    Ok(())
 }
 fn lexical_receiver(e: &Expr) -> bool {
     let direct = match e {
@@ -220,19 +251,29 @@ impl Parser {
             }
             self.expect(&TokenKind::RParen, "`)` after closure captures")?;
         }
-        let ret = if self.eat(&TokenKind::Colon) {
+        let mut ret = if self.eat(&TokenKind::Colon) {
             Some(self.parse_type()?)
         } else {
             None
         };
-        if params
-            .iter()
-            .filter_map(|p| p.ty.as_ref())
-            .any(lexical_type)
-            || ret.as_ref().is_some_and(lexical_type)
+        // Resolve in the source scope before moving annotations into the hidden
+        // environment class: its `self` is not the user's declaring class.
+        for annotation in params
+            .iter_mut()
+            .filter_map(|p| p.ty.as_mut())
+            .chain(ret.iter_mut())
         {
-            self.error(span, "closure annotations referring to enclosing generic or lexical class types are not implemented yet");
-            return Err(());
+            if let Err(message) = bind_annotation(
+                annotation,
+                if self.in_method {
+                    self.closure_class.as_ref()
+                } else {
+                    None
+                },
+            ) {
+                self.error(span, message);
+                return Err(());
+            }
         }
         let previous_static = self.method_static;
         self.method_static |= is_static;

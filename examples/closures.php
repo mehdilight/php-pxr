@@ -22,6 +22,9 @@ class Prefix {
     public function formatter() {
         return fn(string $value): string => $this->text . $value;
     }
+    public function identity() {
+        return static fn(self $value): self => $value;
+    }
     public function staticFormatter(string $prefix) {
         return static fn(string $value): string => $prefix . $value;
     }
@@ -29,3 +32,7 @@ class Prefix {
 $bound = (new Prefix("bound:"))->formatter();
 $unbound = (new Prefix("unused:"))->staticFormatter("static:");
 echo $bound("value"), ":", $unbound("value"), "\n";
+
+$identity = (new Prefix("unused:"))->identity();
+$copied = $identity(new Prefix("typed:"))->formatter();
+echo $copied("value"), "\n";

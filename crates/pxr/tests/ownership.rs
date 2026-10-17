@@ -632,3 +632,49 @@ drop($output); drop($values);
         std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
     }
 }
+
+#[test]
+fn closure_lexical_annotations_preserve_owned_and_borrowed_contracts() {
+    if !have_cc() {
+        return;
+    }
+    let source = r#"<?php
+class LexicalOwned {
+    public string $text;
+    public function __construct(string $text) { $this->text=$text; }
+    public static function transfer() {
+        return static function(owned<self> $value): owned<self> { return move($value); };
+    }
+    public static function inspect() { return static fn(&self $value): string => $value->text; }
+    public static function update() { return static function(&mut self $value): void { $value->text .= "!"; }; }
+}
+$transfer = LexicalOwned::transfer();
+$inspect = LexicalOwned::inspect();
+$update = LexicalOwned::update();
+$input: owned<LexicalOwned> = new LexicalOwned("kept");
+$output = $transfer(move($input));
+$update(&mut $output);
+echo $inspect(&$output), "\n";
+drop($output);
+"#;
+    for opt in [0, 3] {
+        let executable = build("closure_lexical_ownership", source, opt);
+        let out = Command::new(&executable)
+            .env("PXR_GC_STRESS", "1")
+            .env("PXR_PHP", "/missing/php")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"kept!\n");
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+    }
+}

@@ -2706,3 +2706,30 @@ async function main(): void {
         "12:13\n",
     );
 }
+
+#[test]
+fn closure_lexical_types_survive_escaping_frames_and_awaited_arguments() {
+    run_case(
+        "closure_lexical_types",
+        r#"<?php
+class LexicalParent { public string $text; public function __construct(string $text) { $this->text=$text; } }
+class LexicalChild extends LexicalParent {
+    public async function make() {
+        await sleepAsync(0);
+        return fn(self $value): parent => $value;
+    }
+    public function retained() { return fn(): self => $this; }
+    public static function unbound() { return static fn(parent $value): parent => $value; }
+}
+async function argument(): LexicalChild { await sleepAsync(0); return new LexicalChild("argument"); }
+async function main(): void {
+    $callback = await (new LexicalChild("factory"))->make();
+    $retained = (new LexicalChild("retained"))->retained();
+    $unbound = LexicalChild::unbound();
+    for ($i=0; $i<30; $i++) { $garbage = new LexicalChild("temporary"); await sleepAsync(0); }
+    echo $callback(await argument())->text, ":", $retained()->text, ":", $unbound(new LexicalParent("parent"))->text, "\n";
+}
+"#,
+        "argument:retained:parent\n",
+    );
+}
