@@ -340,6 +340,7 @@ pub struct FnDecl {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Param {
+    pub default: Option<Expr>,
     pub name: String,
     pub name_span: Span,
     pub ty: Option<TypeRef>,

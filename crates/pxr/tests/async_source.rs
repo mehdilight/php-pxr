@@ -3127,3 +3127,64 @@ async function main(): void {
         true,
     );
 }
+
+#[test]
+fn optional_defaults_survive_suspension_dispatch_and_owned_prefix_arguments() {
+    run_case(
+        "optional_async_defaults",
+        r#"<?php
+async function values(array<int> $value=[7]): array<int> {await sleepAsync(0); $value[]=8; return $value;}
+async function cancelledDefault(owned<array<int>> $value,float $unused=1/0): void {drop($value);}
+async function transfer(owned<array<int>> $value, int $extra=9): owned<array<int>> {await sleepAsync(0); $value[]=$extra; return move($value);}
+interface OptionalAsync {public async function value(int $value=1): int;}
+class OptionalAsyncBase implements OptionalAsync {public async function value(int $value=2): int {await sleepAsync(0); return $value;}}
+class OptionalAsyncChild extends OptionalAsyncBase {public async function value(int $value=3): int {await sleepAsync(0); return $value;}}
+class OptionalAsyncFactory<T> {public static function callback() {return static async fn(?T $value=null): ?T=>$value;}}
+async function main(): void {
+    $task=values(); $other=values();
+    $cancelledInput: owned<array<int>>=[1]; $lazy=cancelledDefault(move($cancelledInput)); drop($lazy);
+    $providedInput: owned<array<int>>=[2]; await cancelledDefault(move($providedInput),7.0);
+    $service: OptionalAsync=new OptionalAsyncChild(); $valueTask=$service->value();
+    $callback=OptionalAsyncFactory<string>::callback(); $closureTask=$callback();
+    $input: owned<array<int>>=[1]; $ownerTask=transfer(move($input));
+    for($i=0;$i<20;$i++) {await sleepAsync(0);}
+    $first=await $task; $second=await $other; $first[0]=99;
+    echo $first[0], ":", $second[0], ":", $second[1], ":", await $valueTask, ":", is_null(await $closureTask), ":";
+    $output=await $ownerTask; echo $output[0], ":", $output[1], "\n"; drop($output);
+}
+"#,
+        "99:7:8:3:1:1:9\n",
+    );
+}
+
+#[test]
+fn worker_callbacks_adapt_optional_native_parameter_abi() {
+    run_case(
+        "optional_worker_abi",
+        r#"<?php
+async function worker(int $value=7): int {await sleepAsync(0); return $value+1;}
+async function main(): void {
+    $a=spawn parallelAsync("worker",41); $b=worker(); echo await $a, ":", await $b, "\n";
+}
+"#,
+        "42:8\n",
+    );
+}
+
+#[test]
+fn server_callbacks_adapt_optional_native_parameter_abi() {
+    let port = server_port("127.0.0.1");
+    run_case(
+        "optional_server_abi",
+        &format!(
+            r#"<?php
+async function reply(string $request="default"): string {{await sleepAsync(0); return "reply:".$request;}}
+async function main(): void {{
+    $server=spawn tcpServeAsync("127.0.0.1",{port},"reply",1,1024);
+    await sleepAsync(0); echo await tcpExchangeAsync("127.0.0.1",{port},"value",1024), "\n"; await $server;
+}}
+"#
+        ),
+        "reply:value\n",
+    );
+}

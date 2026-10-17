@@ -32,6 +32,7 @@ fn field(name: &str, span: Span) -> Expr {
 }
 fn parameter(name: &str, ty: TypeRef, span: Span) -> Param {
     Param {
+        default: None,
         name: name.into(),
         name_span: span,
         ty: Some(ty),
@@ -246,13 +247,19 @@ impl Parser {
             let TokenKind::Variable(name) = t.kind else {
                 unreachable!()
             };
+            let default = if self.eat(&TokenKind::Assign) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             params.push(Param {
+                default,
                 name,
                 name_span: t.span,
                 ty,
                 span: t.span,
             });
-            if !self.eat(&TokenKind::Comma) {
+            if !self.eat(&TokenKind::Comma) || self.at(&TokenKind::RParen) {
                 break;
             }
         }

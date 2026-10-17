@@ -5300,3 +5300,108 @@ fn compatibility_mode_applies_to_modules_and_cli_artifacts() {
         b"module\n"
     );
 }
+
+#[test]
+fn optional_parameters_bind_defaults_at_the_effective_native_method() {
+    assert_matches_php(
+        "optional_native_dispatch",
+        r#"<?php
+function text(string $value="default", ?int $number=null,): string {return $value.($number??7);}
+class DefaultBase {public function value(int $value=1): int {return $value;} public function words(mixed $words=["base"]): string {return strval($words[0]);}}
+class DefaultChild extends DefaultBase {public function value(int $value=2): int {return $value;} public function words(mixed $words=["child"]): string {return strval($words[0]);}}
+function dispatch(DefaultBase $base): string {return $base->value().":".$base->words();}
+class ThrowingDefaultBase {public function value(float $value=1/0): float {return $value;}}
+class SafeDefaultChild extends ThrowingDefaultBase {public function value(float $value=2): float {return $value;}}
+function safeDefault(ThrowingDefaultBase $value): float {return $value->value();}
+class RequiredDefaultBase {public function value(int $value): int {return $value;}}
+class AddedDefaultChild extends RequiredDefaultBase {public function value(int $value=17): int {return $value;}}
+function requiredDefault(RequiredDefaultBase $value): int {return $value->value(19);}
+class DefaultConstruct {public int $value; public function __construct(int $value=3) {$this->value=$value;} public static function value(int $value=4): int {return $value;}}
+$arrow=fn(int $value=5,): int=>$value;
+$closure=function(string $value="closure"): string {return $value;};
+echo requiredDefault(new AddedDefaultChild()), ":", (new AddedDefaultChild())->value(), ":", safeDefault(new SafeDefaultChild()), ":", text(), ":", text("text",9,), ":", dispatch(new DefaultBase()), ":", dispatch(new DefaultChild()), "\n";
+echo (new DefaultConstruct())->value, ":", DefaultConstruct::value(4,), ":", $arrow(), ":", $closure(), "\n";
+"#,
+    );
+}
+
+#[test]
+fn optional_parameters_preserve_typed_arrays_generics_traits_and_bound_closures() {
+    if !have_cc() {
+        return;
+    }
+    let source = r#"<?php
+function optionalValue<T>(T $value=7): T {return $value;}
+function appendOptional(&mut array<int> $value,int $extra=13): void {$value[]=$extra;}
+function listValue(array<int|string> $value=["first",7]): array<int|string> {$value[]=8; return $value;}
+interface OptionalContract {public function value(int $value=1): int;}
+class OptionalImplementation implements OptionalContract {public function value(int $value=9): int {return $value;}}
+function contract(OptionalContract $value): int {return $value->value();}
+class GenericDefault<T> {
+    public function value<U>(U $value=11): U {return $value;}
+    public function closure() {return function(?T $value=null): ?T {return $value;};}
+}
+trait OptionalTrait {public static function callback() {return static fn(int $value=12): int=>$value;}}
+class OptionalConsumer {use OptionalTrait;}
+$generic=new GenericDefault<string>(); $callback=$generic->closure(); $static=OptionalConsumer::callback();
+$values=listValue(); $again=listValue(); $values[0]="changed";
+echo optionalValue(), ":", optionalValue<int>(), ":", $generic->value(), ":", is_null($callback()), ":", $callback("text"), ":", $static(), ":", contract(new OptionalImplementation()), "\n";
+echo $values[0], ":", $again[0], ":", $again[2], "\n";
+$owned: owned<array<int>>=[1]; appendOptional(&mut $owned); echo $owned[1], "\n"; drop($owned);
+"#;
+    let path = temp_php("optional_generic_typed", source);
+    let run = run_ok(&["run", path.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "7:7:11:1:text:12:9\nchanged:first:8\n13\n");
+}
+
+#[test]
+fn optional_parameter_errors_are_explicit_even_for_unused_declarations() {
+    for (name,source,code) in [
+        ("virtual-constructor", "class A {public function __construct(int $a=1) {}} class B extends A {public function __construct(int $a) {}} function f(A $a): void {$a->__construct();}", "E0311"),
+        ("computed-false-default", "function f(false $value=(1==1)): void {}", "E0311"),
+        ("nested-computed-false-default", "function f(array<false> $value=[1==1]): void {}", "E0311"),
+        ("null-default", "function f(int|string $value=null): void {}", "E0311"),
+        ("false-default", "function f(false $value=true): void {}", "E0311"),
+        ("nested-default", "function f(array<int|string> $value=[null]): void {}", "E0311"),
+        ("bad-default","function f(int $value=\"text\"): int {return $value;}","E0311"),
+        ("required-after","function f(int $a=1,int $b): int {return $b;}","E0311"),
+        ("variable-default","$seed=7; function f(int $a=$seed): int {return $a;}","E0311"),
+        ("removed-default","class A {public function f(int $a=1): int {return $a;}} class B extends A {public function f(int $a): int {return $a;}}","E0311"),
+        ("borrow-default","function f(&int $value=7): int {return $value;}","E0290"),
+        ("owner-default","function f(owned<int> $value=7): owned<int> {return move($value);}","E0290"),
+        ("missing-required","function f(int $a,int $b=7): int {return $a+$b;} echo f();","E0230"),
+        ("too-many","function f(int $a=7): int {return $a;} echo f(1,2);","E0230"),
+    ] {
+        let path=temp_php(&format!("optional_{name}"),&format!("<?php {source}"));
+        let run=run_ok(&["check",path.to_str().unwrap()]);
+        assert_ne!(run.code,0,"{name}");
+        assert!(run.stderr.contains(code),"{name}: {}",run.stderr);
+    }
+}
+
+#[test]
+fn optional_parameters_work_with_explicit_compatibility_mode() {
+    if !have_cc() {
+        return;
+    }
+    let source = r#"<?php
+function value($value=["default",7]) {return $value;}
+class OptionalUntyped {public $value; public function __construct($value="object") {$this->value=$value;}}
+$callback=fn($value="closure")=>$value;
+echo value()[0], ":", value(["explicit"])[0], ":", (new OptionalUntyped())->value, ":", $callback(), "\n";
+"#;
+    let path = temp_php("optional_compatibility", source);
+    let run = run_ok(&["run", "--compat", path.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "default:explicit:object:closure\n");
+    if have_php() {
+        let php = Command::new("php").arg(path).output().unwrap();
+        assert!(
+            php.status.success(),
+            "{}",
+            String::from_utf8_lossy(&php.stderr)
+        );
+        assert_eq!(run.stdout, String::from_utf8_lossy(&php.stdout));
+    }
+}

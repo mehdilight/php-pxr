@@ -178,6 +178,7 @@ impl GenericCall {
             deferred: true,
             key: (String::new(), Vec::new()),
             signature: Signature {
+                declarations: Vec::new(),
                 is_async: false,
                 mangled: String::new(),
                 display: String::new(),
@@ -191,12 +192,13 @@ impl GenericCall {
         }
     }
     fn expression(self, span: Span) -> TExpr {
+        let abi_params = self.signature.abi_params();
         let arg_tys = self.values.iter().map(TExpr::ty).collect();
         TExpr::Call {
             callee: Callee::User {
                 mangled: self.signature.mangled,
                 name: self.signature.display,
-                params: self.signature.params,
+                params: abi_params,
             },
             ret: if self.signature.is_async {
                 Ty::Task(Box::new(self.signature.ret))
@@ -372,7 +374,7 @@ impl Analyzer {
                 .unwrap_or_else(|| mangle_method(&method.declaring_class, &member))
         };
         let mut values = prepared.values;
-        let mut params = prepared.signature.params;
+        let mut params = prepared.signature.abi_params();
         if let Some(receiver) = receiver {
             params.insert(0, Ty::Named(class.name.clone()));
             values.insert(0, receiver);
@@ -439,6 +441,9 @@ impl Analyzer {
         span: Span,
         ctx: &mut FnCtx,
     ) -> Option<GenericCall> {
+        let supplied = args.len();
+        let completed = self.complete_arguments(args, &declaration.params, span, "E0230")?;
+        let args = completed.as_slice();
         if args.len() != declaration.params.len() {
             self.diags.emit(
                 Diagnostic::error(format!(
@@ -582,6 +587,7 @@ impl Analyzer {
                 None => self.class_expander.inferred_return(&mangled),
             };
             Signature {
+                declarations: declaration.params.clone(),
                 is_async: declaration.is_async,
                 mangled,
                 display: format!(
@@ -617,6 +623,16 @@ impl Analyzer {
                 return None;
             }
         }
+        for i in supplied..values.len() {
+            values[i] = TExpr::Missing(signature.params[i].clone());
+        }
+        let mut actual_types = values.iter().map(TExpr::ty).collect();
+        arguments::append_presence(
+            &declaration.params,
+            supplied,
+            &mut values,
+            &mut actual_types,
+        );
         Some(GenericCall {
             deferred: false,
             key,

@@ -509,6 +509,12 @@ impl Checker {
         match s {
             Stmt::FnDecl(f) => {
                 for p in &f.params {
+                    if p.default.is_some() && mode(p.ty.as_ref()) != Mode::Shared {
+                        self.error(
+                            p.span,
+                            "owned/borrowed parameters cannot have optional defaults",
+                        );
+                    }
                     if let Some(t) = &p.ty {
                         self.validate_type(t, &[Mode::Owned, Mode::Read, Mode::Write], p.span);
                     }
@@ -535,6 +541,12 @@ impl Checker {
                                 self.error(m.span, "native destructors are not supported; use explicit cleanup functions (M6 reclaims memory without user destructor callbacks)");
                             }
                             for p in &m.params {
+                                if p.default.is_some() && mode(p.ty.as_ref()) != Mode::Shared {
+                                    self.error(
+                                        p.span,
+                                        "owned/borrowed parameters cannot have optional defaults",
+                                    );
+                                }
                                 if m.is_async
                                     && matches!(mode(p.ty.as_ref()), Mode::Read | Mode::Write)
                                 {

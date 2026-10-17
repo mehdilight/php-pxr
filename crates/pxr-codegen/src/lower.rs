@@ -18,6 +18,13 @@ pub fn lower_program(prog: &TProgram) -> Module {
     let mut m = Module::new();
     for f in &prog.funcs {
         m.function(lower_func(f, &prog.class_type_ids));
+        let optional = f
+            .params
+            .last()
+            .is_some_and(|(name, _)| name == pxr_sema::OPTIONAL_PRESENCE_PARAMETER);
+        if optional {
+            m.function(lower_optional_adapter(f));
+        }
         if prog.parallel_handlers.contains(&f.name) {
             let ty = &f.params[0].1;
             let mut bridge = Lowerer::new(Function::new(
@@ -27,7 +34,12 @@ pub fn lower_program(prog: &TProgram) -> Module {
                 Ty::Task(Box::new(f.ret.clone())),
             ));
             let input = bridge.decode_bits(1, ty);
-            let task = bridge.rt_call(&f.name, vec![input], Ty::Task(Box::new(f.ret.clone())));
+            let target = if optional {
+                format!("{}$all", f.name)
+            } else {
+                f.name.clone()
+            };
+            let task = bridge.rt_call(&target, vec![input], Ty::Task(Box::new(f.ret.clone())));
             bridge.terminator(Inst::Ret {
                 ty: Ty::Task(Box::new(f.ret.clone())),
                 src: Some(task),
@@ -52,6 +64,40 @@ pub fn lower_program(prog: &TProgram) -> Module {
         &prog.class_type_ids,
     ));
     m
+}
+
+// Runtime callbacks supply every user parameter. Adapt to the optional-argument
+// ABI while keeping callback C signatures and worker serialization unchanged.
+fn lower_optional_adapter(f: &TFunc) -> Function {
+    let params = &f.params[..f.params.len() - 1];
+    let ret = if f.is_async {
+        Ty::Task(Box::new(f.ret.clone()))
+    } else {
+        f.ret.clone()
+    };
+    let mut lower = Lowerer::new(Function::new(
+        format!("{}$all", f.name),
+        "full-arity adapter",
+        params.iter().map(|(_, t)| t.clone()).collect(),
+        ret.clone(),
+    ));
+    let mask = lower.array_new();
+    let boolean = lower.emit_const(Literal::Int(3));
+    let one = lower.emit_const(Literal::Int(1));
+    let receiver = params
+        .first()
+        .is_some_and(|(n, _)| n == "this" || n == "$this");
+    for _ in usize::from(receiver)..params.len() {
+        lower.array_push(mask, boolean, one);
+    }
+    let mut values: Vec<_> = (0..params.len() as u32).collect();
+    values.push(mask);
+    let value = lower.rt_call(&f.name, values, ret.clone());
+    lower.terminator(Inst::Ret {
+        ty: ret.clone(),
+        src: (ret != Ty::Void).then_some(value),
+    });
+    lower.into_function()
 }
 
 fn lower_stringifier(stringifiers: &[(u32, String)]) -> Function {
@@ -564,6 +610,19 @@ impl Lowerer {
 
     fn lower_expr(&mut self, e: &TExpr) -> Value {
         match e {
+            TExpr::Missing(ty) => match ty {
+                Ty::Int => self.emit_const(Literal::Int(0)),
+                Ty::Float => self.emit_const(Literal::Float(0.0)),
+                Ty::Bool => self.emit_const(Literal::Bool(false)),
+                Ty::String => self.emit_const(Literal::Str(Vec::new())),
+                Ty::Array(_) => self.array_new(),
+                Ty::Mixed | Ty::Union(_) => {
+                    let tag = self.emit_const(Literal::Int(0));
+                    let bits = self.emit_const(Literal::Int(0));
+                    self.rt_call("pxr_mixed_box", vec![tag, bits], ty.clone())
+                }
+                _ => self.emit_const(Literal::Null),
+            },
             TExpr::Effect {
                 statement, postfix, ..
             } => self.lower_assignment(statement, *postfix),

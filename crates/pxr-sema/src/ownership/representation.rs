@@ -107,7 +107,8 @@ fn expression(e: &TExpr, d: &mut Diagnostics) {
         | TExpr::Str(_)
         | TExpr::Bool(_)
         | TExpr::Null
-        | TExpr::Var { .. } => {}
+        | TExpr::Var { .. }
+        | TExpr::Missing(_) => {}
     }
 }
 fn target(t: &TTarget, d: &mut Diagnostics) {

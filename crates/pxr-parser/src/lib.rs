@@ -6,6 +6,7 @@
 //! a diagnostic and resynchronizes at the next statement boundary so that a
 //! single run reports as many independent syntax errors as possible.
 
+mod arguments;
 mod closures;
 mod compat;
 
@@ -653,13 +654,19 @@ impl Parser {
                     TokenKind::Variable(n) => n,
                     _ => unreachable!(),
                 };
+                let default = if self.eat(&TokenKind::Assign) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
                 params.push(Param {
+                    default,
                     name: pname,
                     name_span: vt.span,
                     ty,
                     span: p_start.merge(vt.span),
                 });
-                if !self.eat(&TokenKind::Comma) {
+                if !self.eat(&TokenKind::Comma) || self.at(&TokenKind::RParen) {
                     break;
                 }
             }
@@ -955,13 +962,19 @@ impl Parser {
                     TokenKind::Variable(n) => n,
                     _ => unreachable!(),
                 };
+                let default = if self.eat(&TokenKind::Assign) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
                 params.push(Param {
+                    default,
                     name: pname,
                     name_span: vt.span,
                     ty,
                     span: p_start.merge(vt.span),
                 });
-                if !self.eat(&TokenKind::Comma) {
+                if !self.eat(&TokenKind::Comma) || self.at(&TokenKind::RParen) {
                     break;
                 }
             }
@@ -1732,16 +1745,7 @@ impl Parser {
         loop {
             if self.eat(&TokenKind::LParen) {
                 let name_span = base.span();
-                let mut args = Vec::new();
-                if !self.at(&TokenKind::RParen) {
-                    loop {
-                        args.push(self.parse_expr()?);
-                        if !self.eat(&TokenKind::Comma) {
-                            break;
-                        }
-                    }
-                }
-                let close = self.expect(&TokenKind::RParen, "`)` after callable arguments")?;
+                let (args, close) = self.parse_call_arguments()?;
                 let span = base.span().merge(close.span);
                 // Invokable objects share ordinary checked method dispatch,
                 // receiver evaluation, ownership and GC handling.
@@ -1781,16 +1785,7 @@ impl Parser {
                     Vec::new()
                 };
                 if self.eat(&TokenKind::LParen) {
-                    let mut args = Vec::new();
-                    if !self.at(&TokenKind::RParen) {
-                        loop {
-                            args.push(self.parse_expr()?);
-                            if !self.eat(&TokenKind::Comma) {
-                                break;
-                            }
-                        }
-                    }
-                    let close = self.expect(&TokenKind::RParen, "`)` after method arguments")?;
+                    let (args, close) = self.parse_call_arguments()?;
                     let span = base.span().merge(close.span);
                     base = Expr::MethodCall {
                         base: Box::new(base),
@@ -1866,16 +1861,7 @@ impl Parser {
         };
         let method_type_args = self.parse_type_arguments()?;
         self.expect(&TokenKind::LParen, "`(` after method name")?;
-        let mut args = Vec::new();
-        if !self.at(&TokenKind::RParen) {
-            loop {
-                args.push(self.parse_expr()?);
-                if !self.eat(&TokenKind::Comma) {
-                    break;
-                }
-            }
-        }
-        let close = self.expect(&TokenKind::RParen, "`)` after arguments")?;
+        let (args, close) = self.parse_call_arguments()?;
         // Keep the existing AST shape for parent calls for downstream consumers.
         if class_name == "parent" {
             Ok(Expr::ParentMethodCall {
@@ -1969,17 +1955,7 @@ impl Parser {
                 let class_name = self.resolve_name(&raw_name, false).0;
                 let type_args = self.parse_type_arguments()?;
                 let (args, end_span) = if self.eat(&TokenKind::LParen) {
-                    let mut args = Vec::new();
-                    if !self.at(&TokenKind::RParen) {
-                        loop {
-                            args.push(self.parse_expr()?);
-                            if !self.eat(&TokenKind::Comma) {
-                                break;
-                            }
-                        }
-                    }
-                    let close =
-                        self.expect(&TokenKind::RParen, "`)` after constructor arguments")?;
+                    let (args, close) = self.parse_call_arguments()?;
                     (args, close.span)
                 } else {
                     (Vec::new(), class_span)
@@ -2022,16 +1998,7 @@ impl Parser {
                 }
                 if self.at(&TokenKind::LParen) {
                     self.advance();
-                    let mut args = Vec::new();
-                    if !self.at(&TokenKind::RParen) {
-                        loop {
-                            args.push(self.parse_expr()?);
-                            if !self.eat(&TokenKind::Comma) {
-                                break;
-                            }
-                        }
-                    }
-                    let close = self.expect(&TokenKind::RParen, "`)` after arguments")?;
+                    let (args, close) = self.parse_call_arguments()?;
                     let (callee, fallback) =
                         if name.eq_ignore_ascii_case("move") || name.eq_ignore_ascii_case("drop") {
                             (format!("$pxr_{}", name.to_ascii_lowercase()), None)

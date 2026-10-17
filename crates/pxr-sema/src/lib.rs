@@ -19,7 +19,9 @@ use pxr_diag::{Diagnostic, Diagnostics, Span};
 use pxr_types::Ty;
 use std::collections::{HashMap, VecDeque};
 
+mod arguments;
 mod class_generics;
+pub const OPTIONAL_PRESENCE_PARAMETER: &str = "$pxr_provided";
 mod compat;
 mod constraints;
 mod generics;
@@ -265,6 +267,8 @@ pub enum Callee {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TExpr {
+    /// Internal optional-argument storage, overwritten by the callee before use.
+    Missing(Ty),
     Effect {
         statement: Box<TStmt>,
         postfix: bool,
@@ -380,7 +384,7 @@ impl TExpr {
             TExpr::Effect { ty, .. } => ty.clone(),
             TExpr::Deferred => Ty::Infer,
             TExpr::Pass { expr, .. } => expr.ty(),
-            TExpr::Coerce { ty, .. } => ty.clone(),
+            TExpr::Coerce { ty, .. } | TExpr::Missing(ty) => ty.clone(),
             TExpr::Int(_) => Ty::Int,
             TExpr::Float(_) => Ty::Float,
             TExpr::Str(_) => Ty::String,
@@ -863,6 +867,7 @@ pub struct Analyzer {
 
 #[derive(Clone, Debug)]
 struct Signature {
+    declarations: Vec<ast::Param>,
     is_async: bool,
     mangled: String,
     display: String,
@@ -1263,6 +1268,14 @@ impl Analyzer {
                 ty: pty.clone(),
             });
         }
+        let provided_slot = if arguments::has_defaults(&method.ast_method.params) {
+            let slot = slots.len() as u32;
+            slots.push(Ty::array(Ty::Bool));
+            param_tys.push((arguments::PROVIDED.into(), Ty::array(Ty::Bool)));
+            Some(slot)
+        } else {
+            None
+        };
         let cid_slot = slots.len() as u32;
         slots.push(Ty::Int); // $cid
 
@@ -1316,6 +1329,24 @@ impl Analyzer {
             call_args.extend(param_vars.clone());
             let mut p = vec![Ty::Named(root_class.name.clone())];
             p.extend(method.params.clone());
+            let target = self
+                .classes
+                .values()
+                .flat_map(|class| class.methods.values())
+                .find(|candidate| candidate.mangled == target_mangled)
+                .unwrap();
+            if arguments::has_defaults(&target.ast_method.params) {
+                call_args.push(if let Some(slot) = provided_slot {
+                    TExpr::Var {
+                        name: arguments::PROVIDED.into(),
+                        slot,
+                        ty: Ty::array(Ty::Bool),
+                    }
+                } else {
+                    arguments::flags(method.params.len(), method.params.len())
+                });
+                p.push(Ty::array(Ty::Bool));
+            }
             TExpr::Call {
                 callee: Callee::User {
                     mangled: target_mangled.to_string(),
@@ -1949,6 +1980,7 @@ impl Analyzer {
                             param_names.push(param.name.clone());
                         }
 
+                        self.validate_defaults(&m.params, &params, &bindings);
                         let ret = if mkey == "__construct" {
                             if let Some(t) = &m.ret {
                                 let r = self.resolve_type_with(t, &bindings);
@@ -2045,6 +2077,11 @@ impl Analyzer {
                                 );
                             }
                             if mkey != "__construct" || existing.ast_method.is_abstract {
+                                self.check_optional_override(
+                                    &m.params,
+                                    &existing.ast_method.params,
+                                    m.name_span,
+                                );
                                 if params.len() != existing.params.len() {
                                     self.diags.emit(
                                         Diagnostic::error(format!(
@@ -2166,6 +2203,11 @@ impl Analyzer {
                             .with_span(implementation.name_span),
                         );
                     }
+                    self.check_optional_override(
+                        &implementation.ast_method.params,
+                        &requirement.ast_method.params,
+                        implementation.name_span,
+                    );
                     // Parameter types are invariant in this initial typed subset.
                     if implementation.params != requirement.params
                         || (implementation.ret != requirement.ret
@@ -2312,6 +2354,7 @@ impl Analyzer {
                 param_names.push(p.name.clone());
             }
 
+            self.validate_defaults(&f.params, &params, &bindings);
             let ret = match &f.ret {
                 Some(t) => self.resolve_type_with(t, &bindings),
                 None => self.class_expander.inferred_return(&mangle_fn(&f.name)),
@@ -2325,6 +2368,7 @@ impl Analyzer {
             self.funcs.insert(
                 key,
                 Signature {
+                    declarations: f.params.clone(),
                     is_async: f.is_async,
                     mangled: mangle_fn(&f.name),
                     display: f.name.clone(),
@@ -2444,7 +2488,8 @@ impl Analyzer {
             ctx.declare(name, ty.clone());
         }
         let before_errors = self.diags.error_count();
-        let body = self.analyze_stmts(&f.body, &mut ctx);
+        let mut body = self.defaults_prologue(&f.params, &mut ctx);
+        body.extend(self.analyze_stmts(&f.body, &mut ctx));
         ctx.inference_failed = self.diags.error_count() != before_errors;
         self.finish_return_inference(&sig.mangled, &sig.display, f.name_span, &ctx);
         if ctx.flow.reachable {
@@ -2460,6 +2505,10 @@ impl Analyzer {
                 .iter()
                 .cloned()
                 .zip(sig.params.iter().cloned())
+                .chain(
+                    arguments::has_defaults(&f.params)
+                        .then(|| (arguments::PROVIDED.into(), Ty::array(Ty::Bool))),
+                )
                 .collect(),
             ret: sig.ret.clone(),
             slots: ctx.slots,
@@ -2509,7 +2558,8 @@ impl Analyzer {
         // Abstract declarations still need a linkable fallback for dispatchers in
         // hierarchies with no concrete descendants. No valid object can reach it.
         let before_errors = self.diags.error_count();
-        let body = if method.ast_method.is_abstract {
+        let mut prologue = self.defaults_prologue(&method.ast_method.params, &mut ctx);
+        let mut body = if method.ast_method.is_abstract {
             vec![TStmt::Expr(TExpr::Call {
                 callee: Callee::User {
                     mangled: "abort".into(),
@@ -2524,6 +2574,8 @@ impl Analyzer {
         } else {
             self.analyze_stmts(&method.ast_method.body, &mut ctx)
         };
+        prologue.append(&mut body);
+        let body = prologue;
         ctx.inference_failed = self.diags.error_count() != before_errors;
         self.finish_return_inference(
             &method.mangled,
@@ -2534,6 +2586,7 @@ impl Analyzer {
         if !method.ast_method.is_abstract && method.name != "__construct" && method.ret != Ty::Void
         {
             let sig = Signature {
+                declarations: method.ast_method.params.clone(),
                 is_async: method.ast_method.is_async,
                 mangled: method.mangled.clone(),
                 display: format!("{class_name}::{}", method.name),
@@ -2560,6 +2613,9 @@ impl Analyzer {
                 .zip(method.params.iter().cloned()),
         );
 
+        if arguments::has_defaults(&method.ast_method.params) {
+            all_params.push((arguments::PROVIDED.into(), Ty::array(Ty::Bool)));
+        }
         Some(TFunc {
             is_async: method.ast_method.is_async,
             name: method.mangled.clone(),
@@ -4449,6 +4505,10 @@ impl Analyzer {
                     return None;
                 }
 
+                let supplied = args.len();
+                let completed =
+                    self.complete_arguments(args, &method.ast_method.params, *span, "E0207")?;
+                let args = completed.as_slice();
                 if args.len() != method.params.len() {
                     self.diags.emit(
                         Diagnostic::error(format!(
@@ -4473,6 +4533,28 @@ impl Analyzer {
                         .with_span(*span),
                     );
                     return None;
+                }
+                if name.eq_ignore_ascii_case("__construct") {
+                    let incompatible = self
+                        .classes
+                        .values()
+                        .filter(|candidate| self.is_subclass_of(&candidate.name, &class.name))
+                        .filter_map(|candidate| candidate.methods.get("__construct"))
+                        .any(|target| {
+                            target.params != method.params
+                                || target
+                                    .ast_method
+                                    .params
+                                    .iter()
+                                    .zip(&method.ast_method.params)
+                                    .any(|(child, parent)| {
+                                        parent.default.is_some() && child.default.is_none()
+                                    })
+                        });
+                    if incompatible {
+                        self.diags.emit(Diagnostic::error("explicit virtual constructor calls require compatible constructor parameter types and optionality; use new or class-qualified constructor access").with_code("E0311").with_span(*span));
+                        return None;
+                    }
                 }
                 let target_mangled = if self.method_has_overrides(&class.name, &name) {
                     mangle_dispatcher(&class.name, &name)
@@ -4503,6 +4585,19 @@ impl Analyzer {
                     typed_args.push(t_arg);
                 }
 
+                for i in supplied..args.len() {
+                    typed_args[i + 1] = TExpr::Missing(method.params[i].clone());
+                    actual_tys[i + 1] = method.params[i].clone();
+                }
+                arguments::append_presence(
+                    &method.ast_method.params,
+                    supplied,
+                    &mut typed_args,
+                    &mut actual_tys,
+                );
+                if arguments::has_defaults(&method.ast_method.params) {
+                    formal_params.push(Ty::array(Ty::Bool));
+                }
                 Some(TExpr::Call {
                     callee: Callee::User {
                         mangled: target_mangled,
@@ -4560,6 +4655,10 @@ impl Analyzer {
                         return None;
                     }
 
+                    let supplied = args.len();
+                    let completed =
+                        self.complete_arguments(args, &ctor.ast_method.params, *span, "E0207")?;
+                    let args = completed.as_slice();
                     if args.len() != ctor.params.len() {
                         self.diags.emit(
                             Diagnostic::error(format!(
@@ -4597,6 +4696,16 @@ impl Analyzer {
                             ty: formal_ty.clone(),
                         });
                     }
+                    for i in supplied..args.len() {
+                        typed_args[i] = TExpr::Missing(ctor.params[i].clone());
+                        actual_tys[i] = ctor.params[i].clone();
+                    }
+                    arguments::append_presence(
+                        &ctor.ast_method.params,
+                        supplied,
+                        &mut typed_args,
+                        &mut actual_tys,
+                    );
                     Some((ctor.mangled.clone(), typed_args, actual_tys))
                 } else {
                     if !args.is_empty() {
@@ -4888,14 +4997,6 @@ impl Analyzer {
             );
             return None;
         }
-        if args.len() != method.params.len() {
-            self.diags.emit(
-                Diagnostic::error("incorrect argument count in class-qualified call")
-                    .with_code("E0207")
-                    .with_span(span),
-            );
-            return None;
-        }
         let mut typed = Vec::new();
         let mut actual = Vec::new();
         let mut formal = Vec::new();
@@ -4939,6 +5040,9 @@ impl Analyzer {
                 false,
             );
         }
+        let supplied = args.len();
+        let completed = self.complete_arguments(args, &method.ast_method.params, span, "E0207")?;
+        let args = completed.as_slice();
         formal.extend(method.params.clone());
         for (arg, want) in args.iter().zip(&method.params) {
             let value = self.infer_for_type(arg, ctx, want)?;
@@ -4955,6 +5059,15 @@ impl Analyzer {
             }
             typed.push(value);
             actual.push(ty);
+        }
+        let offset = usize::from(!method.ast_method.is_static);
+        for i in supplied..args.len() {
+            typed[i + offset] = TExpr::Missing(method.params[i].clone());
+            actual[i + offset] = method.params[i].clone();
+        }
+        arguments::append_presence(&method.ast_method.params, supplied, &mut typed, &mut actual);
+        if arguments::has_defaults(&method.ast_method.params) {
+            formal.push(Ty::array(Ty::Bool));
         }
         Some(TExpr::Call {
             callee: Callee::User {
@@ -5832,7 +5945,11 @@ impl Analyzer {
             }
             return Some(TExpr::Call {
                 callee: Callee::AsyncServer {
-                    handler: handler.mangled,
+                    handler: if arguments::has_defaults(&handler.declarations) {
+                        format!("{}$all", handler.mangled)
+                    } else {
+                        handler.mangled
+                    },
                     http,
                 },
                 ret: Ty::Task(Box::new(Ty::Void)),
@@ -6195,6 +6312,9 @@ impl Analyzer {
                 );
                 return None;
             }
+            let supplied = args.len();
+            let completed = self.complete_arguments(args, &sig.declarations, span, "E0230")?;
+            let args = completed.as_slice();
             if args.len() != sig.params.len() {
                 self.diags.emit(
                     Diagnostic::error(format!(
@@ -6236,11 +6356,17 @@ impl Analyzer {
             if !ok {
                 return None;
             }
+            for i in supplied..args.len() {
+                targs[i] = TExpr::Missing(sig.params[i].clone());
+                arg_tys[i] = sig.params[i].clone();
+            }
+            arguments::append_presence(&sig.declarations, supplied, &mut targs, &mut arg_tys);
+            let abi_params = sig.abi_params();
             return Some(TExpr::Call {
                 callee: Callee::User {
                     mangled: sig.mangled,
                     name: sig.display,
-                    params: sig.params,
+                    params: abi_params,
                 },
                 ret: if sig.is_async {
                     Ty::Task(Box::new(sig.ret))
