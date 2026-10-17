@@ -28,7 +28,7 @@ and whose output the test suite asserts is byte‑identical.
 | `++` / `--`, compound assignment `+=` etc. | as *statements* only (see below) |
 | String literals with escapes; hex / binary / `0o` octal / `_`‑separated ints | |
 | **Double‑quoted interpolation** `"$name"`, `"{$name}"` | equivalent to `"" . $name`; `$` not followed by a name start stays literal (`"$"`, `"$1"`, `"foo$"`, `"$$x"`); array/property access and braced access expressions work; deprecated `${...}` is rejected (see below) |
-| Infrastructure: typed params, return types, recursion | parameter annotations required; concrete-body returns inferred when omitted |
+| Infrastructure: typed params, return types, recursion | parameter annotations required in strict mode; concrete-body returns inferred when omitted |
 | Arrays `[...]` / `array(...)` | ordered maps, `int`/`string` keys, insertion order |
 | **Array value semantics** | assignment, function arguments, returns and `foreach` all operate on copies (copy-on-write storage) |
 | **Array key unification** | a canonical decimal‑integer string key *is* the integer key: `$a["1"]` ≡ `$a[1]` (`"01"`, `"1.5"`, `"+1"`, `" 1"` stay strings) |
@@ -67,12 +67,12 @@ behavioural divergence.
 
 | PHP feature | PXR status |
 | --- | --- |
-| Untyped parameters | **Error** `E0202`; returns can be inferred for concrete bodies |
-| Missing abstract/interface return type | **Error** `E0204`; these signatures have no body to infer |
-| Bare `array` type hint | **Error** — write the element type, `array<T>` (a PXR extension) |
-| A concrete variable changing type (`$x = 1; $x = "s";`) | **Error** — opt into `mixed` to allow type changes |
+| Untyped parameters | `--compat` uses mixed storage; strict mode requires annotations (`E0202`) |
+| Missing abstract/interface return type | `--compat` uses mixed; strict mode requires a contract (`E0204`) |
+| Bare `array` type hint | `--compat` means `array<mixed>`; strict mode requires `array<T>` |
+| An inferred variable changing type (`$x = 1; $x = "s";`) | `--compat` uses mixed storage; strict mode requires explicit mixed storage |
 | Deprecated `${name}` and invalid interpolation | **Error** `E0008`; simple array/property access and braced access expressions are supported |
-| Nullable type annotations | Not yet; null literals work through mixed storage |
+| Nullable/union/failure-literal annotations | Checked tagged storage, including `?T`, `T|null`, `string|false`; affine native resource members are rejected |
 | Assignment as an expression (`$a = $b = 1`, `f($x++)`) | Supported for shared values; owned/borrowed binding duplication is rejected |
 | Keyed `foreach ($a as $k => $v)` | Supported; key destination uses `mixed` (predeclared concrete destinations: `E0242`) |
 | `echo` / `print` an array, `(string)$array` | **Error** `E0240` — PHP prints `Array` *and* a warning to stdout, which PXR does not reproduce |
@@ -83,7 +83,7 @@ behavioural divergence.
 | Wrong argument type (non‑strict mode coercion) | **Error** `E0231` |
 | Undefined variable / function | `E0220` / `E0232` in native-only code; unbound calls resolve at runtime when a PHP boundary is declared |
 | Leading‑zero octal literal (`0755`) | **Warning** `W0001`, read as decimal |
-| Functions that return `string|false` / `int|false` (`strpos`, `strstr`, `base64_decode`, `hex2bin`, `substr_compare`, …) | Not yet — needs a union / `false` value type; only the never-failing encoders above are provided |
+| Functions that return `string|false` / `int|false` (`strpos`, `strstr`, `base64_decode`, `hex2bin`, `substr_compare`, …) | APIs not yet implemented; union/failure-literal return types are supported |
 | `number_format` | Not yet |
 | Enums, reference closures | Not yet; native traits and by-value/bound/static closures, including generic scopes, are supported |
 | Runtime include/require | Supported for explicitly marked PHP files; see [interop](INTEROP.md) |
@@ -277,9 +277,9 @@ or explicit conversion.
 Dynamic arithmetic, numeric strings, overflow promotion, array union, bitwise
 operators, loose/strict comparison, ordering, mixed switch, null coalescing, and
 strict match are tested against PHP. Most other builtins keep concrete argument
-checks. Union/nullable annotations, direct dynamic member access, resources and
-references in native code, and full PHP coercion coverage remain outside the
-compiled subset. PHP boundaries handle broader language/library behavior but
+checks; `--compat` adds checked tagged-to-concrete boundaries. Union/nullable
+annotations are supported. Direct dynamic member access, arbitrary resources and
+references, and full PHP coercion coverage remain outside the compiled subset. PHP boundaries handle broader language/library behavior but
 reject resources, references, callbacks, and native objects crossing the wire.
 See [`MIXED.md`](MIXED.md).
 
@@ -328,7 +328,7 @@ part of this memory-management milestone. Native `__destruct` declarations fail
 explicitly with `E0290`; PHP-boundary destructors remain PHP behavior.
 
 **Fail loud, never silent.** Features not yet implemented (such as
-reference closures, exceptions and nullable annotations)
+reference closures and exceptions)
 produce a compile error with a specific code — never a silently different program.
 
 **Invokable objects.** `$callback($arg)` lowers to checked `__invoke` dispatch,
@@ -343,3 +343,43 @@ unsupported. Trait closures bind lexical types to the consuming class. User-decl
 Native PXR executables link only the system C library. Native-only programs,
 including mixed operations, do not require PHP. Executing an explicit PHP
 boundary starts a persistent PHP CLI worker; it does not embed Zend or a SAPI. See [`RUNTIME.md`](RUNTIME.md).
+
+## Explicit native compatibility mode
+
+Use `pxr run --compat main.php`, `pxr build --compat main.php -o main`, or
+`pxr check --compat main.php`. The option applies to the native module graph.
+`ast`, `emit-ir`, `emit-llvm` and `migration-report` accept the same option.
+Strict native compilation remains the default. The driver exposes the option
+through `BuildOptions.compat` and the `*_with_compat` entry points.
+
+In this mode, untyped parameters and properties use `mixed`; bare `array` means
+`array<mixed>`. Untyped properties initially contain null, including statics.
+Omitted function and ordinary method/closure return annotations mean mixed;
+bare returns and fallthrough produce null. Existing magic method contracts still
+apply, and an async entry point must explicitly return void.
+
+Inferred ordinary local bindings use tagged storage, so a binding can change
+between null, scalar, array and object values. Assignments, nested writes,
+keyed foreach, by-value closures, GC roots, await and isolated workers use that
+representation. A known object assignment retains a flow fact for native member
+and invokable-object dispatch; incompatible branch facts are discarded. Arbitrary
+dynamic name/member lookup remains separate work in M11.
+
+Explicit annotations keep their storage and checks. Values arriving from tagged
+storage are checked before entering concrete parameters, returns, local/property
+slots and supported typed builtin operands. Scalar int-to-float widening remains
+allowed. Typed arrays validate every nested value and preserve keys and copy-on-write
+snapshots. Wrong scalar tags, array members or object classes produce TypeError.
+This contract does not enable PHP's weak scalar coercions. Existing native builtin
+overload restrictions still apply; for example, guard an untyped argument with
+`is_int`/`is_float` before `abs`. Compatibility mode does not add missing APIs.
+
+Affine native resources and tasks retain their native representation. Ownership
+and definite-initialization checks still run. Borrows cannot box, widen or rebuild
+array storage; annotate an owner with the exact required type when borrowing into
+typed code. Reference aliases/captures retain their separate, unfinished contract.
+Unsupported source remains an error. PHP interpreter boundaries still require the
+existing explicit module marker; compilation errors do not trigger fallback.
+
+See [the runnable example](../examples/compat-mode/main.php) and
+[the full M10 status](M10.md).

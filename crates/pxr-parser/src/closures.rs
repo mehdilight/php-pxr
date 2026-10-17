@@ -241,6 +241,7 @@ impl Parser {
             } else {
                 None
             };
+            let ty = ty.or_else(|| self.compat.then_some(TypeRef::Mixed));
             let t = self.expect_variable("closure parameter")?;
             let TokenKind::Variable(name) = t.kind else {
                 unreachable!()
@@ -341,6 +342,10 @@ impl Parser {
         })();
         self.method_static = previous_static;
         let mut body = body_result?;
+        if self.compat && ret.is_none() {
+            ret = Some(TypeRef::Mixed);
+            super::compat::complete_returns(&mut body, span);
+        }
         if scope.is_none() && body_has_lexical_receiver(&body) {
             self.error(
                 span,
@@ -511,9 +516,10 @@ impl Parser {
         }));
         let mut prologue: Vec<_> = captures
             .iter()
-            .map(|n| Stmt::Assign {
+            .zip(&types)
+            .map(|(n, t)| Stmt::Assign {
                 target: local(n, span),
-                ty: None,
+                ty: self.compat.then(|| t.clone()),
                 value: field(n, span),
                 span,
             })

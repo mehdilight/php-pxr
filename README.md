@@ -158,11 +158,16 @@ Concrete code receives static diagnostics; mixed operations check runtime tags,
 and marked legacy files run in PHP. The boundary and differences are documented in
 [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md). Highlights:
 
-* Parameters require annotations; function/concrete method returns can be inferred.
+* In strict mode, parameters require annotations; concrete-body returns can be inferred.
   Abstract/interface contracts still require return annotations.
 * Using an undefined variable is an **error**, not a warning + `null`.
 * Concrete integer overflow wraps; mixed arithmetic promotes to float.
-* Null uses mixed storage; concrete types remain non-nullable.
+* Nullable and union annotations use checked tagged storage (`?T`, `T|null`, `string|false`).
+
+For native compilation of untyped parameters, bare arrays and changing locals,
+use `pxr run --compat main.php`. Explicit types remain checked. See the
+[compatibility contract](docs/COMPATIBILITY.md) and
+[runnable example](examples/compat-mode/main.php).
 
 ## Benchmarks
 

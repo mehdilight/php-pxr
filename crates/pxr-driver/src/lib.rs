@@ -59,6 +59,7 @@ fn runtime_source() -> String {
 
 #[derive(Clone, Debug)]
 pub struct BuildOptions {
+    pub compat: bool,
     pub input: PathBuf,
     pub output: PathBuf,
     /// Optimization level handed to clang (0..=3).
@@ -70,6 +71,7 @@ pub struct BuildOptions {
 impl BuildOptions {
     pub fn new(input: impl Into<PathBuf>, output: impl Into<PathBuf>) -> Self {
         BuildOptions {
+            compat: false,
             input: input.into(),
             output: output.into(),
             opt_level: 2,
@@ -102,14 +104,18 @@ pub struct Frontend {
 
 /// Run the front end (lex, parse, semantic analysis) over a source string.
 pub fn check_source(src: &str) -> (Option<TProgram>, Diagnostics) {
-    let (prog, mut diags) = pxr_parser::parse(src);
+    check_source_with_compat(src, false)
+}
+
+pub fn check_source_with_compat(src: &str, compat: bool) -> (Option<TProgram>, Diagnostics) {
+    let (prog, mut diags) = pxr_parser::parse_at_with_compat(src, 0, compat);
     let Some(prog) = prog else {
         return (None, diags);
     };
     if diags.has_errors() {
         return (None, diags);
     }
-    let (tprog, sdiags) = pxr_sema::analyze(&prog);
+    let (tprog, sdiags) = pxr_sema::analyze_with_compat(&prog, compat);
     diags.extend(sdiags);
     if diags.has_errors() {
         (None, diags)
@@ -125,12 +131,22 @@ pub fn check_file(path: &Path) -> Result<Diagnostics, CompileError> {
 
 /// Resolve declaration-only modules and check a complete file-based program.
 pub fn check_path(path: &Path) -> (Option<TProgram>, Diagnostics) {
-    let (program, diagnostics, _) = check_project(path);
+    check_path_with_compat(path, false)
+}
+
+pub fn check_path_with_compat(path: &Path, compat: bool) -> (Option<TProgram>, Diagnostics) {
+    let (program, diagnostics, _) = check_project_with_compat(path, compat);
     (program, diagnostics)
 }
 
-fn check_project(path: &Path) -> (Option<TProgram>, Diagnostics, Vec<MigrationFile>) {
-    let mut loader = ModuleLoader::default();
+fn check_project_with_compat(
+    path: &Path,
+    compat: bool,
+) -> (Option<TProgram>, Diagnostics, Vec<MigrationFile>) {
+    let mut loader = ModuleLoader {
+        compat,
+        ..Default::default()
+    };
     loader.load(path, false, true, true, pxr_diag::Span::synthetic());
     let mut program = None;
     if !loader.diags.has_errors() {
@@ -138,7 +154,7 @@ fn check_project(path: &Path) -> (Option<TProgram>, Diagnostics, Vec<MigrationFi
             items: std::mem::take(&mut loader.items),
             span: pxr_diag::Span::synthetic(),
         };
-        let (typed, diags) = pxr_sema::analyze(&ast);
+        let (typed, diags) = pxr_sema::analyze_with_compat(&ast, compat);
         loader.diags.extend(diags);
         program = typed;
     }
@@ -209,7 +225,11 @@ fn has_mixed(ty: &pxr_types::Ty) -> bool {
 /// Inspect the same graph and semantic analysis used by build/check. It never
 /// executes a dynamic file or runs PHP to discover exports.
 pub fn migration_report(path: &Path) -> (MigrationReport, Diagnostics) {
-    let (program, diagnostics, files) = check_project(path);
+    migration_report_with_compat(path, false)
+}
+
+pub fn migration_report_with_compat(path: &Path, compat: bool) -> (MigrationReport, Diagnostics) {
+    let (program, diagnostics, files) = check_project_with_compat(path, compat);
     let mut report = MigrationReport {
         checked: program.is_some() && !diagnostics.has_errors(),
         files,
@@ -341,6 +361,7 @@ fn dynamic_source(source: &str) -> bool {
 
 #[derive(Default)]
 struct ModuleLoader {
+    compat: bool,
     items: Vec<pxr_ast::Stmt>,
     sources: Vec<(usize, PathBuf, String)>,
     next_offset: usize,
@@ -450,7 +471,7 @@ impl ModuleLoader {
             self.error(site, format!("cyclic or excessively deep module dependency at `{}`; use require_once for shared dependencies", path.display()));
             return;
         }
-        let (program, diagnostics) = pxr_parser::parse_at(&source, offset);
+        let (program, diagnostics) = pxr_parser::parse_at_with_compat(&source, offset, self.compat);
         self.sources.push((offset, path.clone(), source));
         let failed = diagnostics.has_errors();
         self.diags.extend(diagnostics);
@@ -529,7 +550,7 @@ pub struct BuildResult {
 
 pub fn build(opts: &BuildOptions) -> Result<BuildResult, BuildError> {
     let t0 = Instant::now();
-    let (program, diags) = check_path(&opts.input);
+    let (program, diags) = check_path_with_compat(&opts.input, opts.compat);
     let frontend_time = t0.elapsed();
     if diags.has_errors() || program.is_none() {
         return Err(BuildError::Compile(CompileError::new(diags)));
@@ -600,6 +621,14 @@ pub fn build(opts: &BuildOptions) -> Result<BuildResult, BuildError> {
 
 /// Build into a temporary directory and return its path (used by `pxr run`).
 pub fn build_temp(src_path: &Path, opt_level: u8) -> Result<(PathBuf, WorkDir), BuildError> {
+    build_temp_with_compat(src_path, opt_level, false)
+}
+
+pub fn build_temp_with_compat(
+    src_path: &Path,
+    opt_level: u8,
+    compat: bool,
+) -> Result<(PathBuf, WorkDir), BuildError> {
     let workspace = WorkDir::create()?;
     let stem = src_path
         .file_stem()
@@ -607,6 +636,7 @@ pub fn build_temp(src_path: &Path, opt_level: u8) -> Result<(PathBuf, WorkDir), 
         .unwrap_or_else(|| "program".into());
     let out = workspace.path.join(stem);
     let opts = BuildOptions {
+        compat,
         input: src_path.to_path_buf(),
         output: out.clone(),
         opt_level,
@@ -851,7 +881,14 @@ pub fn ir_for_source(src: &str) -> Result<(String, OptStats), CompileError> {
 
 /// Optimized IR for a complete module graph.
 pub fn ir_for_file(path: &Path) -> Result<(String, OptStats), CompileError> {
-    let (program, diagnostics) = check_path(path);
+    ir_for_file_with_compat(path, false)
+}
+
+pub fn ir_for_file_with_compat(
+    path: &Path,
+    compat: bool,
+) -> Result<(String, OptStats), CompileError> {
+    let (program, diagnostics) = check_path_with_compat(path, compat);
     let Some(program) = program else {
         return Err(CompileError::new(diagnostics));
     };

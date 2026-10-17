@@ -31,13 +31,22 @@ fn have_cc() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 fn build(name: &str, source: &str, opt: u8) -> PathBuf {
+    build_with_compat(name, source, opt, false)
+}
+
+fn build_with_compat(name: &str, source: &str, opt: u8, compat: bool) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("pxr-m7-{}-{name}-{opt}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let input = dir.join("main.php");
     let output = dir.join("main");
     std::fs::write(&input, source).unwrap();
-    let built = Command::new(env!("CARGO_BIN_EXE_pxr"))
-        .arg("build")
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pxr"));
+    if compat {
+        command.arg("build").arg("--compat");
+    } else {
+        command.arg("build");
+    }
+    let built = command
         .arg(&input)
         .arg("--opt")
         .arg(opt.to_string())
@@ -97,11 +106,15 @@ fn build(name: &str, source: &str, opt: u8) -> PathBuf {
 }
 
 fn run_case(name: &str, source: &str, expected: &str) {
+    run_case_with_compat(name, source, expected, false)
+}
+
+fn run_case_with_compat(name: &str, source: &str, expected: &str, compat: bool) {
     if !have_cc() {
         return;
     }
     for opt in [0, 3] {
-        let executable = build(name, source, opt);
+        let executable = build_with_compat(name, source, opt, compat);
         for stress in [false, true] {
             let mut command = Command::new(&executable);
             command.env("PXR_PHP", "/pxr-no-php-cli");
@@ -3071,5 +3084,46 @@ async function main(): void {
 }
 "#,
         "text::8:99\n",
+    );
+}
+
+#[test]
+fn compatibility_storage_and_checked_boundaries_survive_async_frames() {
+    run_case_with_compat(
+        "compat_async_frames",
+        r#"<?php
+async function identity($value) { $delay=0; await sleepAsync($delay); return $value; }
+function number(int $value): int {return $value+1;}
+function values(array<int> $value): array<int> {return $value;}
+class CompatAlive { public string $text; public function __construct(string $text) {$this->text=$text;} }
+async function main(): void {
+    $data=[7,8]; $task=identity($data); $data[0]=99;
+    $callback=async function($value) use($data) {await sleepAsync(0); return $data[0].$value;};
+    $kept=new CompatAlive("kept"); $objectTask=identity($kept); $kept=null;
+    for($i=0;$i<30;$i++) { $garbage=new CompatAlive("temporary"); await sleepAsync(0); }
+    $result=values(await $task); echo $result[0], ":", $data[0], ":", await $callback("!"), ":", number(await identity(7)), "\n";
+    $object=await $objectTask; if($object instanceof CompatAlive) {echo $object->text, "\n";}
+    foreach($data as $key=>$value) {echo $key, "=", $value, ";";} echo "\n";
+}
+"#,
+        "7:99:99!:8\nkept\n0=99;1=8;\n",
+        true,
+    );
+}
+
+#[test]
+fn compatibility_workers_preserve_untyped_payload_isolation() {
+    run_case_with_compat(
+        "compat_workers",
+        r#"<?php
+async function worker($value) {await sleepAsync(0); $value[0]++; return $value;}
+async function main(): void {
+    $seed=[7,"text"];
+    $task=spawn parallelAsync("worker",$seed); $seed[0]=99;
+    $value=await $task; echo $value[0], ":", $value[1], ":", $seed[0], "\n";
+}
+"#,
+        "8:text:99\n",
+        true,
     );
 }

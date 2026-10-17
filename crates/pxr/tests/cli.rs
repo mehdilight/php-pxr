@@ -5187,3 +5187,116 @@ $box=relay(new Box<null|int>(7)); echo $box->value, "\n";
     assert_eq!(run.code, 0, "{}", run.stderr);
     assert_eq!(run.stdout, "1:1\ntext:7:9\n7\n");
 }
+
+#[test]
+fn compatibility_mode_runs_untyped_code_with_checked_native_boundaries() {
+    if !have_cc() {
+        return;
+    }
+    let source = r#"<?php
+function identity($value) { return $value; }
+function increment(int $value): int { return $value + 1; }
+function early($yes) { if ($yes) {return;} }
+function listValues(array $values): array {return $values;}
+class CompatBox {public $value; public static $staticValue; public static function number(int $value): int {return $value+1;} public function set($value) {$this->value=$value;} public function get() {return $this->value;}}
+$x=1; echo $x, ":"; $x="two"; echo strtoupper($x), ":", strlen($x), "\n";
+$x=["a"=>1, "two", null]; $snapshot=$x; $x["a"]=7;
+foreach($snapshot as $key=>$value) {echo $key, "=", $value, ";";} echo "\n";
+echo increment(identity(7)), ":", is_null(early(true)), ":", is_null(early(false)), "\n";
+echo listValues([1,"two"])[1], "\n";
+$cb=function($value) use($x) {return $x["a"].$value;}; echo $cb("!"), "\n";
+$cb=fn($value)=>$value; echo $cb("arrow"), "\n";
+$box=new CompatBox(); echo is_null($box->value), ":", is_null(CompatBox::$staticValue), "\n"; $box->set("object"); echo $box->get(), "\n";
+$typed: int=8; $typed=9; echo CompatBox::number(identity($typed)), "\n";
+"#;
+    let path = temp_php("compat_native_values", &source);
+    let run = run_ok(&["run", "--compat", path.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    if have_php() {
+        let php_source = source.replace("$typed: int=8;", "$typed=8;");
+        let php_path = temp_php("compat_native_values_php", &php_source);
+        let php = Command::new("php").arg(php_path).output().unwrap();
+        assert!(
+            php.status.success(),
+            "{}",
+            String::from_utf8_lossy(&php.stderr)
+        );
+        assert_eq!(run.stdout, String::from_utf8_lossy(&php.stdout));
+    }
+}
+
+#[test]
+fn compatibility_mode_checks_dynamic_tags_at_concrete_boundaries() {
+    if !have_cc() {
+        return;
+    }
+    for (name, source) in [
+        ("argument", "function value($x) {return $x;} function target(int $x): int {return $x;} echo target(value(\"wrong\"));"),
+        ("return", "function value($x): int {return $x;} echo value(\"wrong\");"),
+        ("local", "$x=\"wrong\"; $y: int=$x; echo $y;"),
+        ("array", "function value($x) {return $x;} function target(array<int> $x): int {return $x[0];} echo target(value([\"wrong\"]));"),
+        ("object", "class A {} class B {} function target(A $x): A {return $x;} function value($x) {return $x;} $x=target(value(new B()));"),
+        ("builtin", "$x=7; echo strlen($x);"),
+    ] {
+        let path=temp_php(&format!("compat_bad_{name}"),&format!("<?php {source}"));
+        let run=run_ok(&["run","--compat",path.to_str().unwrap()]);
+        assert_eq!(run.code,255,"{name}: {}",run.stderr);
+        assert!(run.stderr.contains("TypeError"),"{name}: {}",run.stderr);
+    }
+}
+
+#[test]
+fn compatibility_mode_is_explicit_and_preserves_annotations_and_borrows() {
+    for source in [
+        "<?php function f($x) {return $x;} echo f(7);",
+        "<?php function f(array $x): array {return $x;} echo f([7])[0];",
+        "<?php $x=7; $x=\"text\"; echo $x;",
+    ] {
+        let path = temp_php("compat_opt_in", source);
+        assert_ne!(run_ok(&["check", path.to_str().unwrap()]).code, 0);
+        let check = run_ok(&["check", "--compat", path.to_str().unwrap()]);
+        assert_eq!(check.code, 0, "{}", check.stderr);
+    }
+    for source in [
+        "<?php $x: int=7; $x=\"text\";",
+        "<?php function f(int $x): int {$x=\"text\"; return $x;}",
+        "<?php function f(&array<int> $x): void {} $x=[1]; f(&$x);",
+    ] {
+        let path = temp_php("compat_retains_contracts", source);
+        let check = run_ok(&["check", "--compat", path.to_str().unwrap()]);
+        assert_ne!(check.code, 0, "{source}");
+    }
+}
+
+#[test]
+fn compatibility_mode_applies_to_modules_and_cli_artifacts() {
+    if !have_cc() {
+        return;
+    }
+    let dep = temp_php(
+        "compat_module_dependency",
+        "<?php function compatModule($value) {return $value;}",
+    );
+    let entry = dep.parent().unwrap().join("entry.php");
+    std::fs::write(&entry,"<?php require_once __DIR__ . '/compat_module_dependency.php'; echo compatModule('module'), \"\\n\";").unwrap();
+    for command in ["check", "ast", "emit-ir", "emit-llvm", "migration-report"] {
+        let output = run_ok(&[command, "--compat", entry.to_str().unwrap()]);
+        assert_eq!(output.code, 0, "{command}: {}", output.stderr);
+    }
+    let output = run_ok(&["run", "--compat", entry.to_str().unwrap()]);
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    assert_eq!(output.stdout, "module\n");
+    let output_path = entry.with_extension("bin");
+    let built = run_ok(&[
+        "build",
+        "--compat",
+        entry.to_str().unwrap(),
+        "-o",
+        output_path.to_str().unwrap(),
+    ]);
+    assert_eq!(built.code, 0, "{}", built.stderr);
+    assert_eq!(
+        Command::new(output_path).output().unwrap().stdout,
+        b"module\n"
+    );
+}

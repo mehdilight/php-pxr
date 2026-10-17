@@ -30,12 +30,14 @@ check: build
 		echo "checking $$f"; \
 		./target/debug/pxr check $$f || exit 1; \
 	done
+	./target/debug/pxr check --compat examples/compat-mode/main.php
 
 examples: release
 	@for f in $(EXAMPLES); do \
 		echo "== $$f =="; \
 		$(PXR) run $$f || exit 1; \
 	done
+	$(PXR) run --compat examples/compat-mode/main.php
 
 bench: release
 	python3 benchmarks/bench.py

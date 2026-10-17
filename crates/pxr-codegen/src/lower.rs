@@ -541,6 +541,12 @@ impl Lowerer {
                 let place = self.prepare_target(target);
                 let cur_ty = ty.clone();
                 let cur = self.read_target(&place, &cur_ty);
+                let cur = if cur_ty.is_boxed() {
+                    let numeric = self.emit_const(Literal::Str(b"(i|d)".to_vec()));
+                    self.rt_call("pxr_mixed_require", vec![cur, numeric], Ty::Mixed)
+                } else {
+                    cur
+                };
                 let dx = self.emit_const(Literal::Int(*delta));
                 let res = self.lower_bin_expr(pxr_sema::TBinOp::Add, &cur_ty, cur, &Ty::Int, dx);
                 let storage = target.storage_ty();
@@ -825,29 +831,8 @@ impl Lowerer {
     }
 
     fn type_descriptor(&self, ty: &Ty) -> String {
-        match ty {
-            Ty::Mixed => "m".into(),
-            Ty::Int => "i".into(),
-            Ty::Float => "d".into(),
-            Ty::Bool => "b".into(),
-            Ty::String => "s".into(),
-            Ty::Array(element) => format!("[{}]", self.type_descriptor(element)),
-            Ty::Named(name) => format!("O{};", self.class_ids[name]),
-            Ty::Union(members) => format!(
-                "({})",
-                members
-                    .iter()
-                    .map(|m| match m {
-                        pxr_types::UnionMember::Value(t) => self.type_descriptor(t),
-                        pxr_types::UnionMember::Null => "n".into(),
-                        pxr_types::UnionMember::False => "f".into(),
-                        pxr_types::UnionMember::True => "t".into(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("|")
-            ),
-            _ => unreachable!("invalid checked value descriptor: {ty}"),
-        }
+        ty.runtime_descriptor(&|name| self.class_ids.get(name).copied())
+            .expect("checked value descriptor")
     }
 
     fn to_bool(&mut self, v: Value, ty: &Ty) -> Value {

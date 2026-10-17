@@ -7,6 +7,7 @@
 //! single run reports as many independent syntax errors as possible.
 
 mod closures;
+mod compat;
 
 use pxr_ast::*;
 use pxr_diag::{Diagnostic, Diagnostics, Span};
@@ -14,6 +15,7 @@ use pxr_lexer::{StrPart, Token, TokenKind};
 use std::collections::HashMap;
 
 pub struct Parser {
+    compat: bool,
     toks: Vec<Token>,
     pos: usize,
     diags: Diagnostics,
@@ -42,6 +44,15 @@ pub fn parse(src: &str) -> (Option<Program>, Diagnostics) {
 
 /// Parse with byte offsets in a driver's combined source map.
 pub fn parse_at(src: &str, offset: usize) -> (Option<Program>, Diagnostics) {
+    parse_at_with_compat(src, offset, false)
+}
+
+/// Explicit native compatibility mode; strict parsing remains the default.
+pub fn parse_at_with_compat(
+    src: &str,
+    offset: usize,
+    compat: bool,
+) -> (Option<Program>, Diagnostics) {
     let (mut toks, lex_diags) = pxr_lexer::lex(src);
     for token in &mut toks {
         token.shift(offset);
@@ -56,6 +67,7 @@ pub fn parse_at(src: &str, offset: usize) -> (Option<Program>, Diagnostics) {
         shifted.emit(diag);
     }
     let mut p = Parser {
+        compat,
         toks,
         pos: 0,
         diags: Diagnostics::new(),
@@ -635,6 +647,7 @@ impl Parser {
                 } else {
                     None
                 };
+                let ty = ty.or_else(|| self.compat.then_some(TypeRef::Mixed));
                 let vt = self.expect_variable("parameter name")?;
                 let pname = match vt.kind {
                     TokenKind::Variable(n) => n,
@@ -659,7 +672,12 @@ impl Parser {
             None
         };
 
-        let body = self.parse_block()?;
+        let mut body = self.parse_block()?;
+        let mut ret = ret;
+        if self.compat && ret.is_none() {
+            ret = Some(TypeRef::Mixed);
+            compat::complete_returns(&mut body, start);
+        }
         let end = self.peek().span;
         Ok(FnDecl {
             is_async: false,
@@ -860,6 +878,8 @@ impl Parser {
             None
         };
 
+        let untyped = ty.is_none();
+        let ty = ty.or_else(|| self.compat.then_some(TypeRef::Mixed));
         let vt = self.expect_variable("property name")?;
         let name = match vt.kind {
             TokenKind::Variable(n) => n,
@@ -869,6 +889,8 @@ impl Parser {
 
         let default = if self.eat(&TokenKind::Assign) {
             Some(self.parse_expr()?)
+        } else if self.compat && untyped {
+            Some(Expr::NullLit(name_span))
         } else {
             None
         };
@@ -927,6 +949,7 @@ impl Parser {
                 } else {
                     None
                 };
+                let ty = ty.or_else(|| self.compat.then_some(TypeRef::Mixed));
                 let vt = self.expect_variable("parameter name")?;
                 let pname = match vt.kind {
                     TokenKind::Variable(n) => n,
@@ -962,6 +985,14 @@ impl Parser {
             self.method_static = previous_static;
             result?
         };
+        let mut body = body;
+        let mut ret = ret;
+        if self.compat && ret.is_none() && (!name.starts_with("__") || name == "__invoke") {
+            ret = Some(TypeRef::Mixed);
+            if !is_abstract {
+                compat::complete_returns(&mut body, start);
+            }
+        }
         let end = self.peek().span;
         Ok(MethodDecl {
             is_async: false,
@@ -1107,6 +1138,9 @@ impl Parser {
 
         if self.at(&TokenKind::KwArray) {
             let start = self.advance().span;
+            if self.compat && !self.at(&TokenKind::Lt) {
+                return Ok(TypeRef::Array(Box::new(TypeRef::Mixed)));
+            }
             self.expect(&TokenKind::Lt, "`<` after `array` (write `array<T>`)")?;
             let inner = self.parse_type()?;
             let close = self.expect_type_close()?;

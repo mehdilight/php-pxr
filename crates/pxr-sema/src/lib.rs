@@ -20,6 +20,7 @@ use pxr_types::Ty;
 use std::collections::{HashMap, VecDeque};
 
 mod class_generics;
+mod compat;
 mod constraints;
 mod generics;
 mod ownership;
@@ -842,6 +843,7 @@ pub struct MethodInfo {
 }
 
 pub struct Analyzer {
+    compat: bool,
     parallel_handlers: std::collections::HashSet<String>,
     worker_bootstrap: Vec<TStmt>,
     unresolved_returns: Vec<(String, Span)>,
@@ -872,6 +874,7 @@ struct Signature {
 
 /// Result of analysing one function body.
 struct FnCtx {
+    compat_locals: bool,
     is_async: bool,
     infer_return: bool,
     inference_failed: bool,
@@ -893,6 +896,7 @@ struct FnCtx {
 impl FnCtx {
     fn new(ret: Ty, is_main: bool) -> Self {
         FnCtx {
+            compat_locals: false,
             is_async: false,
             infer_return: false,
             inference_failed: false,
@@ -947,6 +951,13 @@ fn uses_php(statement: &ast::Stmt) -> bool {
 }
 
 pub fn analyze(program: &ast::Program) -> (Option<TProgram>, Diagnostics) {
+    analyze_with_compat(program, false)
+}
+
+pub fn analyze_with_compat(
+    program: &ast::Program,
+    compat: bool,
+) -> (Option<TProgram>, Diagnostics) {
     let (mut expanded_traits, diagnostics) = traits::expand(program);
     if diagnostics.has_errors() {
         return (None, diagnostics);
@@ -1018,6 +1029,7 @@ pub fn analyze(program: &ast::Program) -> (Option<TProgram>, Diagnostics) {
             return (None, class_expander.diags);
         }
         let mut a = Analyzer {
+            compat,
             parallel_handlers: std::collections::HashSet::new(),
             worker_bootstrap: vec![],
             unresolved_returns: Vec::new(),
@@ -2424,6 +2436,7 @@ impl Analyzer {
             .function(&mut declaration, &substitutions);
         let f = &declaration;
         let mut ctx = FnCtx::new(sig.ret.clone(), false);
+        ctx.compat_locals = self.compat && !f.name.starts_with("$closure_factory$");
         ctx.is_async = f.is_async;
         ctx.infer_return = f.ret.is_none();
         ctx.type_bindings = bindings;
@@ -2481,6 +2494,7 @@ impl Analyzer {
 
     fn analyze_method_inner(&mut self, class_name: &str, method: &MethodInfo) -> Option<TFunc> {
         let mut ctx = FnCtx::new(method.ret.clone(), false);
+        ctx.compat_locals = self.compat;
         ctx.is_async = method.ast_method.is_async;
         ctx.infer_return = method.ast_method.ret.is_none()
             && method.name != "__construct"
@@ -2559,6 +2573,7 @@ impl Analyzer {
 
     fn analyze_main(&mut self, stmts: &[ast::Stmt]) -> Option<TFunc> {
         let mut ctx = FnCtx::new(Ty::Void, true);
+        ctx.compat_locals = self.compat;
         let mut body = Vec::new();
         let mut classes: Vec<_> = self.classes.values().cloned().collect();
         classes.sort_by_key(|c| c.class_id);
@@ -3032,7 +3047,11 @@ impl Analyzer {
             );
             return None;
         }
-        let subj = self.infer(subject, ctx)?;
+        let subj = if self.compat {
+            self.infer_for_type(subject, ctx, &Ty::array(Ty::Mixed))?
+        } else {
+            self.infer(subject, ctx)?
+        };
         let sty = subj.ty();
         let elem = match sty.array_elem() {
             Some(e) if !matches!(e, Ty::Null) => e.clone(),
@@ -3081,7 +3100,14 @@ impl Analyzer {
                 }
                 s
             }
-            None => ctx.declare(value, elem.clone()),
+            None => ctx.declare(
+                value,
+                if ctx.compat_locals && compat_value_type(&elem) {
+                    Ty::Mixed
+                } else {
+                    elem.clone()
+                },
+            ),
         };
         invalidate_writes(body, ctx);
         ctx.flow.forget(vslot);
@@ -3207,7 +3233,9 @@ impl Analyzer {
         let expected = if let Some(annotation) = annotation {
             Some(self.resolve_type_with(annotation, &ctx.type_bindings))
         } else if let ast::LValue::Var { name, .. } = target {
-            ctx.slot_of(name).map(|slot| ctx.slot_ty(slot))
+            ctx.slot_of(name)
+                .map(|slot| ctx.slot_ty(slot))
+                .or_else(|| ctx.compat_locals.then_some(Ty::Mixed))
         } else {
             Some(match target {
                 ast::LValue::Index { base, index, .. } => self
@@ -3265,7 +3293,13 @@ impl Analyzer {
                         (slot, existing)
                     }
                     None => {
-                        let ty = annotated.clone().unwrap_or_else(|| val_ty.clone());
+                        let ty = annotated.clone().unwrap_or_else(|| {
+                            if ctx.compat_locals && compat_value_type(&val_ty) {
+                                Ty::Mixed
+                            } else {
+                                val_ty.clone()
+                            }
+                        });
                         if ty == Ty::Void {
                             self.diags.emit(
                                 Diagnostic::error("a variable cannot have type `void`")
@@ -3293,6 +3327,12 @@ impl Analyzer {
 
                 ctx.flow.forget(slot);
                 ctx.flow.initialized.insert(slot);
+                if ctx.compat_locals && decl_ty == Ty::Mixed {
+                    if let Ty::Named(name) = &val_ty {
+                        ctx.flow.types.insert(slot, 64);
+                        ctx.flow.named.insert(slot, name.clone());
+                    }
+                }
                 Some(TStmt::Assign {
                     target: TTarget::Var {
                         name: name.clone(),
@@ -3555,7 +3595,7 @@ impl Analyzer {
         ctx: &mut FnCtx,
     ) -> Option<TStmt> {
         let (ttarget, tty) = self.infer_target_read(target, span, ctx)?;
-        if !tty.is_numeric() {
+        if !tty.is_numeric() && !(self.compat && tty.is_boxed()) {
             self.diags.emit(
                 Diagnostic::error(format!(
                     "`++`/`--` requires a numeric operand, found `{tty}`"
@@ -4901,7 +4941,7 @@ impl Analyzer {
         }
         formal.extend(method.params.clone());
         for (arg, want) in args.iter().zip(&method.params) {
-            let value = self.infer(arg, ctx)?;
+            let value = self.infer_for_type(arg, ctx, want)?;
             let ty = value.ty();
             if !self.is_assignable(&ty, want) {
                 self.diags.emit(
@@ -5361,7 +5401,8 @@ impl Analyzer {
                 _ => {}
             }
         }
-        self.infer(expr, ctx)
+        let value = self.infer(expr, ctx)?;
+        Some(self.compat_boundary(value, expected, expr.span()))
     }
 
     fn infer_array_lit(
@@ -5535,7 +5576,7 @@ impl Analyzer {
             }
             let mut values = Vec::new();
             for (arg, expected) in args.iter().zip(&params) {
-                let value = self.infer(arg, ctx)?;
+                let value = self.infer_for_type(arg, ctx, expected)?;
                 if value.ty() != *expected {
                     return self.builtin_ty_err(
                         callee,
@@ -5694,7 +5735,7 @@ impl Analyzer {
                 None
             };
             let number = if let Some(n) = number_arg {
-                let n = self.infer(n, ctx)?;
+                let n = self.infer_for_type(n, ctx, &Ty::Int)?;
                 if n.ty() != Ty::Int {
                     return self.builtin_ty_err(callee, "int capacity or timeout", &n.ty(), span);
                 }
@@ -5769,7 +5810,7 @@ impl Analyzer {
                     continue;
                 }
                 let expected = if i == 0 { Ty::String } else { Ty::Int };
-                let value = self.infer(arg, ctx)?;
+                let value = self.infer_for_type(arg, ctx, &expected)?;
                 if value.ty() != expected {
                     return self.builtin_ty_err(
                         callee,
@@ -5808,7 +5849,7 @@ impl Analyzer {
             let params = vec![Ty::String, Ty::Int, Ty::String, Ty::Int, Ty::Int];
             let mut values = Vec::new();
             for (arg, expected) in args.iter().zip(&params) {
-                let value = self.infer(arg, ctx)?;
+                let value = self.infer_for_type(arg, ctx, expected)?;
                 if value.ty() != *expected {
                     return self.builtin_ty_err(
                         "tcpExchangeAsync",
@@ -5984,7 +6025,7 @@ impl Analyzer {
             }
             let mut values = Vec::new();
             for (argument, expected) in args.iter().zip(&params) {
-                let value = self.infer(argument, ctx)?;
+                let value = self.infer_for_type(argument, ctx, expected)?;
                 if value.ty() != *expected {
                     return self.builtin_ty_err(
                         callee,
@@ -6044,7 +6085,7 @@ impl Analyzer {
                 return self.builtin_ty_err("stopServer", "Task<void> server", &server.ty(), span);
             }
             let grace = if args.len() == 2 {
-                self.infer(&args[1], ctx)?
+                self.infer_for_type(&args[1], ctx, &Ty::Int)?
             } else {
                 TExpr::Int(30000)
             };
@@ -6088,7 +6129,11 @@ impl Analyzer {
                 );
                 return None;
             }
-            let value = self.infer(&args[0], ctx)?;
+            let value = if key == "sleepasync" {
+                self.infer_for_type(&args[0], ctx, &Ty::Int)?
+            } else {
+                self.infer(&args[0], ctx)?
+            };
             let input = value.ty();
             let (mangled, ret) = if key == "sleepasync" {
                 if input != Ty::Int {
@@ -6288,8 +6333,17 @@ impl Analyzer {
     ) -> Option<TExpr> {
         let name = kind.name();
         let mut targs = Vec::new();
-        for a in args {
-            targs.push(self.infer(a, ctx)?);
+        for (index, a) in args.iter().enumerate() {
+            let value = if let Some(expected) = self
+                .compat
+                .then(|| compat::builtin_parameter(kind, index, args.len()))
+                .flatten()
+            {
+                self.infer_for_type(a, ctx, &expected)?
+            } else {
+                self.infer(a, ctx)?
+            };
+            targs.push(value);
         }
         let atys: Vec<Ty> = targs.iter().map(|t| t.ty()).collect();
         if let Some(task) = atys
@@ -7126,5 +7180,17 @@ fn send_value_type(ty: &Ty) -> bool {
         Ty::Null | Ty::Bool | Ty::Int | Ty::Float | Ty::String | Ty::Mixed | Ty::Union(_) => true,
         Ty::Array(t) => send_value_type(t),
         _ => false,
+    }
+}
+
+// Native tasks/resources retain their affine representation even in compatibility mode.
+fn compat_value_type(ty: &Ty) -> bool {
+    match ty {
+        Ty::Void | Ty::Infer | Ty::Task(_) | Ty::TaskResult(_) => false,
+        Ty::Named(n) => !["TcpStream", "TcpListener", "Channel"]
+            .iter()
+            .any(|r| n.eq_ignore_ascii_case(r)),
+        Ty::Array(e) => compat_value_type(e),
+        _ => true,
     }
 }

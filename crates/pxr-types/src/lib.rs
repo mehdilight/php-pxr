@@ -65,6 +65,32 @@ impl Ty {
         flat.dedup();
         Ty::Union(flat)
     }
+    /// Compiler-generated runtime membership descriptor. None for affine/native-only types.
+    pub fn runtime_descriptor(&self, class_id: &impl Fn(&str) -> Option<u32>) -> Option<String> {
+        Some(match self {
+            Ty::Mixed => "m".into(),
+            Ty::Int => "i".into(),
+            Ty::Float => "d".into(),
+            Ty::Bool => "b".into(),
+            Ty::String => "s".into(),
+            Ty::Array(element) => format!("[{}]", element.runtime_descriptor(class_id)?),
+            Ty::Named(name) => format!("O{};", class_id(name)?),
+            Ty::Union(members) => format!(
+                "({})",
+                members
+                    .iter()
+                    .map(|m| match m {
+                        UnionMember::Value(t) => t.runtime_descriptor(class_id),
+                        UnionMember::Null => Some("n".into()),
+                        UnionMember::False => Some("f".into()),
+                        UnionMember::True => Some("t".into()),
+                    })
+                    .collect::<Option<Vec<_>>>()?
+                    .join("|")
+            ),
+            _ => return None,
+        })
+    }
     pub fn contains_infer(&self) -> bool {
         matches!(self, Ty::Infer)
             || matches!(self, Ty::Array(element) | Ty::Task(element) | Ty::TaskResult(element) if element.contains_infer())

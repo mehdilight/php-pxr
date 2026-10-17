@@ -41,6 +41,7 @@ COMMANDS:
 OPTIONS:
     -o, --output <path>   Output path for `build` (default: input stem)
         --opt <0-3>       Optimization level (default: 2)
+        --compat          Use checked mixed storage for untyped native code
         --keep-llvm       Keep the generated .ll next to the output
         --keep-temps      Keep intermediate files
     -v, --verbose         Print stage timings and statistics
@@ -90,6 +91,7 @@ fn run() -> i32 {
 
 #[derive(Default)]
 struct Options {
+    compat: bool,
     file: Option<PathBuf>,
     output: Option<PathBuf>,
     opt_level: u8,
@@ -121,6 +123,7 @@ fn parse_options(args: &[String], allow_program_args: bool) -> Result<Options, S
                     return Err("--opt must be between 0 and 3".into());
                 }
             }
+            "--compat" => o.compat = true,
             "--keep-llvm" => o.keep_llvm = true,
             "--keep-temps" => o.keep_temps = true,
             "-v" | "--verbose" => o.verbose = true,
@@ -171,7 +174,7 @@ fn cmd_migration_report(args: &[String]) -> i32 {
         Ok(source) => source,
         Err(code) => return code,
     };
-    let (migration, diagnostics) = pxr_driver::migration_report(&file);
+    let (migration, diagnostics) = pxr_driver::migration_report_with_compat(&file, options.compat);
     if json {
         println!("{}", migration.to_json());
     } else {
@@ -196,7 +199,7 @@ fn cmd_check(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let (_, diags) = pxr_driver::check_path(&file);
+    let (_, diags) = pxr_driver::check_path_with_compat(&file, o.compat);
     report(&diags, &src, &file)
 }
 
@@ -221,6 +224,7 @@ fn cmd_build(args: &[String]) -> i32 {
         .unwrap_or_else(|| PathBuf::from(file.file_stem().unwrap_or_default()));
 
     let opts = BuildOptions {
+        compat: o.compat,
         input: file.clone(),
         output: output.clone(),
         opt_level: o.opt_level,
@@ -256,7 +260,7 @@ fn cmd_run(args: &[String]) -> i32 {
     if o.verbose {
         eprintln!("pxr: building {}", file.display());
     }
-    let (exe, _workdir) = match pxr_driver::build_temp(&file, o.opt_level) {
+    let (exe, _workdir) = match pxr_driver::build_temp_with_compat(&file, o.opt_level, o.compat) {
         Ok(v) => v,
         Err(e) => return report_build_error(e, &file),
     };
@@ -271,7 +275,10 @@ fn cmd_run(args: &[String]) -> i32 {
 }
 
 fn cmd_emit_ir(args: &[String]) -> i32 {
-    with_source(args, |src, file| match pxr_driver::ir_for_file(file) {
+    with_source(args, |src, file| match pxr_driver::ir_for_file_with_compat(
+        file,
+        parse_options(args, false).unwrap().compat,
+    ) {
         Ok((text, stats)) => {
             eprint!(
                 "; pxr: {} constant(s) folded, {} branch(es) folded, {} instruction(s) removed\n",
@@ -286,9 +293,8 @@ fn cmd_emit_ir(args: &[String]) -> i32 {
 
 fn cmd_emit_llvm(args: &[String]) -> i32 {
     with_source(args, |src, file| {
-        let o = parse_options(args, false);
-        let _ = o;
-        match pxr_driver::check_path(file) {
+        let o = parse_options(args, false).unwrap();
+        match pxr_driver::check_path_with_compat(file, o.compat) {
             (Some(program), diags) if !diags.has_errors() => {
                 let mut module = pxr_codegen::lower_program(&program);
                 pxr_opt::optimize(&mut module);
@@ -331,7 +337,8 @@ fn cmd_tokens(args: &[String]) -> i32 {
 
 fn cmd_ast(args: &[String]) -> i32 {
     with_source(args, |src, _file| {
-        let (ast, diags) = pxr_parser::parse(src);
+        let (ast, diags) =
+            pxr_parser::parse_at_with_compat(src, 0, parse_options(args, false).unwrap().compat);
         if diags.has_errors() {
             return report(&diags, src, Path::new("<input>"));
         }
