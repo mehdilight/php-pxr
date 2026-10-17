@@ -2733,3 +2733,173 @@ async function main(): void {
         "argument:retained:parent\n",
     );
 }
+
+#[test]
+fn async_closures_create_lazy_tasks_with_capture_snapshots_and_nested_results() {
+    run_case(
+        "async_closure_values",
+        r#"<?php
+class Counter { public int $calls=0; }
+function argument(): int { echo "argument:"; return 7; }
+async function main(): void {
+    $counter = new Counter();
+    $values = [3];
+    $callback = async function(int $n) use ($counter, $values): string {
+        $counter->calls++;
+        await sleepAsync(0);
+        $values[0]++;
+        return "value:" . ($values[0] + $n);
+    };
+    $values[0] = 99;
+    $task = $callback(argument());
+    echo $counter->calls, ":", $values[0], "\n";
+    echo await $task, ":", $counter->calls, "\n";
+    echo await $callback(1), ":", $counter->calls, "\n";
+    $arrow = async fn(int $n): int => $n + await sleepValue(2);
+    echo await $arrow(5), "\n";
+    $outer = async fn(int $x) => async fn(int $y): int => $x + $y;
+    $inner = await $outer(8);
+    echo await $inner(3), "\n";
+    $static = static async fn(int $n): int => $n * 2;
+    $otherOrder = async static function(int $n): int { await sleepAsync(0); return $n + 1; };
+    echo await $static(4), ":", await $otherOrder(4), "\n";
+    async function(): void { await sleepAsync(0); };
+}
+async function sleepValue(int $n): int { await sleepAsync(0); return $n; }
+"#,
+        "argument:0:99\nvalue:11:1\nvalue:5:2\n7\n11\n8:5\n",
+    );
+}
+
+#[test]
+fn bound_async_closures_preserve_scope_receivers_void_and_trait_dispatch() {
+    run_case(
+        "bound_async_closures",
+        r#"<?php
+class AsyncClosureBase {
+    private string $prefix;
+    private static int $calls=0;
+    public function __construct(string $prefix) { $this->prefix=$prefix; }
+    protected function marker(): int { return 1; }
+    public function make(string $suffix) {
+        return async function(int $n) use ($suffix): string {
+            await sleepAsync(0); self::$calls++;
+            return $this->prefix . $suffix . ($n + $this->marker()) . ":" . self::$calls;
+        };
+    }
+    public function nested() { return async fn(int $x) => async fn(int $y): string => $this->prefix . ($x + $y); }
+    public function action() { return async function() { await sleepAsync(0); echo $this->prefix, "action\n"; }; }
+    public function typedAction() { return async function(): void { await sleepAsync(0); echo $this->prefix, "void\n"; }; }
+    public static function typed() { return static async fn(self $value): self => $value; }
+    public async function asyncFactory() { await sleepAsync(0); return async fn(): string => $this->prefix; }
+}
+class AsyncClosureChild extends AsyncClosureBase { protected function marker(): int { return 10; } }
+trait AsyncClosureTrait {
+    public function make() { return async fn(int $n): int => $this->value + $n; }
+}
+class AsyncConsumer { use AsyncClosureTrait; private int $value=30; }
+async function main(): void {
+    $callback = (new AsyncClosureChild("bound:"))->make("!");
+    $outer = (new AsyncClosureChild("nested:"))->nested();
+    $inner = await $outer(4);
+    $action = (new AsyncClosureBase("kept:"))->action();
+    $typedAction = (new AsyncClosureBase("kept:"))->typedAction();
+    $typed = AsyncClosureBase::typed();
+    $fromAsync = await (new AsyncClosureBase("async-factory"))->asyncFactory();
+    $trait = (new AsyncConsumer())->make();
+    for ($i=0; $i<30; $i++) { $temporary=new AsyncClosureBase("garbage"); await sleepAsync(0); }
+    $a = spawn $callback(1); $b = spawn $inner(5);
+    echo await $a, "\n", await $b, "\n", await $trait(2), "\n";
+    await $action(); await $typedAction();
+    $result = await $typed(new AsyncClosureBase("typed:"));
+    $resultAction = $result->action(); await $resultAction();
+    echo await $fromAsync(), "\n";
+}
+"#,
+        "bound:!11:1\nnested:9\n32\nkept:action\nkept:void\ntyped:action\nasync-factory\n",
+    );
+}
+
+#[test]
+fn async_closure_owned_arguments_results_and_cancelled_bridges_are_cleaned_up() {
+    run_case(
+        "async_closure_owned_cleanup",
+        r#"<?php
+class AsyncOwnedFactory {
+    private string $prefix;
+    public function __construct(string $prefix) { $this->prefix=$prefix; }
+    public function callback() {
+        return async function(owned<string> $value): owned<string> {
+            await sleepAsync(0);
+            $value .= $this->prefix;
+            return move($value);
+        };
+    }
+    public function fail() {
+        return async function(owned<string> $value): owned<string> { await sleepAsync(-1); return move($value); };
+    }
+    public function hold() {
+        return async function(owned<array<string>> $value): void {
+            await sleepAsync(10000);
+            echo "unexpected";
+        };
+    }
+}
+async function main(): void {
+    $callback = (new AsyncOwnedFactory("!"))->callback();
+    $hold = (new AsyncOwnedFactory("unused"))->hold();
+    $fail = (new AsyncOwnedFactory("failed"))->fail();
+    $input: owned<string> = "kept";
+    $result = await $callback(move($input));
+    echo $result, "\n"; drop($result);
+    $failureValue: owned<string> = "failure";
+    $failure = await taskResultAsync($fail(move($failureValue)));
+    echo resultStatus($failure), "\n"; drop($failure);
+    for ($i=0; $i<20; $i++) {
+        $lazyValue: owned<array<string>> = ["lazy"];
+        $lazy = $hold(move($lazyValue)); cancelTask($lazy);
+        $startedValue: owned<array<string>> = ["started"];
+        $started = spawn $hold(move($startedValue));
+        await sleepAsync(0); await sleepAsync(0);
+        cancelTask($started);
+        $unusedValue: owned<string> = "unused";
+        $unused = $callback(move($unusedValue)); drop($unused);
+    }
+    echo "cleaned\n";
+}
+"#,
+        "kept!\n2\ncleaned\n",
+    );
+}
+
+#[test]
+fn workers_run_bound_async_closures_with_isolated_captures_and_statics() {
+    run_case(
+        "worker_async_closures",
+        r#"<?php
+class AsyncWorkerClosure {
+    private int $value;
+    private static int $calls=0;
+    public function __construct(int $value) { $this->value=$value; }
+    public function callback() {
+        return async function(int $n): int {
+            await sleepAsync(0);
+            self::$calls++;
+            return $this->value + $n + self::$calls;
+        };
+    }
+}
+async function closureWorker(int $n): int {
+    $callback = (new AsyncWorkerClosure($n))->callback();
+    $first = await $callback(10);
+    return $first + await $callback(20);
+}
+async function main(): void {
+    $a=spawn parallelAsync("closureWorker", 1);
+    $b=spawn parallelAsync("closureWorker", 2);
+    echo await $a, ":", await $b, "\n";
+}
+"#,
+        "35:37\n",
+    );
+}

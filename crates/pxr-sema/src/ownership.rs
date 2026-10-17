@@ -1295,7 +1295,7 @@ impl Checker {
             .filter(|(key, _)| key.ends_with(&suffix))
             .map(|(_, signature)| signature);
         let first = candidates.next()?;
-        if first.is_async || first.is_static || candidates.any(|other| other != first) {
+        if first.is_static || candidates.any(|other| other != first) {
             return None;
         }
         // Semantic analysis still checks the concrete target after expansion.

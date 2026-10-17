@@ -334,9 +334,9 @@ produce a compile error with a specific code — never a silently different prog
 **Invokable objects.** `$callback($arg)` lowers to checked `__invoke` dispatch,
 including interface callbacks, inheritance and receiver retention across awaited
 arguments. The method uses the existing visibility/argument/ownership rules.
-By-value, bound and static closures/arrow functions are supported; see
+By-value, bound, static and PXR async closures/arrow functions are supported; see
 [CALLABLES.md](CALLABLES.md). Callable strings/arrays, reference captures, generic
-closure scopes and `callable` annotations remain unsupported. `__invoke` is synchronous under the current magic-method policy.
+closure scopes and `callable` annotations remain unsupported. User-declared `__invoke` remains synchronous under the current magic-method policy.
 
 ## Runtime independence
 

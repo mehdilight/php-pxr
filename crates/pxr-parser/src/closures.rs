@@ -172,7 +172,7 @@ fn forward_argument(parameter: &Param, span: Span) -> Expr {
 }
 
 impl Parser {
-    pub(super) fn parse_closure(&mut self, is_static: bool) -> Result<Expr, ()> {
+    pub(super) fn parse_closure(&mut self, is_static: bool, is_async: bool) -> Result<Expr, ()> {
         let token = self.advance();
         let arrow = token.kind == TokenKind::Fn;
         let span = token.span;
@@ -342,7 +342,7 @@ impl Parser {
                 .unwrap()
                 .methods
                 .push(MethodDecl {
-                    is_async: false,
+                    is_async,
                     type_params: bridge_types,
                     bounds: vec![],
                     is_static: !bound,
@@ -377,7 +377,19 @@ impl Parser {
                     span,
                 }
             };
-            body = vec![Stmt::ForwardReturn(call, span)];
+            let result = if is_async {
+                Expr::Call {
+                    fallback: None,
+                    callee: "$pxr_await".into(),
+                    callee_span: span,
+                    type_args: vec![],
+                    args: vec![call],
+                    span,
+                }
+            } else {
+                call
+            };
+            body = vec![Stmt::ForwardReturn(result, span)];
         }
         let mut members: Vec<_> = captures
             .iter()
@@ -433,7 +445,7 @@ impl Parser {
             .collect();
         prologue.append(&mut body);
         members.push(ClassMember::Method(MethodDecl {
-            is_async: false,
+            is_async,
             type_params: vec![],
             bounds: vec![],
             is_static: false,

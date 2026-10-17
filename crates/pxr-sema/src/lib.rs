@@ -1815,7 +1815,11 @@ impl Analyzer {
                             );
                         }
                         let mkey = m.name.to_ascii_lowercase();
-                        if m.is_async && mkey.starts_with("__") {
+                        // Only parser-generated closure environments may expose
+                        // async invocation. User magic methods retain their ABI.
+                        let async_closure_invoke =
+                            c.name.starts_with("$closure$") && mkey == "__invoke";
+                        if m.is_async && mkey.starts_with("__") && !async_closure_invoke {
                             self.diags.emit(
                                 Diagnostic::error(
                                     "constructors and magic methods must be synchronous",

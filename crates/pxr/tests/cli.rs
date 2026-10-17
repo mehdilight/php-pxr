@@ -4772,3 +4772,18 @@ echo $first->value->value, ":", $ancestor(new ParentBox<int>(9))->value, "\n";
     assert_eq!(run.code, 0, "{}", run.stderr);
     assert_eq!(run.stdout, "8:9\n");
 }
+
+#[test]
+fn async_closures_do_not_enable_async_user_magic_or_synchronous_await() {
+    for (name, source, diagnostic) in [
+        ("user_async_invoke", "<?php class C { public async function __invoke(): int { return 1; } }", "must be synchronous"),
+        ("closure_sync_await", "<?php $f=fn(): int => await sleepAsync(0);", "E0300"),
+        ("closure_async_outside_await", "<?php $f=async fn(): int => 1; echo await $f();", "E0300"),
+        ("closure_static_async_this", "<?php class C { public function make() { return static async fn(): int => $this->value; } } $f=(new C())->make();", "E0268"),
+    ] {
+        let path = temp_php(name, source);
+        let run = run_ok(&["check", path.to_str().unwrap()]);
+        assert_eq!(run.code, 1, "{name}: {}", run.stderr);
+        assert!(run.stderr.contains(diagnostic), "{name}: {}", run.stderr);
+    }
+}

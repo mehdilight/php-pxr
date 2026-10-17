@@ -421,6 +421,14 @@ impl Parser {
             TokenKind::Function if self.peek_at(1).kind == TokenKind::LParen => {
                 self.parse_simple().map(Some)
             }
+            TokenKind::Async
+                if self.peek_at(1).kind == TokenKind::Fn
+                    || self.peek_at(1).kind == TokenKind::Static
+                    || self.peek_at(1).kind == TokenKind::Function
+                        && self.peek_at(2).kind == TokenKind::LParen =>
+            {
+                self.parse_simple().map(Some)
+            }
             TokenKind::Function | TokenKind::Async => {
                 self.parse_fn().map(|f| Some(Stmt::FnDecl(Box::new(f))))
             }
@@ -1819,12 +1827,35 @@ impl Parser {
         let tok = self.peek().clone();
         let span = tok.span;
         match tok.kind {
-            TokenKind::Function | TokenKind::Fn => self.parse_closure(false),
+            TokenKind::Function | TokenKind::Fn => self.parse_closure(false, false),
+            TokenKind::Async => {
+                self.advance();
+                let is_static = self.eat(&TokenKind::Static);
+                if !matches!(self.peek().kind, TokenKind::Function | TokenKind::Fn) {
+                    self.error(
+                        self.peek().span,
+                        "expected `function` or `fn` in async closure",
+                    );
+                    return Err(());
+                }
+                self.parse_closure(is_static, true)
+            }
             TokenKind::Static
-                if matches!(self.peek_at(1).kind, TokenKind::Function | TokenKind::Fn) =>
+                if matches!(
+                    self.peek_at(1).kind,
+                    TokenKind::Function | TokenKind::Fn | TokenKind::Async
+                ) =>
             {
                 self.advance();
-                self.parse_closure(true)
+                let is_async = self.eat(&TokenKind::Async);
+                if !matches!(self.peek().kind, TokenKind::Function | TokenKind::Fn) {
+                    self.error(
+                        self.peek().span,
+                        "expected `function` or `fn` in static closure",
+                    );
+                    return Err(());
+                }
+                self.parse_closure(true, is_async)
             }
             TokenKind::Int(v) => {
                 self.advance();

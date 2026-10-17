@@ -9,7 +9,7 @@
 
 CARGO ?= cargo
 PXR   := ./target/release/pxr
-EXAMPLES := $(wildcard examples/*.php) examples/migration/main.php examples/async/main.php examples/async/generics.php examples/async/server.php examples/async/http_demo.php examples/async/results.php examples/async/stream.php examples/async/parallel.php examples/async/parallel_values.php
+EXAMPLES := $(wildcard examples/*.php) examples/migration/main.php examples/async/main.php examples/async/generics.php examples/async/closures.php examples/async/server.php examples/async/http_demo.php examples/async/results.php examples/async/stream.php examples/async/parallel.php examples/async/parallel_values.php
 CHECK_EXAMPLES := $(EXAMPLES) examples/async/tcp.php examples/async/http.php
 
 .PHONY: all build release test check examples bench fmt clean

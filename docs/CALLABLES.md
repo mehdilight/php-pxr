@@ -1,6 +1,6 @@
 # Native callable support
 
-M10 is in progress. Invokable objects, by-value closures and arrow functions
+M10 is in progress. Invokable objects, by-value closures and synchronous/async arrow functions
 have independent native acceptance tests. This is not yet the full PHP callable
 contract.
 
@@ -50,11 +50,43 @@ echo $format("value"), "\n";
 `static function (...) { ... }` and `static fn(...) => ...` do not retain an
 instance receiver. They retain ordinary class visibility, including `self::`
 access in non-generic classes. A closure created in a static method also has no
-`$this`. Creating a synchronous closure after an await in an async method is
+`$this`. Creating a closure after an await in an async method is
 supported; the returned environment outlives the creating frame. Owned parameters/returns and
 read/exclusive borrow parameters keep their normal contracts through invocation;
 forwarding moves owners and reborrows borrowed parameters. Inferred `void` is
 forwarded as a call followed by a bare return.
+
+## Async closures
+
+PXR also supports `async function` and `async fn`. Combine `static` and `async`
+to avoid retaining an instance; either modifier order is accepted.
+
+```php
+async function main(): void {
+    $offset = 10;
+    $add = async function(int $value) use ($offset): int {
+        await sleepAsync(0);
+        return $value + $offset;
+    };
+    $task = $add(3); // Arguments are captured now; the body has not run.
+    echo await $task, "\n";
+    $double = static async fn(int $value): int => $value * 2;
+    $running = spawn $double(4);
+    echo await $running, "\n";
+}
+```
+
+The result annotation names the completed value. Calling creates an affine lazy
+task, with the same await, spawn, cancellation, scope cleanup and moved-owner
+rules as an ordinary [async function](ASYNC.md). Captures snapshot when the
+closure is created; arguments snapshot when the task is created. Each invocation
+starts its captured locals afresh. Bound closures retain lexical visibility and
+shared receivers across suspension, including instance trait scopes. Inferred
+and explicit void results are supported. Call-scoped borrow parameters and
+owned/borrowed captures remain rejected, since a task can outlive the call.
+Async syntax is a PXR extension and does not execute in PHP. Bound/class-scoped
+async bodies currently run through an awaited scope bridge, adding one internal
+task/frame per invocation compared with an unbound global async closure.
 
 A class may implement `__invoke` and be called with `$object($arg)`. Typed
 interfaces declaring `__invoke` support callback parameters and virtual dispatch.
@@ -75,12 +107,13 @@ See [callback_objects.php](../examples/callback_objects.php) and
   types remain rejected until generic lexical type binding is supplied.
   Static closures and lexical `self`/`parent` annotations in trait scope also
   remain rejected. `parent` requires a declared parent class.
-- Async closures, callable strings/arrays, first-class callable references,
+- Callable strings/arrays, first-class callable references,
   `callable`/`Closure` annotations and Closure reflection/binding APIs are not
   implemented. Late static binding (`static::`) retains its existing restriction.
 - Native callbacks are not implicitly exported across the legacy PHP boundary;
   the existing [interop restrictions](INTEROP.md) still apply.
-- Invokable magic methods remain synchronous and cannot declare method generics.
+- User-declared invokable magic methods remain synchronous and cannot declare
+  method generics. Async closures use compiler-generated invocation methods.
 - Untyped parameters, optional/variadic/named arguments and unpacking retain their
   current restrictions; accepting a closure does not bypass argument checks.
 

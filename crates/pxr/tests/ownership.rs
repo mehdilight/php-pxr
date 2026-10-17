@@ -133,6 +133,12 @@ fn owned_values_moves_borrows_and_generic_methods() {
 #[test]
 fn ownership_violations_fail_before_lowering() {
     let cases = [
+        ("owned-async-closure-receiver", "class C { public function make() { return async fn(): int => 1; } } $c: owned<C>=new C; $f=$c->make();"),
+        ("async-closure-borrow-param", "$f=async function(&int $x): int { return $x; };"),
+        ("async-closure-bound-borrow-param", "class C { public function make() { return async function(&mut array<int> $x): void { $x[]=1; }; } }"),
+        ("async-closure-owned-capture", "$x: owned<string>=\"kept\"; $f=async fn(): string => $x;"),
+        ("async-closure-bound-implicit-transfer", "class C { public function make() { return async function(owned<int> $x): int { drop($x); return 1; }; } } async function main(): void { $f=(new C())->make(); $x: owned<int>=1; echo await $f($x); }"),
+        ("async-closure-result-use-twice", "async function main(): void { $f=async fn(): int => 1; $t=$f(); echo await $t; echo await $t; }"),
         ("bound-closure-implicit-transfer", "class C { public function take() { return function(owned<int> $x): int { drop($x); return 1; }; } } $f=(new C())->take(); $x: owned<int>=1; $f($x);"),
         ("owned-bound-closure", "class C { public int $x=1; public function make() { return fn(): int => $this->x; } } $c: owned<C>=new C; $f=$c->make();"),
         ("owned-implicit-closure-receiver", "class C { public function make() { return fn(): int => 1; } } $c: owned<C>=new C; $f=$c->make();"),

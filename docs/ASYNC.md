@@ -1,6 +1,6 @@
 # Async/await and structured tasks
 
-**Implemented:** async functions and methods with explicit or inferred result
+**Implemented:** async functions, methods and by-value closures with explicit or inferred result
 types, inferred affine task handles, `await`, `spawn`, nonblocking timers,
 owned TCP exchanges/streams, recoverable task results, bounded native TCP/HTTP servers, consuming cancellation and an
 async CLI entry point. Programs compile to native resumable frames and run
@@ -8,6 +8,9 @@ without PHP. This syntax is a PXR language extension and cannot run in PHP.
 Shared-nothing OS-thread workers and bounded channels are described in
 [PARALLEL.md](PARALLEL.md). See [MILESTONES.md](MILESTONES.md), the internal
 [runtime contract](ASYNC_RUNTIME.md) and [primary references](ASYNC_REFERENCES.md).
+
+Closure and arrow syntax, including bound receivers, is described in
+[CALLABLES.md](CALLABLES.md).
 
 ## Runnable syntax
 
