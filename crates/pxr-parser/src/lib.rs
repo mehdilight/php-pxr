@@ -995,6 +995,10 @@ impl Parser {
                 | TokenKind::Namespace
                 | TokenKind::Parent
                 | TokenKind::Static
+                | TokenKind::Question
+                | TokenKind::Null
+                | TokenKind::False
+                | TokenKind::True
         )
     }
 
@@ -1021,6 +1025,33 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<TypeRef, ()> {
+        let start = self.peek().span;
+        if self.eat(&TokenKind::Question) {
+            let inner = self.parse_type_atom()?;
+            if self.at(&TokenKind::Pipe) {
+                self.error(
+                    start,
+                    "nullable shorthand cannot be combined with a union; write `T|null|U`",
+                );
+                return Err(());
+            }
+            return Ok(TypeRef::Union(vec![inner, TypeRef::LiteralNull], start));
+        }
+        let first = self.parse_type_atom()?;
+        if !self.eat(&TokenKind::Pipe) {
+            return Ok(first);
+        }
+        let mut members = vec![first];
+        loop {
+            members.push(self.parse_type_atom()?);
+            if !self.eat(&TokenKind::Pipe) {
+                break;
+            }
+        }
+        Ok(TypeRef::Union(members, start))
+    }
+
+    fn parse_type_atom(&mut self) -> Result<TypeRef, ()> {
         if matches!(self.peek().kind, TokenKind::Parent | TokenKind::Static) {
             let token = self.advance();
             let name = if token.kind == TokenKind::Parent {
@@ -1090,6 +1121,9 @@ impl Parser {
             TokenKind::KwBool => TypeRef::Bool,
             TokenKind::KwVoid => TypeRef::Void,
             TokenKind::KwMixed => TypeRef::Mixed,
+            TokenKind::Null => TypeRef::LiteralNull,
+            TokenKind::False => TypeRef::LiteralFalse,
+            TokenKind::True => TypeRef::LiteralTrue,
             TokenKind::Ident(name) => TypeRef::Named(name),
             other => {
                 self.error(

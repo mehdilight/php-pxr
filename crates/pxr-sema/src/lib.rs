@@ -25,6 +25,7 @@ mod generics;
 mod ownership;
 mod return_inference;
 mod traits;
+mod unions;
 
 /// Aliases re-exported so downstream stages can refer to the operator enums
 /// through the semantic layer.
@@ -596,6 +597,33 @@ impl FlowState {
                 }
                 let mut result = self.clone();
                 for (candidate, other) in [(lhs, rhs), (rhs, lhs)] {
+                    if let Some(slot) = mixed_slot(candidate) {
+                        if let Ty::Union(members) = candidate.ty() {
+                            result.restrict(slot, unions::union_mask(&Ty::Union(members.clone())));
+                            if let TExpr::Bool(literal) = &**other {
+                                use pxr_types::UnionMember as M;
+                                let has_bool = members.contains(&M::Value(Ty::Bool));
+                                let possible = has_bool
+                                    || members.contains(if *literal {
+                                        &M::True
+                                    } else {
+                                        &M::False
+                                    });
+                                let opposite = has_bool
+                                    || members.contains(if *literal {
+                                        &M::False
+                                    } else {
+                                        &M::True
+                                    });
+                                if equal && !possible {
+                                    result.reachable = false;
+                                }
+                                if !equal && !opposite {
+                                    result.restrict(slot, VALUE_MASK & !4);
+                                }
+                            }
+                        }
+                    }
                     if matches!(&**other, TExpr::Null) {
                         if let Some(slot) = mixed_slot(candidate) {
                             result.restrict(slot, if equal { 16 } else { VALUE_MASK & !16 });
@@ -634,6 +662,9 @@ impl FlowState {
                 };
                 let mut result = self.clone();
                 if let Some(slot) = args.first().and_then(mixed_slot) {
+                    if matches!(args[0].ty(), Ty::Union(_)) {
+                        result.restrict(slot, unions::union_mask(&args[0].ty()));
+                    }
                     result.restrict(slot, if truth { mask } else { VALUE_MASK & !mask });
                 }
                 result
@@ -644,11 +675,7 @@ impl FlowState {
 }
 fn mixed_slot(expression: &TExpr) -> Option<u32> {
     match expression {
-        TExpr::Var {
-            slot,
-            ty: Ty::Mixed,
-            ..
-        } => Some(*slot),
+        TExpr::Var { slot, ty, .. } if ty.is_boxed() => Some(*slot),
         TExpr::Coerce { expr, .. } => mixed_slot(expr),
         _ => None,
     }
@@ -661,6 +688,7 @@ fn scalar_mask(ty: &Ty) -> u8 {
         Ty::String => 8,
         Ty::Array(_) => 32,
         Ty::Named(_) => 64,
+        Ty::Union(_) => unions::union_mask(ty),
         _ => VALUE_MASK,
     }
 }
@@ -764,6 +792,7 @@ pub struct TProgram {
     /// The synthesized entry point running top-level statements.
     pub main: TFunc,
     pub class_registrations: Vec<(u32, u32)>,
+    pub class_type_ids: Vec<(String, u32)>,
     pub stringifiers: Vec<(u32, String)>,
     pub worker_bootstrap: Vec<TStmt>,
     pub parallel_handlers: std::collections::HashSet<String>,
@@ -1061,6 +1090,19 @@ impl Analyzer {
         if from == to {
             return true;
         }
+        if let Ty::Union(members) = to {
+            return self.union_accepts(from, members);
+        }
+        if let Ty::Union(members) = from {
+            if *to == Ty::Mixed {
+                return true;
+            }
+            return members.iter().all(|m| match m {
+                pxr_types::UnionMember::Value(t) => self.is_assignable(t, to),
+                pxr_types::UnionMember::False | pxr_types::UnionMember::True => *to == Ty::Bool,
+                _ => false,
+            });
+        }
         match (from, to) {
             (from, Ty::Mixed)
                 if *from != Ty::Void && !matches!(from, Ty::Task(_) | Ty::TaskResult(_)) =>
@@ -1072,6 +1114,7 @@ impl Analyzer {
                 matches!(**e, Ty::Null)
                     || e == t
                     || **t == Ty::Mixed
+                    || matches!(**t, Ty::Union(_)) && self.is_assignable(e, t)
                     || self.array_layout_assignable(e, t)
             }
             (Ty::Named(child), Ty::Named(parent)) => self.is_subclass_of(child, parent),
@@ -1486,6 +1529,11 @@ impl Analyzer {
             funcs,
             main: main?,
             class_registrations,
+            class_type_ids: self
+                .classes
+                .values()
+                .map(|c| (c.name.clone(), c.class_id))
+                .collect(),
             stringifiers,
             worker_bootstrap: self.worker_bootstrap.clone(),
             parallel_handlers: self.parallel_handlers.clone(),
@@ -2283,6 +2331,10 @@ impl Analyzer {
 
     fn resolve_type_with(&mut self, t: &ast::TypeRef, bindings: &HashMap<String, Ty>) -> Ty {
         match t {
+            ast::TypeRef::Union(members, span) => self.resolve_union(members, *span, bindings),
+            ast::TypeRef::LiteralNull => Ty::Union(vec![pxr_types::UnionMember::Null]),
+            ast::TypeRef::LiteralFalse => Ty::Union(vec![pxr_types::UnionMember::False]),
+            ast::TypeRef::LiteralTrue => Ty::Union(vec![pxr_types::UnionMember::True]),
             ast::TypeRef::EmptyElement => Ty::Null,
             ast::TypeRef::Applied(name, args, _)
                 if name
@@ -3731,7 +3783,7 @@ impl Analyzer {
                 }
             }
             let array_ty = match parent.storage_ty() {
-                Ty::Mixed => Ty::array(Ty::Mixed),
+                Ty::Mixed | Ty::Union(_) => Ty::array(Ty::Mixed),
                 ty @ Ty::Array(_) => ty,
                 _ => {
                     self.diags.emit(
@@ -3748,7 +3800,7 @@ impl Analyzer {
                 Some(index) => {
                     let key = self.infer(index, ctx)?;
                     let ty = key.ty();
-                    if !matches!(ty, Ty::Int | Ty::String | Ty::Mixed) {
+                    if !matches!(ty, Ty::Int | Ty::String | Ty::Mixed | Ty::Union(_)) {
                         self.diags.emit(
                             Diagnostic::error("array keys must be int or string")
                                 .with_code("E0250")
@@ -3768,14 +3820,14 @@ impl Analyzer {
         };
         let base_expr = self.infer(&ast::Expr::Var(name.clone(), span), ctx)?;
         let bty = base_expr.ty();
-        if bty == Ty::Mixed {
+        if bty.is_boxed() {
             let parent = self.infer_target_read(base, span, ctx)?.0;
             let key = match index {
                 None => None,
                 Some(index) => {
                     let key = self.infer(index, ctx)?;
                     let ty = key.ty();
-                    if !matches!(ty, Ty::Int | Ty::String | Ty::Mixed) {
+                    if !matches!(ty, Ty::Int | Ty::String | Ty::Mixed | Ty::Union(_)) {
                         self.diags.emit(
                             Diagnostic::error("array keys must be int or string")
                                 .with_code("E0250")
@@ -3810,7 +3862,7 @@ impl Analyzer {
             Some(ie) => {
                 let key = self.infer(ie, ctx)?;
                 let kty = key.ty();
-                if !matches!(kty, Ty::Int | Ty::String | Ty::Mixed) {
+                if !matches!(kty, Ty::Int | Ty::String | Ty::Mixed | Ty::Union(_)) {
                     self.diags.emit(
                         Diagnostic::error(format!(
                             "array keys must be `int` or `string`, found `{kty}`"
@@ -3985,8 +4037,10 @@ impl Analyzer {
                             slot,
                             ty: ty.clone(),
                         };
-                        Some(if ty == Ty::Mixed {
-                            if let Some(narrowed) = ctx.flow.narrowed(slot) {
+                        Some(if ty.is_boxed() {
+                            if let Some(narrowed) = unions::narrowed_union(&ty, ctx.flow.mask(slot))
+                                .or_else(|| ctx.flow.narrowed(slot))
+                            {
                                 TExpr::Coerce {
                                     expr: Box::new(expression),
                                     ty: narrowed,
@@ -4017,7 +4071,7 @@ impl Analyzer {
                 }
                 match op {
                     AUnOp::Neg => {
-                        if !oty.is_numeric() && oty != Ty::Mixed {
+                        if !oty.is_numeric() && !oty.is_boxed() {
                             self.diags.emit(
                                 Diagnostic::error(format!(
                                     "unary `-` requires a numeric operand, found `{oty}`"
@@ -4030,7 +4084,7 @@ impl Analyzer {
                         Some(TExpr::Un {
                             op: AUnOp::Neg,
                             operand_ty: oty.clone(),
-                            ty: oty,
+                            ty: if oty.is_boxed() { Ty::Mixed } else { oty },
                             expr: Box::new(operand),
                         })
                     }
@@ -4053,7 +4107,7 @@ impl Analyzer {
                         })
                     }
                     AUnOp::BitNot => {
-                        if oty != Ty::Int && oty != Ty::Mixed {
+                        if oty != Ty::Int && !oty.is_boxed() {
                             self.diags.emit(
                                 Diagnostic::error(format!(
                                     "`~` requires an `int` operand, found `{oty}`"
@@ -4066,7 +4120,7 @@ impl Analyzer {
                         Some(TExpr::Un {
                             op: AUnOp::BitNot,
                             operand_ty: oty.clone(),
-                            ty: oty,
+                            ty: if oty.is_boxed() { Ty::Mixed } else { oty },
                             expr: Box::new(operand),
                         })
                     }
@@ -4569,7 +4623,7 @@ impl Analyzer {
             } => {
                 let t_expr = self.infer(expr, ctx)?;
                 let expr_ty = t_expr.ty();
-                if !matches!(expr_ty, Ty::Named(_) | Ty::Mixed) {
+                if !matches!(expr_ty, Ty::Named(_) | Ty::Mixed | Ty::Union(_)) {
                     self.diags.emit(
                         Diagnostic::error(format!(
                             "cannot use `instanceof` on non-object of type `{expr_ty}`"
@@ -4917,12 +4971,27 @@ impl Analyzer {
         if l.contains_infer() || r.contains_infer() {
             return Some(Ty::Infer);
         }
+        if op == ABinOp::NullCoalesce {
+            if let Ty::Union(members) = l {
+                let nonnull: Vec<_> = members
+                    .iter()
+                    .filter(|m| **m != pxr_types::UnionMember::Null)
+                    .collect();
+                if nonnull.len() == 1 {
+                    if let pxr_types::UnionMember::Value(t) = nonnull[0] {
+                        if self.is_assignable(r, t) {
+                            return Some(t.clone());
+                        }
+                    }
+                }
+            }
+        }
         if matches!(l, Ty::Task(_) | Ty::TaskResult(_))
             || matches!(r, Ty::Task(_) | Ty::TaskResult(_))
         {
             return self.bad_operands(op, l, r, span);
         }
-        if *l == Ty::Mixed || *r == Ty::Mixed {
+        if l.is_boxed() || r.is_boxed() {
             if *l == Ty::Void || *r == Ty::Void {
                 return self.bad_operands(op, l, r, span);
             }
@@ -4987,7 +5056,10 @@ impl Analyzer {
             }
             ABinOp::Concat => {
                 for t in [l, r] {
-                    if !matches!(t, Ty::String | Ty::Int | Ty::Float | Ty::Bool | Ty::Mixed) {
+                    if !matches!(
+                        t,
+                        Ty::String | Ty::Int | Ty::Float | Ty::Bool | Ty::Mixed | Ty::Union(_)
+                    ) {
                         self.diags.emit(
                             Diagnostic::error(format!(
                                 "`.` cannot concatenate a value of type `{t}`"
@@ -5016,8 +5088,7 @@ impl Analyzer {
                 Some(Ty::Bool)
             }
             ABinOp::Identical | ABinOp::NotIdentical => {
-                let mixed =
-                    (*l == Ty::Mixed && (*r != Ty::Void)) || (*r == Ty::Mixed && *l != Ty::Void);
+                let mixed = (l.is_boxed() && (*r != Ty::Void)) || (r.is_boxed() && *l != Ty::Void);
                 let ok = l == r && l.is_scalar()
                     || mixed
                     || (l.is_array() && r.is_array())
@@ -5102,6 +5173,18 @@ impl Analyzer {
     /// The common type of two branch results (`?:`, `??`, `match`, array
     /// literals). Allows the same `int`/`float` widening as assignment.
     fn unify_types(&mut self, a: &Ty, b: &Ty, span: Span) -> Option<Ty> {
+        if matches!(a, Ty::Union(_)) && self.union_guarantees(b, a) {
+            return Some(a.clone());
+        }
+        if matches!(b, Ty::Union(_)) && self.union_guarantees(a, b) {
+            return Some(b.clone());
+        }
+        if a.is_boxed() || b.is_boxed() {
+            if *a != Ty::Void && *b != Ty::Void {
+                return Some(Ty::Mixed);
+            }
+        }
+
         if *a == Ty::Infer {
             return Some(b.clone());
         }
@@ -5181,7 +5264,7 @@ impl Analyzer {
         ctx: &mut FnCtx,
     ) -> Option<TExpr> {
         let mut b = self.infer(base, ctx)?;
-        if b.ty() == Ty::Mixed {
+        if b.ty().is_boxed() {
             b = TExpr::Coerce {
                 expr: Box::new(b),
                 ty: Ty::array(Ty::Mixed),
@@ -5222,7 +5305,7 @@ impl Analyzer {
         };
         let key = self.infer(ie, ctx)?;
         let kty = key.ty();
-        if !matches!(kty, Ty::Int | Ty::String | Ty::Mixed) {
+        if !matches!(kty, Ty::Int | Ty::String | Ty::Mixed | Ty::Union(_)) {
             self.diags.emit(
                 Diagnostic::error(format!(
                     "array keys must be `int` or `string`, found `{kty}`"
@@ -5247,6 +5330,28 @@ impl Analyzer {
         ctx: &mut FnCtx,
         expected: &Ty,
     ) -> Option<TExpr> {
+        if let ast::Expr::Paren(inner, _) = expr {
+            return self.infer_for_type(inner, ctx, expected);
+        }
+        if let Ty::Union(members) = expected {
+            if matches!(expr, ast::Expr::ArrayLit { .. }) {
+                let arrays: Vec<_> = members
+                    .iter()
+                    .filter_map(|m| match m {
+                        pxr_types::UnionMember::Value(t @ Ty::Array(_)) => Some(t),
+                        _ => None,
+                    })
+                    .collect();
+                if arrays.len() == 1 {
+                    return self.infer_for_type(expr, ctx, arrays[0]);
+                }
+            }
+        }
+        if let (ast::Expr::ArrayLit { items, span }, Ty::Array(element)) = (expr, expected) {
+            if matches!(**element, Ty::Union(_)) {
+                return self.infer_union_array(items, *span, ctx, element);
+            }
+        }
         if *expected == Ty::Mixed || *expected == Ty::array(Ty::Mixed) {
             match expr {
                 ast::Expr::ArrayLit { items, span } => {
@@ -5274,7 +5379,7 @@ impl Analyzer {
                 Some(k) => {
                     let kt = self.infer(k, ctx)?;
                     let kty = kt.ty();
-                    if !matches!(kty, Ty::Int | Ty::String | Ty::Mixed) {
+                    if !matches!(kty, Ty::Int | Ty::String | Ty::Mixed | Ty::Union(_)) {
                         self.diags.emit(
                             Diagnostic::error(format!(
                                 "array keys must be `int` or `string`, found `{kty}`"
@@ -5336,7 +5441,7 @@ impl Analyzer {
             for c in &arm.conds {
                 let ct = self.infer(c, ctx)?;
                 let cty = ct.ty();
-                if cty != st && !(st == Ty::Mixed && cty != Ty::Void) {
+                if cty != st && !(st.is_boxed() && cty != Ty::Void) {
                     self.diags.emit(
                         Diagnostic::error(format!(
                             "match arm condition has type `{cty}` but the subject is `{st}`; `match` uses strict `===` comparison"
@@ -6550,7 +6655,7 @@ impl Analyzer {
                 if n != 2 {
                     return self.builtin_arity_err(name, 2, 2, n, span);
                 }
-                if !matches!(atys[0], Ty::Int | Ty::String | Ty::Mixed) {
+                if !matches!(atys[0], Ty::Int | Ty::String | Ty::Mixed | Ty::Union(_)) {
                     return self.builtin_ty_err(
                         name,
                         "an `int` or `string` key",
@@ -6682,7 +6787,14 @@ fn numeric_result(l: &Ty, r: &Ty) -> Ty {
 pub fn is_truthy(ty: &Ty) -> bool {
     matches!(
         ty,
-        Ty::Bool | Ty::Int | Ty::Float | Ty::String | Ty::Mixed | Ty::Named(_) | Ty::Array(_)
+        Ty::Bool
+            | Ty::Int
+            | Ty::Float
+            | Ty::String
+            | Ty::Mixed
+            | Ty::Union(_)
+            | Ty::Named(_)
+            | Ty::Array(_)
     )
 }
 
@@ -7011,7 +7123,7 @@ fn invalidate_writes(statements: &[ast::Stmt], ctx: &mut FnCtx) {
 
 fn send_value_type(ty: &Ty) -> bool {
     match ty {
-        Ty::Null | Ty::Bool | Ty::Int | Ty::Float | Ty::String | Ty::Mixed => true,
+        Ty::Null | Ty::Bool | Ty::Int | Ty::Float | Ty::String | Ty::Mixed | Ty::Union(_) => true,
         Ty::Array(t) => send_value_type(t),
         _ => false,
     }

@@ -5006,3 +5006,184 @@ fn trait_closure_scopes_reject_wrong_consumers_missing_parents_and_receivers() {
         assert!(run.stderr.contains(diagnostic),"{name}: {}",run.stderr);
     }
 }
+
+#[test]
+fn nullable_union_and_failure_literal_types_match_php() {
+    assert_matches_php(
+        "union_scalar_types",
+        r#"<?php
+function maybe(bool $yes): string|false { if ($yes) { return "kept"; } return false; }
+function length(string|false $value): int { if ($value === false) { return -1; } return strlen($value); }
+function number(?int $value): int { return ($value ?? 3) + 1; }
+function nothing(null $value): null { return $value; }
+function nope(false $value): false { return $value; }
+function yep(true $value): true { return $value; }
+function wide(float|null $value): ?float { return $value; }
+function joinNullableValues(?int $value, mixed $fallback): mixed { return $value ?? $fallback; }
+function joinLiteral(false $value, bool $choice, bool $other): mixed { return $choice ? $value : $other; }
+class Holder { public ?int $number=null; public static string|false $text=false; }
+$holder=new Holder(); $holder->number=7;
+echo length(maybe(true)), ":", length(maybe(false)), ":", number(null), ":", number(8), "\n";
+echo is_null(nothing(null)), ":", nope(false), ":", yep(true), ":", is_float(wide(7)), ":", $holder->number, ":", Holder::$text, "\n";
+echo joinNullableValues(null,"fallback"), ":", joinLiteral(false,false,true), "\n";
+"#,
+    );
+}
+
+#[test]
+fn union_object_guards_and_closure_captures_match_php() {
+    assert_matches_php(
+        "union_object_types",
+        r#"<?php
+interface Named { public function name(): string; }
+class First implements Named { public function name(): string { return "first"; } }
+class Second { public function name(): string { return "second"; } }
+function describe(Named|Second|null $value): string {
+    if ($value instanceof Named) { return $value->name(); }
+    if ($value instanceof Second) { return $value->name(); }
+    return "null";
+}
+function factory(string|false $seed) {
+    return function(string|false $value) use ($seed): string|false { if ($value === false) { return $seed; } return $value; };
+}
+$callback=factory("captured");
+echo describe(new First()), ":", describe(new Second()), ":", describe(null), ":", $callback(false), ":", $callback("argument"), "\n";
+"#,
+    );
+}
+
+#[test]
+fn union_arrays_preserve_checked_layouts_keys_snapshots_and_generics() {
+    if !have_cc() {
+        return;
+    }
+    let path = temp_php(
+        "union_array_layouts",
+        r#"<?php
+function first(array<int|string> $values): int|string { return $values[0]; }
+function nested(array<array<int>|false> $values): int { $first=$values[0]; if(is_array($first)) { return $first[0]; } return 0; }
+function nullable(array<int>|null $values): int { if(is_array($values)) { return $values[0]; } return -1; }
+function identity<T>(T $value): T { return $value; }
+class Box<T> { public T $value; public function __construct(T $value) { $this->value=$value; } }
+$values: array<int|string> = (["text",7]); $copy=$values; $copy[0]=8;
+echo first($values), ":", first($copy), ":", nested([[9],false]), ":", nullable([10]), ":", nullable(null), "\n";
+$maybe: array<int>|null = [1]; $snapshot=$maybe; $maybe[0]=2;
+if(is_array($snapshot)) { echo $snapshot[0], ":"; }
+if(is_array($maybe)) { echo $maybe[0], "\n"; }
+$box=new Box<int|string>("boxed"); echo $box->value, ":", identity<string|false>(false), "\n";
+$keyed: array<string|false>=["a"=>"kept",7=>false];
+foreach($keyed as $key=>$value) { echo $key, ":", $value, ";"; } echo "\n";
+"#,
+    );
+    let run = run_ok(&["run", path.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "text:8:9:10:-1\n1:2\nboxed:\na:kept;7:;\n");
+}
+
+#[test]
+fn invalid_union_declarations_and_static_members_fail_explicitly() {
+    for (name, source, code) in [
+        (
+            "union_duplicate",
+            "<?php function f(int|int $x): void {}",
+            "E0310",
+        ),
+        (
+            "union_void",
+            "<?php function f(void|int $x): void {}",
+            "E0310",
+        ),
+        (
+            "union_mixed",
+            "<?php function f(mixed|int $x): void {}",
+            "E0310",
+        ),
+        (
+            "union_bool_literal",
+            "<?php function f(bool|false $x): void {}",
+            "E0310",
+        ),
+        (
+            "union_true_false",
+            "<?php function f(true|false $x): void {}",
+            "E0310",
+        ),
+        (
+            "union_wrong_scalar",
+            "<?php function f(string|int $x): void {} f(true);",
+            "E0231",
+        ),
+        (
+            "union_resource",
+            "<?php function f(TcpStream|false $x): void {}",
+            "E0310",
+        ),
+    ] {
+        let path = temp_php(name, source);
+        let run = run_ok(&["check", path.to_str().unwrap()]);
+        assert_eq!(run.code, 1, "{name}: {}", run.stderr);
+        assert!(run.stderr.contains(code), "{name}: {}", run.stderr);
+    }
+}
+
+#[test]
+fn union_dynamic_boundaries_reject_wrong_tags_literals_objects_and_array_elements() {
+    if !have_cc() {
+        return;
+    }
+    for (name, source) in [
+        (
+            "union_bad_dynamic",
+            "<?php function f(int|string $x): void {} $x: mixed=true; f($x);",
+        ),
+        (
+            "union_bad_false",
+            "<?php function f(false $x): void {} f(true);",
+        ),
+        (
+            "union_bad_true",
+            "<?php function f(true $x): void {} f(false);",
+        ),
+        (
+            "union_bad_object",
+            "<?php class A {} class B {} function f(A|null $x): void {} $x: mixed=new B(); f($x);",
+        ),
+        (
+            "union_bad_array",
+            "<?php function f(array<int>|null $x): void {} $x: mixed=[\"wrong\"]; f($x);",
+        ),
+        (
+            "union_bad_nested",
+            "<?php function f(array<array<int>>|false $x): void {} $x: mixed=[[\"wrong\"]]; f($x);",
+        ),
+    ] {
+        let path = temp_php(name, source);
+        let run = run_ok(&["run", path.to_str().unwrap()]);
+        assert_eq!(run.code, 255, "{name}: {}", run.stderr);
+        assert!(run.stderr.contains("TypeError"), "{name}: {}", run.stderr);
+    }
+}
+
+#[test]
+fn union_generic_inference_uses_concrete_evidence_and_canonical_type_order() {
+    if !have_cc() {
+        return;
+    }
+    let path = temp_php(
+        "union_generic_evidence",
+        r#"<?php
+function fallback<T>(?T $value,T $fallback): T { if($value!==null) {return $value;} return $fallback; }
+function choose<T>(T|string $value,T $fallback): T { return $fallback; }
+class Box<T> { public T $value; public function __construct(T $value) {$this->value=$value;} }
+function relay(Box<int|null> $value): Box<null|int> {return $value;}
+function flag<T>(T|false $value): T|false {return $value;}
+class FlagBox<T> { public T|false $value; public function __construct(T|false $value) {$this->value=$value;} }
+echo flag<bool>(true), ":", (new FlagBox<bool>(true))->value, "\n";
+echo fallback(null,"text"), ":", fallback(7,8), ":", choose("unused",9), "\n";
+$box=relay(new Box<null|int>(7)); echo $box->value, "\n";
+"#,
+    );
+    let run = run_ok(&["run", path.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "1:1\ntext:7:9\n7\n");
+}

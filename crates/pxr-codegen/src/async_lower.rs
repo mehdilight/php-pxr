@@ -404,7 +404,7 @@ fn tag(ty: &Ty) -> usize {
         Ty::String => 4,
         Ty::Array(_) => 5,
         Ty::Named(_) | Ty::TaskResult(_) => 6,
-        Ty::Mixed => 7,
+        Ty::Mixed | Ty::Union(_) => 7,
         Ty::Task(_) | Ty::Infer => unreachable!("invalid async result type"),
     }
 }

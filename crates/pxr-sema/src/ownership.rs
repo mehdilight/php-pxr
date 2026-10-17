@@ -78,6 +78,15 @@ fn result_ownership_compatible(expected: &TypeRef, actual: &TypeRef) -> bool {
     }
 }
 fn copy_safe(t: Option<&TypeRef>) -> bool {
+    if let Some(TypeRef::Union(members, _)) = t.map(inner) {
+        return members.iter().all(|t| copy_safe(Some(t)));
+    }
+    if matches!(
+        t,
+        Some(TypeRef::LiteralNull | TypeRef::LiteralFalse | TypeRef::LiteralTrue)
+    ) {
+        return true;
+    }
     matches!(
         t.map(inner),
         Some(TypeRef::Int | TypeRef::Float | TypeRef::Bool | TypeRef::String | TypeRef::Void)
@@ -470,6 +479,11 @@ impl Checker {
         } else {
             match t {
                 TypeRef::Array(t) => self.validate_type(t, &[], span),
+                TypeRef::Union(members, _) => {
+                    for member in members {
+                        self.validate_type(member, &[], span);
+                    }
+                }
                 TypeRef::Applied(n, ts, _) => {
                     for t in ts {
                         self.validate_type(
@@ -1551,7 +1565,11 @@ impl Checker {
             | TypeRef::Bool
             | TypeRef::String
             | TypeRef::Void
-            | TypeRef::Mixed => true,
+            | TypeRef::Mixed
+            | TypeRef::Union(_, _)
+            | TypeRef::LiteralNull
+            | TypeRef::LiteralFalse
+            | TypeRef::LiteralTrue => true,
             TypeRef::Array(t) => self.send_type(&t, false),
             TypeRef::Param(_, _) if !root => true,
             TypeRef::Named(ref n) if root && owned && n == "Channel" => true,
@@ -2465,6 +2483,11 @@ fn erase_type(t: &mut TypeRef) {
     }
     match t {
         TypeRef::Array(t) => erase_type(t),
+        TypeRef::Union(members, _) => {
+            for member in members {
+                erase_type(member);
+            }
+        }
         TypeRef::Applied(_, ts, _) => {
             for t in ts {
                 erase_type(t);
@@ -2693,6 +2716,10 @@ fn substitute(ty: &TypeRef, bindings: &BTreeMap<String, TypeRef>) -> TypeRef {
     match ty {
         TypeRef::Param(n, _) => bindings.get(n).cloned().unwrap_or_else(|| ty.clone()),
         TypeRef::Array(t) => TypeRef::Array(Box::new(substitute(t, bindings))),
+        TypeRef::Union(members, span) => TypeRef::Union(
+            members.iter().map(|t| substitute(t, bindings)).collect(),
+            *span,
+        ),
         TypeRef::Applied(n, ts, sp) => TypeRef::Applied(
             n.clone(),
             ts.iter().map(|t| substitute(t, bindings)).collect(),
@@ -2716,7 +2743,7 @@ fn infer_bindings(pattern: &TypeRef, actual: &TypeRef, bindings: &mut BTreeMap<S
     }
 }
 
-fn type_shape(t: &TypeRef) -> String {
+pub(super) fn type_shape(t: &TypeRef) -> String {
     match t {
         TypeRef::Param(n, _) => format!("param:{n}"),
         TypeRef::Named(n) => n.to_ascii_lowercase(),
@@ -2726,6 +2753,11 @@ fn type_shape(t: &TypeRef) -> String {
             ts.iter().map(type_shape).collect::<Vec<_>>().join(",")
         ),
         TypeRef::Array(t) => format!("array<{}>", type_shape(t)),
+        TypeRef::Union(members, _) => {
+            let mut shapes: Vec<_> = members.iter().map(type_shape).collect();
+            shapes.sort();
+            shapes.join("|")
+        }
         _ => format!("{t:?}"),
     }
 }

@@ -133,6 +133,9 @@ fn owned_values_moves_borrows_and_generic_methods() {
 #[test]
 fn ownership_violations_fail_before_lowering() {
     let cases = [
+        ("union-owner-copy", "$x: owned<int|string>=1; $y=$x;"),
+        ("union-borrow-rebox", "function f(&array<int|string> $x): void {} $x: owned<array<int>>=[1]; f(&$x);"),
+        ("union-nested-owner", "function f(array<owned<int>|string> $x): void {}"),
         ("trait-nested-borrow-wrong-consumer", "trait T { public static function make() { return static fn() => static function(&mut array<self> $x): void {}; } } class A { use T; } class B { use T; } $outer=A::make(); $f=$outer(); $x: owned<array<B>>=[]; $f(&mut $x);"),
         ("trait-nested-borrow-wrong-parent", "class P {} class Q {} trait T { public static function make() { return static fn() => static function(&mut array<parent> $x): void {}; } } class A extends P { use T; } $outer=A::make(); $f=$outer(); $x: owned<array<Q>>=[]; $f(&mut $x);"),
         ("trait-bound-owned-receiver", "trait T { public function make() { return fn(self $x): self => $x; } } class C { use T; } $c: owned<C>=new C; $f=$c->make();"),
@@ -803,6 +806,42 @@ echo $shadow(&mut $genericValues,new GenericConsumer<int>(),"typed"), "\n"; drop
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(out.stdout, b"3:4\n3:4\n3\n3:4\ntyped\n");
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn union_types_preserve_owned_moves_and_exact_borrow_layouts() {
+    if !have_cc() {
+        return;
+    }
+    let source = r#"<?php
+function transfer(owned<int|string> $value): owned<int|string> { return move($value); }
+function inspect(&int|string $value): int|string { return $value; }
+function mutate(&mut array<int|string> $values): void { $values[]="added"; }
+function first(&array<string|int> $values): int|string { return $values[0]; }
+$value: owned<int|string>="kept"; $result=transfer(move($value)); echo inspect(&$result), "\n"; drop($result);
+$values: owned<array<int|string>>=[7,"text"]; mutate(&mut $values);
+echo first(&$values), ":", $values[2], "\n"; drop($values);
+"#;
+    for opt in [0, 3] {
+        let executable = build("union_ownership", source, opt);
+        let out = Command::new(&executable)
+            .env("PXR_GC_STRESS", "1")
+            .env("PXR_PHP", "/missing/php")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"kept\n7:added\n");
         assert!(
             out.stderr.is_empty(),
             "{}",

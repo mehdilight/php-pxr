@@ -3022,3 +3022,54 @@ async function main(): void {
         "2:3\n",
     );
 }
+
+#[test]
+fn union_types_preserve_snapshots_closure_fields_and_results_across_await() {
+    run_case(
+        "union_async_lifetimes",
+        r#"<?php
+async function text(string|false $value): string|false { await sleepAsync(0); return $value; }
+async function arrayValue(array<int>|null $value): array<int>|null { await sleepAsync(0); return $value; }
+async function transfer(owned<array<int|string>> $values): owned<array<int|string>> { await sleepAsync(0); return move($values); }
+class Holder {
+    public string $text;
+    public function __construct(string $text) { $this->text=$text; }
+    public static function identity() { return static async fn(?self $value): ?self => $value; }
+}
+async function main(): void {
+    $values: array<int>|null=[7]; $task=arrayValue($values); $values[0]=9;
+    $callback=Holder::identity(); $objectTask=$callback(new Holder("kept"));
+    $seed: string|false="captured";
+    $closure=async function(string|false $value) use($seed): string|false { await sleepAsync(0); if($value===false) {return $seed;} return $value; };
+    for($i=0;$i<40;$i++) { $garbage=new Holder("temporary"); await sleepAsync(0); }
+    $result=await $task; if(is_array($result)) { echo $result[0], ":"; }
+    if(is_array($values)) {echo $values[0], ":";}
+    $object=await $objectTask; if($object instanceof Holder) {echo $object->text, ":";}
+    echo await $closure(false), ":", await text(false), "\n";
+    $input: owned<array<int|string>>=["owned",8];
+    $output=await transfer(move($input)); echo $output[0], ":", $output[1], "\n"; drop($output);
+}
+"#,
+        "7:9:kept:captured:\nowned:8\n",
+    );
+}
+
+#[test]
+fn workers_serialize_union_values_without_sharing_array_headers() {
+    run_case(
+        "union_workers",
+        r#"<?php
+async function scalar(string|false $value): string|false { await sleepAsync(0); return $value; }
+async function values(array<int>|null $value): array<int>|null { await sleepAsync(0); if(is_array($value)) {$value[0]++;} return $value; }
+async function main(): void {
+    $seed: array<int>|null=[7];
+    $a=spawn parallelAsync("scalar","text"); $b=spawn parallelAsync("scalar",false);
+    $c=spawn parallelAsync("values",$seed); $seed[0]=99;
+    echo await $a, ":", await $b, ":";
+    $result=await $c; if(is_array($result)) {echo $result[0], ":";}
+    if(is_array($seed)) {echo $seed[0], "\n";}
+}
+"#,
+        "text::8:99\n",
+    );
+}

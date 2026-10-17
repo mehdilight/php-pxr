@@ -6,6 +6,7 @@ fn pattern_is_bound(pattern: &ast::TypeRef, bindings: &HashMap<String, Ty>) -> b
     match pattern {
         ast::TypeRef::Param(name, _) => bindings.contains_key(name),
         ast::TypeRef::Array(element) => pattern_is_bound(element, bindings),
+        ast::TypeRef::Union(members, _) => members.iter().all(|t| pattern_is_bound(t, bindings)),
         ast::TypeRef::Applied(_, args, _) => args
             .iter()
             .all(|argument| pattern_is_bound(argument, bindings)),
@@ -31,6 +32,58 @@ fn infer_bindings(
                 }
             } else {
                 bindings.insert(name.clone(), actual.clone());
+            }
+        }
+        ast::TypeRef::Union(members, _) => {
+            let fixed = |m: &ast::TypeRef| match m {
+                ast::TypeRef::Int => *actual == Ty::Int,
+                ast::TypeRef::Float => *actual == Ty::Float,
+                ast::TypeRef::String => *actual == Ty::String,
+                ast::TypeRef::Bool => *actual == Ty::Bool,
+                ast::TypeRef::LiteralFalse | ast::TypeRef::LiteralTrue => *actual == Ty::Bool,
+                _ => false,
+            };
+            if *actual == Ty::Mixed || members.iter().any(fixed) {
+                return Ok(());
+            }
+            let actual = if let Ty::Union(parts) = actual {
+                let rest: Vec<_> = parts
+                    .iter()
+                    .filter(|part| {
+                        !members.iter().any(|m| {
+                            matches!(
+                                (m, *part),
+                                (ast::TypeRef::LiteralNull, pxr_types::UnionMember::Null)
+                                    | (ast::TypeRef::LiteralFalse, pxr_types::UnionMember::False)
+                                    | (ast::TypeRef::LiteralTrue, pxr_types::UnionMember::True)
+                            )
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                if rest.is_empty() {
+                    return Ok(());
+                }
+                if rest.len() == 1 {
+                    if let pxr_types::UnionMember::Value(t) = &rest[0] {
+                        t.clone()
+                    } else {
+                        Ty::union(rest)
+                    }
+                } else {
+                    Ty::union(rest)
+                }
+            } else {
+                actual.clone()
+            };
+            let unbound: Vec<_> = members
+                .iter()
+                .filter(|m| !pattern_is_bound(m, bindings))
+                .collect();
+            if unbound.len() == 1 {
+                infer_bindings(unbound[0], &actual, bindings, classes, class_infos)?;
+            } else if unbound.len() > 1 {
+                return Err("ambiguous union inference; supply explicit type arguments".into());
             }
         }
         ast::TypeRef::Array(element) => {
@@ -95,6 +148,7 @@ fn encode_type(ty: &Ty) -> String {
         Ty::Bool => "b".into(),
         Ty::String => "s".into(),
         Ty::Mixed => "m".into(),
+        Ty::Union(_) => format!("u{}", hex_name(&ty.to_string())),
         Ty::Null => "z".into(),
         Ty::Array(element) => format!("a{}", encode_type(element)),
         Ty::Named(name) => format!("n{}", hex_name(name)),
@@ -172,6 +226,11 @@ impl Analyzer {
                         .unwrap_or(usize::MAX)
                 ),
                 ast::TypeRef::Array(element) => format!("a({})", shape(element, parameters)),
+                ast::TypeRef::Union(members, _) => {
+                    let mut parts: Vec<_> = members.iter().map(|m| shape(m, parameters)).collect();
+                    parts.sort();
+                    parts.join("|")
+                }
                 ast::TypeRef::Applied(name, args, _) => format!(
                     "{}<{}>",
                     name.to_ascii_lowercase(),

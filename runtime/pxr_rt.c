@@ -2548,6 +2548,101 @@ static void *pxr_mixed_payload(const void *p, int tag) {
     return (void *)(intptr_t)value->bits;
 }
 
+/* Checked native type descriptors. Tagged unions use the existing mixed ABI;
+ * array extraction reconstructs typed entries instead of reinterpreting boxes. */
+static const char *pxr_type_end(const char *p, const char *end) {
+    if (p >= end) abort();
+    char code = *p++;
+    if (code == 'O') { while (p < end && *p != ';') p++; if (p == end) abort(); return p + 1; }
+    if (code == '[') { p = pxr_type_end(p,end); if (p == end || *p != ']') abort(); return p + 1; }
+    if (code == '(') {
+        for (;;) { p = pxr_type_end(p,end); if (p == end) abort(); if (*p == ')') return p+1; if (*p++ != '|') abort(); }
+    }
+    if (!strchr("midbsnft",code)) abort();
+    return p;
+}
+static pxr_mixed pxr_type_entry(const pxr_ent *entry) {
+    if (entry->vt == PXR_TAG_MIXED) return *pxr_mixed_checked((void *)(intptr_t)entry->bits);
+    return (pxr_mixed){entry->vt,entry->bits};
+}
+static int pxr_type_accepts(pxr_mixed value, const char *type, const char *end) {
+    if (type >= end) abort();
+    switch (*type) {
+        case 'm': return 1;
+        case 'n': return value.tag == PXR_TAG_NULL;
+        case 'f': return value.tag == PXR_TAG_BOOL && !value.bits;
+        case 't': return value.tag == PXR_TAG_BOOL && value.bits;
+        case 'i': return value.tag == PXR_TAG_INT;
+        case 'd': return value.tag == PXR_TAG_FLOAT;
+        case 'b': return value.tag == PXR_TAG_BOOL;
+        case 's': return value.tag == PXR_TAG_STR;
+        case 'O': {
+            unsigned long long id = 0; const char *p = type+1;
+            while (p < end && *p >= '0' && *p <= '9') { id = id*10+(unsigned)(*p++-'0'); if (id>UINT32_MAX) abort(); }
+            if (p == end || *p != ';') abort();
+            return value.tag == PXR_TAG_OBJ && pxr_instanceof((void *)(intptr_t)value.bits,(long long)id);
+        }
+        case '[': {
+            if (value.tag != PXR_TAG_ARR) return 0;
+            pxr_array *array = (void *)(intptr_t)value.bits;
+            for (size_t i=0;i<array->len;i++) if (!pxr_type_accepts(pxr_type_entry(&array->ents[i]),type+1,end)) return 0;
+            return 1;
+        }
+        case '(': {
+            int accepts=0; const char *p=type+1;
+            for (;;) {
+                accepts |= pxr_type_accepts(value,p,end);
+                p=pxr_type_end(p,end);
+                if (p==end) abort();
+                if (*p==')') return accepts;
+                if (*p++!='|') abort();
+            }
+        }
+        default: abort();
+    }
+}
+static void pxr_union_type_error(void) {
+    fputs("Fatal error: Uncaught TypeError: value does not satisfy the declared union or nullable type\n",stderr);
+    exit(255);
+}
+void *pxr_mixed_require(void *p, const pxr_str *descriptor) {
+    pxr_mixed value=*pxr_mixed_checked(p);
+    const char *type=descriptor->data, *end=type+descriptor->len;
+    if (pxr_type_end(type,end)!=end) abort();
+    if (pxr_type_accepts(value,type,end)) return p;
+    /* Preserve int if accepted; otherwise perform only the existing scalar
+     * int-to-float widening, never an array element-layout conversion. */
+    if (value.tag==PXR_TAG_INT) {
+        double number=(double)value.bits; int64_t bits; memcpy(&bits,&number,sizeof(bits));
+        pxr_mixed widened={PXR_TAG_FLOAT,bits};
+        if (pxr_type_accepts(widened,type,end)) return pxr_mixed_box(PXR_TAG_FLOAT,bits);
+    }
+    pxr_union_type_error(); return NULL;
+}
+static pxr_array *pxr_type_array(pxr_array *source, const char *element, const char *end) {
+    pxr_array *copy=pxr_array_new();
+    for (size_t i=0;i<source->len;i++) {
+        pxr_ent *entry=&source->ents[i]; pxr_mixed value=pxr_type_entry(entry);
+        long long tag=value.tag, bits=value.bits;
+        if (*element=='(' || *element=='m' || *element=='n' || *element=='f' || *element=='t') {
+            tag=PXR_TAG_MIXED; bits=(intptr_t)pxr_mixed_box(value.tag,value.bits);
+        } else if (*element=='[') {
+            tag=PXR_TAG_ARR; bits=(intptr_t)pxr_type_array((void *)(intptr_t)value.bits,element+1,end);
+        }
+        pxr_array_set(copy,entry->ks?PXR_TAG_STR:PXR_TAG_INT,entry->ki,entry->ks,tag,bits);
+    }
+    copy->next_index=source->next_index; copy->append_overflow=source->append_overflow; copy->has_integer=source->has_integer;
+    pxr_array_share(source,copy);
+    return copy;
+}
+void *pxr_mixed_typed_array(void *p, const pxr_str *descriptor) {
+    pxr_mixed value=*pxr_mixed_checked(p);
+    const char *type=descriptor->data, *end=type+descriptor->len;
+    if (type==end || *type!='[' || pxr_type_end(type,end)!=end) abort();
+    if (!pxr_type_accepts(value,type,end)) pxr_union_type_error();
+    return pxr_type_array((void *)(intptr_t)value.bits,type+1,end);
+}
+
 void *pxr_mixed_array(const void *p) { return pxr_mixed_payload(p, PXR_TAG_ARR); }
 void *pxr_mixed_object(const void *p) { return pxr_mixed_payload(p, PXR_TAG_OBJ); }
 long long pxr_mixed_instanceof(const void *p, long long class_id) {

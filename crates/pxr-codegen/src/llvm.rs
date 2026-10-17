@@ -87,6 +87,8 @@ const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
     ("pxr_mixed_bit_not", "ptr", &["ptr"]),
     ("pxr_mixed_binary", "ptr", &["i64", "ptr", "ptr"]),
     ("pxr_mixed_copy", "ptr", &["ptr"]),
+    ("pxr_mixed_require", "ptr", &["ptr", "ptr"]),
+    ("pxr_mixed_typed_array", "ptr", &["ptr", "ptr"]),
     ("pxr_array_to_mixed", "ptr", &["ptr"]),
     ("pxr_mixed_array", "ptr", &["ptr"]),
     ("pxr_mixed_object", "ptr", &["ptr"]),
@@ -225,7 +227,7 @@ pub fn llty(ty: &Ty) -> &'static str {
         Ty::Bool => "i1",
         Ty::Int => "i64",
         Ty::Float => "double",
-        Ty::String | Ty::Mixed => "ptr",
+        Ty::String | Ty::Mixed | Ty::Union(_) => "ptr",
         // A `null` value is a null pointer (`inttoptr i64 0 to ptr`); the null
         // literal itself is otherwise rejected at compile time.
         Ty::Null => "ptr",
@@ -576,7 +578,7 @@ impl<'a> FnGen<'a> {
                     (Ty::Int, Ty::Bool) => format!("%v{dst} = trunc i64 %v{src} to i1"),
                     (Ty::Float, Ty::Int) => format!("%v{dst} = bitcast double %v{src} to i64"),
                     (Ty::Int, Ty::Float) => format!("%v{dst} = bitcast i64 %v{src} to double"),
-                    (Ty::Mixed, Ty::Int)
+                    (Ty::Mixed | Ty::Union(_), Ty::Int)
                     | (Ty::String, Ty::Int)
                     | (Ty::Array(_), Ty::Int)
                     | (Ty::Named(_), Ty::Int)
@@ -585,7 +587,7 @@ impl<'a> FnGen<'a> {
                     | (Ty::Null, Ty::Int) => {
                         format!("%v{dst} = ptrtoint ptr %v{src} to i64")
                     }
-                    (Ty::Int, Ty::Mixed)
+                    (Ty::Int, Ty::Mixed | Ty::Union(_))
                     | (Ty::Int, Ty::String)
                     | (Ty::Int, Ty::Array(_))
                     | (Ty::Int, Ty::Named(_))
@@ -651,7 +653,9 @@ impl<'a> FnGen<'a> {
                 Ty::Int => self.line(&format!("call void @pxr_print_i64(i64 %v{src})")),
                 Ty::Float => self.line(&format!("call void @pxr_print_f64(double %v{src})")),
                 Ty::String => self.line(&format!("call void @pxr_print_str(ptr %v{src})")),
-                Ty::Mixed => self.line(&format!("call void @pxr_mixed_print(ptr %v{src})")),
+                Ty::Mixed | Ty::Union(_) => {
+                    self.line(&format!("call void @pxr_mixed_print(ptr %v{src})"))
+                }
                 Ty::Bool => {
                     let t = self.temp();
                     self.line(&format!("%v{t} = zext i1 %v{src} to i32"));

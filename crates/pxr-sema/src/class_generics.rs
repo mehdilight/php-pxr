@@ -24,6 +24,18 @@ pub(super) struct ClassExpander {
 pub(super) fn type_ref(ty: &Ty) -> ast::TypeRef {
     use ast::TypeRef as R;
     match ty {
+        Ty::Union(members) => R::Union(
+            members
+                .iter()
+                .map(|m| match m {
+                    pxr_types::UnionMember::Value(t) => type_ref(t),
+                    pxr_types::UnionMember::Null => R::LiteralNull,
+                    pxr_types::UnionMember::False => R::LiteralFalse,
+                    pxr_types::UnionMember::True => R::LiteralTrue,
+                })
+                .collect(),
+            Span::synthetic(),
+        ),
         Ty::Infer => unreachable!("unresolved arguments are deferred before specialization"),
         Ty::Void => R::Void,
         Ty::Int => R::Int,
@@ -50,6 +62,18 @@ pub(super) fn type_ref(ty: &Ty) -> ast::TypeRef {
 pub(super) fn concrete_type(ty: &ast::TypeRef) -> Ty {
     use ast::TypeRef as R;
     match ty {
+        R::Union(members, _) => Ty::union(
+            members
+                .iter()
+                .flat_map(|t| match concrete_type(t) {
+                    Ty::Union(m) => m,
+                    value => vec![pxr_types::UnionMember::Value(value)],
+                })
+                .collect(),
+        ),
+        R::LiteralNull => Ty::Union(vec![pxr_types::UnionMember::Null]),
+        R::LiteralFalse => Ty::Union(vec![pxr_types::UnionMember::False]),
+        R::LiteralTrue => Ty::Union(vec![pxr_types::UnionMember::True]),
         R::Void => Ty::Void,
         R::Int => Ty::Int,
         R::Float => Ty::Float,
@@ -68,6 +92,7 @@ pub(super) fn concrete_type(ty: &ast::TypeRef) -> Ty {
 
 fn closed(ty: &ast::TypeRef) -> bool {
     match ty {
+        ast::TypeRef::Union(members, _) => members.iter().all(closed),
         ast::TypeRef::Param(..) => false,
         ast::TypeRef::Array(element) => closed(element),
         ast::TypeRef::Applied(_, args, _) => args.iter().all(closed),
@@ -254,6 +279,14 @@ impl ClassExpander {
     /// Validate template signatures without inventing a mixed instantiation.
     pub fn validate_type(&mut self, ty: &ast::TypeRef) {
         match ty {
+            ast::TypeRef::Union(members, span) => {
+                if let Some(message) = unions::raw_union_error(members) {
+                    self.error("E0310", *span, message.into());
+                }
+                for member in members {
+                    self.validate_type(member);
+                }
+            }
             ast::TypeRef::Applied(name, args, span) => {
                 if name
                     .rsplit('\\')
@@ -335,6 +368,21 @@ impl ClassExpander {
                 }
             }
             R::Array(element) => self.rewrite_type(element, bindings),
+            R::Union(members, span) => {
+                let generic = members.iter().any(unions::has_parameter);
+                let valid = if let Some(message) = unions::raw_union_error(members) {
+                    self.error("E0310", *span, message.into());
+                    false
+                } else {
+                    true
+                };
+                for member in members.iter_mut() {
+                    self.rewrite_type(member, bindings);
+                }
+                if generic && valid && members.iter().all(closed) {
+                    *ty = type_ref(&concrete_type(ty));
+                }
+            }
             R::Applied(name, args, span) => {
                 for argument in args.iter_mut() {
                     self.rewrite_type(argument, bindings);

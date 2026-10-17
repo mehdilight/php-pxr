@@ -413,6 +413,10 @@ pub struct MethodDecl {
 /// A syntactic type reference, before resolution.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeRef {
+    Union(Vec<TypeRef>, Span),
+    LiteralNull,
+    LiteralFalse,
+    LiteralTrue,
     /// A lexically scoped generic parameter.
     Param(String, Span),
     Applied(String, Vec<TypeRef>, Span),
@@ -434,7 +438,10 @@ pub enum TypeRef {
 impl TypeRef {
     pub fn span(&self) -> Span {
         match self {
-            TypeRef::Span(s) | TypeRef::Param(_, s) | TypeRef::Applied(_, _, s) => *s,
+            TypeRef::Span(s)
+            | TypeRef::Param(_, s)
+            | TypeRef::Applied(_, _, s)
+            | TypeRef::Union(_, s) => *s,
             _ => Span::synthetic(),
         }
     }

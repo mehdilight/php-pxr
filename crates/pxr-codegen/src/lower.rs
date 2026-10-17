@@ -17,7 +17,7 @@ use pxr_types::Ty;
 pub fn lower_program(prog: &TProgram) -> Module {
     let mut m = Module::new();
     for f in &prog.funcs {
-        m.function(lower_func(f));
+        m.function(lower_func(f, &prog.class_type_ids));
         if prog.parallel_handlers.contains(&f.name) {
             let ty = &f.params[0].1;
             let mut bridge = Lowerer::new(Function::new(
@@ -39,10 +39,18 @@ pub fn lower_program(prog: &TProgram) -> Module {
         let mut bootstrap = prog.main.clone();
         bootstrap.name = "pxr_parallel_bootstrap".into();
         bootstrap.body = prog.worker_bootstrap.clone();
-        m.function(lower_main(&bootstrap, &prog.class_registrations));
+        m.function(lower_main(
+            &bootstrap,
+            &prog.class_registrations,
+            &prog.class_type_ids,
+        ));
     }
     m.function(lower_stringifier(&prog.stringifiers));
-    m.function(lower_main(&prog.main, &prog.class_registrations));
+    m.function(lower_main(
+        &prog.main,
+        &prog.class_registrations,
+        &prog.class_type_ids,
+    ));
     m
 }
 
@@ -81,7 +89,11 @@ fn lower_stringifier(stringifiers: &[(u32, String)]) -> Function {
     lower.into_function()
 }
 
-fn lower_main(tf: &TFunc, class_registrations: &[(u32, u32)]) -> Function {
+fn lower_main(
+    tf: &TFunc,
+    class_registrations: &[(u32, u32)],
+    class_ids: &[(String, u32)],
+) -> Function {
     let params: Vec<Ty> = tf.params.iter().map(|(_, t)| t.clone()).collect();
     let mut lw = Lowerer::new(Function::new(
         tf.name.clone(),
@@ -90,6 +102,7 @@ fn lower_main(tf: &TFunc, class_registrations: &[(u32, u32)]) -> Function {
         tf.ret.clone(),
     ));
 
+    lw.class_ids.extend(class_ids.iter().cloned());
     for ty in tf.slots.iter() {
         let slot = lw.f.alloc_slot(ty.clone());
         lw.emit_prelude(Inst::SlotAlloc {
@@ -116,7 +129,7 @@ fn lower_main(tf: &TFunc, class_registrations: &[(u32, u32)]) -> Function {
     lw.into_function()
 }
 
-fn lower_func(tf: &TFunc) -> Function {
+fn lower_func(tf: &TFunc, class_ids: &[(String, u32)]) -> Function {
     let params: Vec<Ty> = tf.params.iter().map(|(_, t)| t.clone()).collect();
     let mut lw = Lowerer::new(Function::new(
         tf.name.clone(),
@@ -130,6 +143,7 @@ fn lower_func(tf: &TFunc) -> Function {
     // Slots live in the entry block so LLVM can promote them to registers.
     // Registering them through `alloc_slot` keeps the slot table in sync so
     // that compiler-private temporaries (short-circuit results) get fresh ids.
+    lw.class_ids.extend(class_ids.iter().cloned());
     for ty in tf.slots.iter() {
         let slot = lw.f.alloc_slot(ty.clone());
         lw.emit_prelude(Inst::SlotAlloc {
@@ -179,6 +193,7 @@ enum PreparedTarget {
 
 struct Lowerer {
     f: Function,
+    class_ids: std::collections::HashMap<String, u32>,
     prelude: Vec<Inst>,
     terminated: bool,
     /// Targets for `break` / `continue`, innermost first. A `switch` pushes an
@@ -197,6 +212,7 @@ impl Lowerer {
     fn new(f: Function) -> Self {
         Lowerer {
             f,
+            class_ids: std::collections::HashMap::new(),
             prelude: Vec::new(),
             terminated: false,
             loops: Vec::new(),
@@ -269,7 +285,7 @@ impl Lowerer {
             Ty::Float => Literal::Float(0.0),
             Ty::Bool => Literal::Bool(false),
             Ty::String => Literal::Str(Vec::new()),
-            Ty::Mixed => Literal::Null,
+            Ty::Mixed | Ty::Union(_) => Literal::Null,
             _ => Literal::Str(Vec::new()),
         };
         self.emit_prelude(Inst::Const { dst, lit });
@@ -533,7 +549,7 @@ impl Lowerer {
                 if postfix {
                     cur
                 } else {
-                    res.0
+                    value
                 }
             }
             _ => unreachable!("effect expression must contain an assignment"),
@@ -575,7 +591,7 @@ impl Lowerer {
                 expr,
             } => {
                 let a = self.lower_expr(expr);
-                if *operand_ty == Ty::Mixed {
+                if operand_ty.is_boxed() {
                     if *op == pxr_sema::TUnOp::Neg {
                         return self.rt_call("pxr_mixed_negate", vec![a], Ty::Mixed);
                     }
@@ -706,7 +722,7 @@ impl Lowerer {
             } => {
                 let obj = self.lower_expr(expr);
                 let target_cid = self.emit_const(Literal::Int(*target_class_id as i64));
-                let function = if expr.ty() == Ty::Mixed {
+                let function = if expr.ty().is_boxed() {
                     "pxr_mixed_instanceof"
                 } else {
                     "pxr_instanceof"
@@ -727,6 +743,26 @@ impl Lowerer {
         if from == to {
             return v;
         }
+        if matches!(to, Ty::Union(_)) {
+            let boxed = if from.is_boxed() {
+                v
+            } else {
+                self.cast(v, from, &Ty::Mixed)
+            };
+            let descriptor = self.emit_const(Literal::Str(self.type_descriptor(to).into_bytes()));
+            return self.rt_call("pxr_mixed_require", vec![boxed, descriptor], to.clone());
+        }
+        if from.is_boxed() && *to == Ty::Mixed {
+            return v;
+        }
+        if let (Ty::Array(_), Ty::Array(target)) = (from, to) {
+            if matches!(**target, Ty::Union(_)) {
+                let boxed = self.cast(v, from, &Ty::Mixed);
+                let descriptor =
+                    self.emit_const(Literal::Str(self.type_descriptor(to).into_bytes()));
+                return self.rt_call("pxr_mixed_typed_array", vec![boxed, descriptor], to.clone());
+            }
+        }
         if *to == Ty::Mixed && *from != Ty::Void {
             let tag = self.emit_const(Literal::Int(Self::tag_of(from)));
             let bits = self.encode_bits(v, from);
@@ -741,7 +777,19 @@ impl Lowerer {
             let boxed = self.cast(v, from, &Ty::Mixed);
             return self.cast(boxed, &Ty::Mixed, to);
         }
-        if *from == Ty::Mixed {
+        if from.is_boxed() {
+            if matches!(to,Ty::Array(element) if **element != Ty::Mixed) {
+                let descriptor =
+                    self.emit_const(Literal::Str(self.type_descriptor(to).into_bytes()));
+                return self.rt_call("pxr_mixed_typed_array", vec![v, descriptor], to.clone());
+            }
+            let v = if matches!(to, Ty::Named(_)) {
+                let descriptor =
+                    self.emit_const(Literal::Str(self.type_descriptor(to).into_bytes()));
+                self.rt_call("pxr_mixed_require", vec![v, descriptor], Ty::Mixed)
+            } else {
+                v
+            };
             let function = match to {
                 Ty::Int => "pxr_mixed_i64",
                 Ty::Float => "pxr_mixed_f64",
@@ -774,6 +822,32 @@ impl Lowerer {
             src: v,
         });
         dst
+    }
+
+    fn type_descriptor(&self, ty: &Ty) -> String {
+        match ty {
+            Ty::Mixed => "m".into(),
+            Ty::Int => "i".into(),
+            Ty::Float => "d".into(),
+            Ty::Bool => "b".into(),
+            Ty::String => "s".into(),
+            Ty::Array(element) => format!("[{}]", self.type_descriptor(element)),
+            Ty::Named(name) => format!("O{};", self.class_ids[name]),
+            Ty::Union(members) => format!(
+                "({})",
+                members
+                    .iter()
+                    .map(|m| match m {
+                        pxr_types::UnionMember::Value(t) => self.type_descriptor(t),
+                        pxr_types::UnionMember::Null => "n".into(),
+                        pxr_types::UnionMember::False => "f".into(),
+                        pxr_types::UnionMember::True => "t".into(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            ),
+            _ => unreachable!("invalid checked value descriptor: {ty}"),
+        }
     }
 
     fn to_bool(&mut self, v: Value, ty: &Ty) -> Value {
@@ -848,7 +922,7 @@ impl Lowerer {
         rhs: &TExpr,
     ) -> Value {
         use pxr_sema::TBinOp as B;
-        if (*lhs_ty == Ty::Mixed || *rhs_ty == Ty::Mixed) && Self::mixed_op(op).is_some() {
+        if (lhs_ty.is_boxed() || rhs_ty.is_boxed()) && Self::mixed_op(op).is_some() {
             let left = self.lower_expr(lhs);
             let right = self.lower_expr(rhs);
             let result = self.lower_mixed_binary(op, left, lhs_ty, right, rhs_ty);
@@ -985,15 +1059,22 @@ impl Lowerer {
                 });
                 dst
             }
-            B::NullCoalesce => self.lower_null_coalesce(lhs, lhs_ty, rhs, rhs_ty),
+            B::NullCoalesce => self.lower_null_coalesce(lhs, lhs_ty, rhs, rhs_ty, result_ty),
             B::Pow => unreachable!("`**` is rejected during semantic analysis"),
         }
     }
 
     /// Lower `a ?? b` lazily, testing both key presence and boxed nulls.
-    fn lower_null_coalesce(&mut self, lhs: &TExpr, lhs_ty: &Ty, rhs: &TExpr, rhs_ty: &Ty) -> Value {
+    fn lower_null_coalesce(
+        &mut self,
+        lhs: &TExpr,
+        lhs_ty: &Ty,
+        rhs: &TExpr,
+        rhs_ty: &Ty,
+        result_ty: &Ty,
+    ) -> Value {
         // Keep a reference around so we can borrow it in `match` arms later.
-        let ty = self.common_of(lhs_ty, rhs_ty);
+        let ty = result_ty.clone();
         match lhs {
             TExpr::Index {
                 base,
@@ -1043,7 +1124,7 @@ impl Lowerer {
                 };
                 let bits = self.array_get(a3, ktag, kint, kstr);
                 let v1 = self.decode_bits(bits, ety);
-                if *ety == Ty::Mixed {
+                if ety.is_boxed() {
                     let is_null = self.mixed_is_null(v1);
                     let present_l = self.fresh_label();
                     self.terminator(Inst::Branch {
@@ -1076,7 +1157,7 @@ impl Lowerer {
                 self.emit(Inst::SlotGet { dst, slot: tmp, ty });
                 dst
             }
-            _ if *lhs_ty == Ty::Mixed => {
+            _ if lhs_ty.is_boxed() => {
                 let v = self.lower_expr(lhs);
                 let is_null = self.mixed_is_null(v);
                 let tmp = self.alloc_temp_slot(ty.clone());
@@ -1089,6 +1170,7 @@ impl Lowerer {
                     else_label: take_l,
                 });
                 self.switch_to(take_l);
+                let v = self.cast(v, lhs_ty, &ty);
                 self.emit(Inst::SlotSet {
                     slot: tmp,
                     src: v,
@@ -1119,27 +1201,6 @@ impl Lowerer {
     fn mixed_is_null(&mut self, value: Value) -> Value {
         let result = self.rt_call("pxr_mixed_is_nullish", vec![value], Ty::Int);
         self.to_bool(result, &Ty::Int)
-    }
-
-    /// The common type of a binary/coalesce/ternary result, mirroring the
-    /// analyzer's `unify_types` (used only when both operands are non-null).
-    fn common_of(&self, a: &Ty, b: &Ty) -> Ty {
-        if a == b {
-            return a.clone();
-        }
-        if (*a == Ty::Mixed && *b != Ty::Void) || (*b == Ty::Mixed && *a != Ty::Void) {
-            return Ty::Mixed;
-        }
-        if a.is_numeric() && b.is_numeric() {
-            return if *a == Ty::Float || *b == Ty::Float {
-                Ty::Float
-            } else {
-                Ty::Int
-            };
-        }
-        // Fall back to the left type; semantic analysis rejected real
-        // mismatches long before we get here.
-        a.clone()
     }
 
     fn lower_ternary(
@@ -1294,7 +1355,7 @@ impl Lowerer {
     }
 
     fn bin(&mut self, op: IBinOp, a: Value, at: &Ty, b: Value, bt: &Ty, rt: &Ty) -> Value {
-        if (*at == Ty::Mixed || *bt == Ty::Mixed) && matches!(op, IBinOp::Eq | IBinOp::NotEq) {
+        if (at.is_boxed() || bt.is_boxed()) && matches!(op, IBinOp::Eq | IBinOp::NotEq) {
             let a = self.cast(a, at, &Ty::Mixed);
             let b = self.cast(b, bt, &Ty::Mixed);
             let result = self.rt_call("pxr_mixed_identical", vec![a, b], Ty::Int);
@@ -1413,7 +1474,7 @@ impl Lowerer {
             Ty::String => 4,
             Ty::Array(_) => 5,
             Ty::Named(_) | Ty::TaskResult(_) => 6,
-            Ty::Mixed => 7,
+            Ty::Mixed | Ty::Union(_) => 7,
             _ => 0,
         }
     }
@@ -1494,7 +1555,7 @@ impl Lowerer {
     /// at every place an array value is stored into a location, passed to a
     /// function, embedded in another array, or taken as a `foreach` value.
     fn maybe_copy_array(&mut self, v: Value, ty: &Ty) -> Value {
-        if *ty == Ty::Mixed {
+        if ty.is_boxed() {
             return self.rt_call("pxr_mixed_copy", vec![v], Ty::Mixed);
         }
         if !ty.is_array() {
@@ -1558,7 +1619,7 @@ impl Lowerer {
                 let kint = self.emit_const(Literal::Int(0));
                 (ktag, kint, kv)
             }
-            Ty::Mixed => {
+            Ty::Mixed | Ty::Union(_) => {
                 let tag = self.rt_call("pxr_mixed_key_tag", vec![kv], Ty::Int);
                 let integer = self.rt_call("pxr_mixed_key_int", vec![kv], Ty::Int);
                 let string = self.rt_call("pxr_mixed_key_str", vec![kv], Ty::String);
@@ -1695,7 +1756,7 @@ impl Lowerer {
             PreparedTarget::Array { .. } | PreparedTarget::Nested { .. } => {
                 let (array, key) = self.array_location(place);
                 if let Some((tag, integer, string)) = key {
-                    let boxed = self.emit_const(Literal::Int(i64::from(*storage == Ty::Mixed)));
+                    let boxed = self.emit_const(Literal::Int(i64::from(storage.is_boxed())));
                     self.rt_call(
                         "pxr_array_child_or_new",
                         vec![array, tag, integer, string, boxed],
@@ -1707,7 +1768,7 @@ impl Lowerer {
             }
             _ => {
                 let value = self.read_target(place, storage);
-                if *storage == Ty::Mixed {
+                if storage.is_boxed() {
                     self.rt_call("pxr_mixed_array_or_new", vec![value], view.clone())
                 } else {
                     self.cast(value, storage, view)
@@ -1760,6 +1821,26 @@ impl Lowerer {
             }
             PreparedTarget::Array { base, key } => {
                 let array = self.array_base_value(base);
+                if let ArrayBase::Slot {
+                    slot,
+                    storage: storage @ Ty::Union(_),
+                    view,
+                } = base
+                {
+                    // A narrowed union array may have been reconstructed with
+                    // concrete element slots. Publish the new header only after
+                    // its complete write satisfies the original union contract.
+                    let array = self.maybe_copy_array(array, view);
+                    self.write_array_element(array, *key, ty, value);
+                    let value = self.cast(array, view, storage);
+                    let value = self.maybe_copy_array(value, storage);
+                    self.emit(Inst::SlotSet {
+                        slot: *slot,
+                        src: value,
+                        ty: storage.clone(),
+                    });
+                    return;
+                }
                 self.write_array_element(array, *key, ty, value);
             }
             PreparedTarget::Nested {
@@ -1805,7 +1886,7 @@ impl Lowerer {
         rv: Value,
     ) -> (Value, Ty) {
         use pxr_sema::TBinOp as B;
-        if (*lt == Ty::Mixed || *rt == Ty::Mixed) && Self::mixed_op(op).is_some() {
+        if (lt.is_boxed() || rt.is_boxed()) && Self::mixed_op(op).is_some() {
             return (self.lower_mixed_binary(op, lv, lt, rv, rt), Ty::Mixed);
         }
 
@@ -1918,7 +1999,7 @@ impl Lowerer {
                     self.emit_const(Literal::Bool(false))
                 }
             }
-            _ if *ty == Ty::Mixed => {
+            _ if ty.is_boxed() => {
                 let current = self.read_target(&place, ty);
                 let null = self.mixed_is_null(current);
                 let no = self.emit_const(Literal::Bool(false));
@@ -2177,7 +2258,7 @@ impl Lowerer {
                 let tv = self.lower_expr(t);
                 // PHP's `switch` compares loosely; numeric strings compare by
                 // value (`"1" == "01"`).
-                let eq = if *subject_ty == Ty::Mixed || c.test_ty == Ty::Mixed {
+                let eq = if subject_ty.is_boxed() || c.test_ty.is_boxed() {
                     let result = self.lower_mixed_binary(
                         pxr_sema::TBinOp::Eq,
                         sval,
@@ -2364,7 +2445,7 @@ impl Lowerer {
                     IsScalar => -1,
                     _ => unreachable!(),
                 };
-                if arg_tys[0] == Ty::Mixed {
+                if arg_tys[0].is_boxed() {
                     let tag = self.emit_const(Literal::Int(tag));
                     let result = self.rt_call("pxr_mixed_is", vec![a[0], tag], Ty::Int);
                     self.to_bool(result, &Ty::Int)
@@ -2378,7 +2459,7 @@ impl Lowerer {
             }
             Strlen => self.rt_call("pxr_strlen", vec![a[0]], Ty::Int),
             Intval => match arg_tys[0] {
-                Ty::Mixed => self.cast(a[0], &Ty::Mixed, &Ty::Int),
+                Ty::Mixed | Ty::Union(_) => self.cast(a[0], &Ty::Mixed, &Ty::Int),
                 Ty::Int => a[0],
                 Ty::Float => {
                     let boxed = self.cast(a[0], &Ty::Float, &Ty::Mixed);
@@ -2392,7 +2473,7 @@ impl Lowerer {
                 }
             },
             Floatval => match arg_tys[0] {
-                Ty::Mixed => self.cast(a[0], &Ty::Mixed, &Ty::Float),
+                Ty::Mixed | Ty::Union(_) => self.cast(a[0], &Ty::Mixed, &Ty::Float),
                 Ty::Float => a[0],
                 Ty::Int => self.cast(a[0], &Ty::Int, &Ty::Float),
                 Ty::Bool => self.cast(a[0], &Ty::Bool, &Ty::Float),
@@ -2403,7 +2484,7 @@ impl Lowerer {
                 }
             },
             Strval => match arg_tys[0] {
-                Ty::Mixed => self.cast(a[0], &Ty::Mixed, &Ty::String),
+                Ty::Mixed | Ty::Union(_) => self.cast(a[0], &Ty::Mixed, &Ty::String),
                 Ty::String => a[0],
                 Ty::Int => self.cast(a[0], &Ty::Int, &Ty::String),
                 Ty::Float => self.cast(a[0], &Ty::Float, &Ty::String),

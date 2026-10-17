@@ -143,6 +143,11 @@ fn bind_annotation(t: &mut TypeRef, scope: Option<&ClassScope>) -> Result<(), &'
             }
         }
         TypeRef::Array(t) => bind_annotation(t, scope)?,
+        TypeRef::Union(members, _) => {
+            for member in members {
+                bind_annotation(member, scope)?;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -152,6 +157,7 @@ fn needs_trait_parent(ty: &TypeRef) -> bool {
     match ty {
         TypeRef::Param(name, _) => name == CLOSURE_TRAIT_PARENT,
         TypeRef::Array(element) => needs_trait_parent(element),
+        TypeRef::Union(members, _) => members.iter().any(needs_trait_parent),
         TypeRef::Applied(_, arguments, _) => arguments.iter().any(needs_trait_parent),
         _ => false,
     }

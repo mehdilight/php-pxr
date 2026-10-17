@@ -5,6 +5,12 @@ impl Analyzer {
         if left == right {
             return Some(left.clone());
         }
+        if matches!(left, Ty::Union(_)) && self.union_guarantees(right, left) {
+            return Some(left.clone());
+        }
+        if matches!(right, Ty::Union(_)) && self.union_guarantees(left, right) {
+            return Some(right.clone());
+        }
         if *left == Ty::Infer {
             return Some(right.clone());
         }
