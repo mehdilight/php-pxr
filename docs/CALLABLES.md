@@ -140,9 +140,9 @@ See [callback_objects.php](../examples/callback_objects.php) and
   the existing [interop restrictions](INTEROP.md) still apply.
 - User-declared invokable magic methods remain synchronous and cannot declare
   method generics. Async closures use compiler-generated invocation methods.
-- Optional positional parameters work on closures and invokable methods; see
+- Optional and named parameters work on closures and invokable methods; see
   [ARGUMENTS.md](ARGUMENTS.md). `--compat` permits untyped parameters through mixed
-  storage. Named/variadic arguments and unpacking remain unfinished; closures
+  storage. Variadic arguments and unpacking remain unfinished; closures
   retain the same argument and ownership checks as other native calls.
 
 Behavioral references: [PHP anonymous functions](https://www.php.net/manual/en/functions.anonymous.php)

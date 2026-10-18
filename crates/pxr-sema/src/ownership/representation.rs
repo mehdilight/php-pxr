@@ -34,7 +34,8 @@ fn argument(e: &TExpr, want: &Ty, d: &mut Diagnostics) {
 fn expression(e: &TExpr, d: &mut Diagnostics) {
     match e {
         TExpr::Effect { statement, .. } => statements(std::slice::from_ref(statement), d),
-        TExpr::Pass { expr, .. }
+        TExpr::Ordered { expr, .. }
+        | TExpr::Pass { expr, .. }
         | TExpr::Coerce { expr, .. }
         | TExpr::Un { expr, .. }
         | TExpr::Instanceof { expr, .. } => expression(expr, d),

@@ -94,6 +94,7 @@ fn copy_safe(t: Option<&TypeRef>) -> bool {
 }
 #[derive(Clone, PartialEq)]
 struct Signature {
+    param_names: Vec<String>,
     is_static: bool,
     is_async: bool,
     type_params: Vec<String>,
@@ -232,6 +233,7 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
                 c.signatures.insert(
                     f.name.to_ascii_lowercase(),
                     Signature {
+                        param_names: f.params.iter().map(|p| p.name.clone()).collect(),
                         is_static: true,
                         is_async: f.is_async,
                         type_params: f.type_params.iter().map(|(n, _)| n.clone()).collect(),
@@ -257,6 +259,7 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
                         m.name.to_ascii_lowercase()
                     ),
                     Signature {
+                        param_names: m.params.iter().map(|p| p.name.clone()).collect(),
                         is_static: m.is_static,
                         is_async: m.is_async,
                         type_params: m.type_params.iter().map(|(n, _)| n.clone()).collect(),
@@ -1398,7 +1401,17 @@ impl Checker {
     ) -> BTreeMap<String, TypeRef> {
         let base = self.loans.len();
         let mut bindings = BTreeMap::new();
-        for (i, arg) in args.iter().enumerate() {
+        for (position, original) in args.iter().enumerate() {
+            let (i, arg) = if let Expr::NamedArgument { name, value, .. } = original {
+                (
+                    signature
+                        .and_then(|s| s.param_names.iter().position(|n| n == name))
+                        .unwrap_or(usize::MAX),
+                    value.as_ref(),
+                )
+            } else {
+                (position, original)
+            };
             let allowed = self.borrow_argument;
             self.borrow_argument = Some(unparen(arg).span());
             let v = self.expr(arg);
@@ -1653,7 +1666,7 @@ impl Checker {
                 ..Value::plain(Some(TypeRef::Mixed))
             },
             Expr::Var(n, sp) => self.read(n, *sp),
-            Expr::Paren(e, _) => self.expr(e),
+            Expr::NamedArgument { value: e, .. } | Expr::Paren(e, _) => self.expr(e),
             Expr::Call {
                 callee,
                 fallback,
@@ -2529,9 +2542,10 @@ fn erase_expr(e: &mut Expr) {
                 erase_expr(a);
             }
         }
-        Expr::Unary { expr, .. } | Expr::Paren(expr, _) | Expr::Instanceof { expr, .. } => {
-            erase_expr(expr)
-        }
+        Expr::NamedArgument { value: expr, .. }
+        | Expr::Unary { expr, .. }
+        | Expr::Paren(expr, _)
+        | Expr::Instanceof { expr, .. } => erase_expr(expr),
         Expr::Binary { lhs, rhs, .. } => {
             erase_expr(lhs);
             erase_expr(rhs);

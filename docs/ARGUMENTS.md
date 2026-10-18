@@ -1,6 +1,6 @@
 # Native argument binding
 
-Positional calls support required and optional parameters on native functions,
+Positional and named calls support required and optional parameters on native functions,
 methods, constructors, invokable objects, closures and arrow functions, including
 generic specializations and async functions/closures.
 
@@ -10,6 +10,7 @@ function greet(string $name = "world", string $suffix = "!"): string {
 }
 echo greet();
 echo greet("native", ".");
+echo greet(suffix: ".", name: "native");
 ```
 
 Default expressions currently support constant scalar/array expressions.
@@ -40,8 +41,25 @@ move/borrow checks still apply. Async calls retain their existing lazy-task
 contract and preserve argument storage across suspension. Native worker/server
 callback adapters pass full argument presence through the optional-argument ABI.
 
-Named arguments, variadic parameters and argument unpacking remain unfinished.
-They are explicit errors; optional-argument support does not imply them.
+Named labels are case-sensitive and may use keyword spellings. Supplied expressions
+run in source order, including assignments and awaited arguments; native parameter
+positions do not change that order. Array arguments snapshot when evaluated.
+Positional arguments must precede named arguments. Unknown/duplicate names,
+missing required values and conflicting positional/named assignments are errors.
+Native virtual named calls currently require matching parameter names across all
+possible overrides; an ambiguous hierarchy produces E0312. Direct construction
+and class-qualified calls bind to their selected declaration.
+
+Native builtins accept named operands from their supported PHP 8.4 signatures,
+for example `strlen(string: "bytes")`, `substr(offset: 1, string: "abcdef")`
+and `array_slice(preserve_keys: true, offset: 1, array: $values)`. Skipped native
+length defaults keep their omitted-length behavior. Missing APIs/options are not
+added by named binding. Unknown named variadic operands of `sprintf`/`printf` and
+`array_merge` are rejected, as in PHP. PXR async/I/O/task intrinsics and explicit
+PHP interpreter boundaries retain their positional-call contract for now.
+
+Variadic parameters and argument unpacking remain unfinished and explicit errors.
+See [the named-argument example](../examples/named_arguments.php).
 See [M10 status](M10.md) and [the runnable example](../examples/optional_arguments.php).
 
 Reference: [PHP function arguments](https://www.php.net/manual/en/functions.arguments.php).

@@ -267,6 +267,11 @@ pub enum Callee {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TExpr {
+    /// Values occupy ABI parameter positions; evaluate them in source order.
+    Ordered {
+        expr: Box<TExpr>,
+        order: Vec<usize>,
+    },
     /// Internal optional-argument storage, overwritten by the callee before use.
     Missing(Ty),
     Effect {
@@ -384,6 +389,7 @@ impl TExpr {
             TExpr::Effect { ty, .. } => ty.clone(),
             TExpr::Deferred => Ty::Infer,
             TExpr::Pass { expr, .. } => expr.ty(),
+            TExpr::Ordered { expr, .. } => expr.ty(),
             TExpr::Coerce { ty, .. } | TExpr::Missing(ty) => ty.clone(),
             TExpr::Int(_) => Ty::Int,
             TExpr::Float(_) => Ty::Float,
@@ -4077,6 +4083,14 @@ impl Analyzer {
                     ty,
                 })
             }
+            ast::Expr::NamedArgument { span, .. } => {
+                self.diags.emit(
+                    Diagnostic::error("named arguments are not supported by this callable yet")
+                        .with_code("E0312")
+                        .with_span(*span),
+                );
+                None
+            }
             ast::Expr::IntLit(v, _) => Some(TExpr::Int(*v)),
             ast::Expr::FloatLit(v, _) => Some(TExpr::Float(*v)),
             ast::Expr::StrLit(s, _) => Some(TExpr::Str(s.clone())),
@@ -4476,6 +4490,9 @@ impl Analyzer {
                     return None;
                 }
 
+                if !self.check_named_dispatch(&class, &method, args, *span) {
+                    return None;
+                }
                 if !method.ast_method.type_params.is_empty() {
                     if method.ast_method.is_static {
                         self.diags.emit(
@@ -4505,25 +4522,9 @@ impl Analyzer {
                     return None;
                 }
 
-                let supplied = args.len();
-                let completed =
-                    self.complete_arguments(args, &method.ast_method.params, *span, "E0207")?;
-                let args = completed.as_slice();
-                if args.len() != method.params.len() {
-                    self.diags.emit(
-                        Diagnostic::error(format!(
-                            "method `{}::{name}` expects {} argument{}, found {}",
-                            class.name,
-                            method.params.len(),
-                            if method.params.len() == 1 { "" } else { "s" },
-                            args.len()
-                        ))
-                        .with_code("E0207")
-                        .with_span(*span),
-                    );
-                    return None;
-                }
-
+                let binding =
+                    self.bind_arguments(args, &method.ast_method.params, *span, "E0207")?;
+                let args = binding.values.as_slice();
                 if method.ast_method.is_static {
                     self.diags.emit(
                         Diagnostic::error(
@@ -4562,57 +4563,61 @@ impl Analyzer {
                     method.mangled.clone()
                 };
 
-                let mut typed_args = vec![base_expr];
-                let mut actual_tys = vec![Ty::Named(class.name.clone())];
+                let mut typed_args = vec![None; args.len() + 1];
+                typed_args[0] = Some(base_expr);
                 let mut formal_params = vec![Ty::Named(class.name.clone())];
                 formal_params.extend(method.params.iter().cloned());
-
-                for (arg, formal_ty) in args.iter().zip(method.params.iter()) {
-                    let t_arg = self.infer_for_type(arg, ctx, formal_ty)?;
-                    let aty = t_arg.ty();
-                    if !self.is_assignable(&aty, formal_ty) {
+                for &index in &binding.order {
+                    let arg = &args[index];
+                    let formal_ty = &method.params[index];
+                    let value = self.infer_for_type(arg, ctx, formal_ty)?;
+                    if !self.is_assignable(&value.ty(), formal_ty) {
                         self.diags.emit(
                             Diagnostic::error(format!(
-                                "argument type mismatch in call to `{}::{name}`: expected `{formal_ty}`, found `{aty}`",
-                                class.name
+                                "expected `{formal_ty}`, found `{}` in method `{name}`",
+                                value.ty()
                             ))
                             .with_code("E0208")
                             .with_span(arg.span()),
                         );
                         return None;
                     }
-                    actual_tys.push(aty);
-                    typed_args.push(t_arg);
+                    typed_args[index + 1] = Some(if binding.present[index] {
+                        value
+                    } else {
+                        TExpr::Missing(formal_ty.clone())
+                    });
                 }
-
-                for i in supplied..args.len() {
-                    typed_args[i + 1] = TExpr::Missing(method.params[i].clone());
-                    actual_tys[i + 1] = method.params[i].clone();
-                }
-                arguments::append_presence(
+                let mut typed_args: Vec<_> = typed_args.into_iter().map(Option::unwrap).collect();
+                let mut actual_tys = typed_args.iter().map(TExpr::ty).collect();
+                binding.append_presence(
                     &method.ast_method.params,
-                    supplied,
                     &mut typed_args,
                     &mut actual_tys,
                 );
-                if arguments::has_defaults(&method.ast_method.params) {
+                let optional = arguments::has_defaults(&method.ast_method.params);
+                if optional {
                     formal_params.push(Ty::array(Ty::Bool));
                 }
-                Some(TExpr::Call {
-                    callee: Callee::User {
-                        mangled: target_mangled,
-                        name: format!("{}::{name}", class.name),
-                        params: formal_params,
+                Some(binding.wrap(
+                    TExpr::Call {
+                        callee: Callee::User {
+                            mangled: target_mangled,
+                            name: format!("{}::{name}", class.name),
+                            params: formal_params,
+                        },
+                        ret: if method.ast_method.is_async {
+                            Ty::Task(Box::new(method.ret))
+                        } else {
+                            method.ret
+                        },
+                        args: typed_args,
+                        arg_tys: actual_tys,
+                        span: *span,
                     },
-                    ret: if method.ast_method.is_async {
-                        Ty::Task(Box::new(method.ret))
-                    } else {
-                        method.ret
-                    },
-                    args: typed_args,
-                    arg_tys: actual_tys,
-                    span: *span,
-                })
+                    1,
+                    optional,
+                ))
             }
             ast::Expr::New {
                 class_name,
@@ -4645,6 +4650,7 @@ impl Analyzer {
                     return None;
                 }
                 let ctor = class.methods.get("__construct").cloned();
+                let mut constructor_binding = None;
                 let ctor_info = if let Some(ctor) = &ctor {
                     if !self.check_member_visibility(
                         &ctor.declaring_class,
@@ -4655,57 +4661,43 @@ impl Analyzer {
                         return None;
                     }
 
-                    let supplied = args.len();
-                    let completed =
-                        self.complete_arguments(args, &ctor.ast_method.params, *span, "E0207")?;
-                    let args = completed.as_slice();
-                    if args.len() != ctor.params.len() {
-                        self.diags.emit(
-                            Diagnostic::error(format!(
-                                "constructor `{}::__construct` expects {} argument{}, found {}",
-                                class.name,
-                                ctor.params.len(),
-                                if ctor.params.len() == 1 { "" } else { "s" },
-                                args.len()
-                            ))
-                            .with_code("E0207")
-                            .with_span(*span),
-                        );
-                        return None;
-                    }
-
-                    let mut typed_args = Vec::new();
-                    let mut actual_tys = Vec::new();
-                    for (arg, formal_ty) in args.iter().zip(ctor.params.iter()) {
-                        let t_arg = self.infer_for_type(arg, ctx, formal_ty)?;
-                        let aty = t_arg.ty();
-                        if !self.is_assignable(&aty, formal_ty) {
+                    let binding =
+                        self.bind_arguments(args, &ctor.ast_method.params, *span, "E0207")?;
+                    let args = binding.values.as_slice();
+                    let mut typed_args = vec![None; args.len()];
+                    for &index in &binding.order {
+                        let arg = &args[index];
+                        let formal_ty = &ctor.params[index];
+                        let value = self.infer_for_type(arg, ctx, formal_ty)?;
+                        if !self.is_assignable(&value.ty(), formal_ty) {
                             self.diags.emit(
                                 Diagnostic::error(format!(
-                                    "argument type mismatch in call to `{}::__construct`: expected `{formal_ty}`, found `{aty}`",
-                                    class.name
+                                    "expected `{formal_ty}`, found `{}` in constructor",
+                                    value.ty()
                                 ))
                                 .with_code("E0208")
                                 .with_span(arg.span()),
                             );
                             return None;
                         }
-                        actual_tys.push(formal_ty.clone());
-                        typed_args.push(TExpr::Coerce {
-                            expr: Box::new(t_arg),
-                            ty: formal_ty.clone(),
+                        typed_args[index] = Some(if binding.present[index] {
+                            TExpr::Coerce {
+                                expr: Box::new(value),
+                                ty: formal_ty.clone(),
+                            }
+                        } else {
+                            TExpr::Missing(formal_ty.clone())
                         });
                     }
-                    for i in supplied..args.len() {
-                        typed_args[i] = TExpr::Missing(ctor.params[i].clone());
-                        actual_tys[i] = ctor.params[i].clone();
-                    }
-                    arguments::append_presence(
+                    let mut typed_args: Vec<_> =
+                        typed_args.into_iter().map(Option::unwrap).collect();
+                    let mut actual_tys = typed_args.iter().map(TExpr::ty).collect();
+                    binding.append_presence(
                         &ctor.ast_method.params,
-                        supplied,
                         &mut typed_args,
                         &mut actual_tys,
                     );
+                    constructor_binding = Some(binding);
                     Some((ctor.mangled.clone(), typed_args, actual_tys))
                 } else {
                     if !args.is_empty() {
@@ -4754,13 +4746,23 @@ impl Analyzer {
                     }
                 }
 
-                Some(TExpr::New {
+                let expression = TExpr::New {
                     class_id: class.class_id,
                     class_name: class.name.clone(),
                     num_props: class.properties.len() as u32,
                     prop_defaults,
                     ctor: ctor_info,
                     ty: Ty::Named(class.name.clone()),
+                };
+                Some(if let Some(binding) = constructor_binding {
+                    binding.wrap(
+                        expression,
+                        0,
+                        ctor.as_ref()
+                            .is_some_and(|c| arguments::has_defaults(&c.ast_method.params)),
+                    )
+                } else {
+                    expression
                 })
             }
             ast::Expr::Instanceof {
@@ -4998,7 +5000,6 @@ impl Analyzer {
             return None;
         }
         let mut typed = Vec::new();
-        let mut actual = Vec::new();
         let mut formal = Vec::new();
         if !method.ast_method.is_static {
             let Some(slot) = ctx.slot_of("this") else {
@@ -5025,7 +5026,6 @@ impl Analyzer {
                 slot,
                 ty: this_ty.clone(),
             });
-            actual.push(this_ty);
             formal.push(Ty::Named(class.name.clone()));
         }
         if !method.ast_method.type_params.is_empty() {
@@ -5040,50 +5040,62 @@ impl Analyzer {
                 false,
             );
         }
-        let supplied = args.len();
-        let completed = self.complete_arguments(args, &method.ast_method.params, span, "E0207")?;
-        let args = completed.as_slice();
+        let binding = self.bind_arguments(args, &method.ast_method.params, span, "E0207")?;
+        let args = binding.values.as_slice();
+        let offset = typed.len();
+        let mut values: Vec<Option<TExpr>> = typed
+            .into_iter()
+            .map(Some)
+            .chain((0..args.len()).map(|_| None))
+            .collect();
         formal.extend(method.params.clone());
-        for (arg, want) in args.iter().zip(&method.params) {
+        for &index in &binding.order {
+            let arg = &args[index];
+            let want = &method.params[index];
             let value = self.infer_for_type(arg, ctx, want)?;
-            let ty = value.ty();
-            if !self.is_assignable(&ty, want) {
+            if !self.is_assignable(&value.ty(), want) {
                 self.diags.emit(
                     Diagnostic::error(format!(
-                        "expected `{want}`, found `{ty}` in class-qualified call"
+                        "expected `{want}`, found `{}` in class-qualified call",
+                        value.ty()
                     ))
                     .with_code("E0208")
                     .with_span(arg.span()),
                 );
                 return None;
             }
-            typed.push(value);
-            actual.push(ty);
+            values[offset + index] = Some(if binding.present[index] {
+                value
+            } else {
+                TExpr::Missing(want.clone())
+            });
         }
-        let offset = usize::from(!method.ast_method.is_static);
-        for i in supplied..args.len() {
-            typed[i + offset] = TExpr::Missing(method.params[i].clone());
-            actual[i + offset] = method.params[i].clone();
-        }
-        arguments::append_presence(&method.ast_method.params, supplied, &mut typed, &mut actual);
-        if arguments::has_defaults(&method.ast_method.params) {
+        let mut typed: Vec<_> = values.into_iter().map(Option::unwrap).collect();
+        let mut actual = typed.iter().map(TExpr::ty).collect();
+        binding.append_presence(&method.ast_method.params, &mut typed, &mut actual);
+        let optional = arguments::has_defaults(&method.ast_method.params);
+        if optional {
             formal.push(Ty::array(Ty::Bool));
         }
-        Some(TExpr::Call {
-            callee: Callee::User {
-                mangled: method.mangled,
-                name: format!("{}::{name}", class.name),
-                params: formal,
+        Some(binding.wrap(
+            TExpr::Call {
+                callee: Callee::User {
+                    mangled: method.mangled,
+                    name: format!("{}::{name}", class.name),
+                    params: formal,
+                },
+                ret: if method.ast_method.is_async {
+                    Ty::Task(Box::new(method.ret))
+                } else {
+                    method.ret
+                },
+                args: typed,
+                arg_tys: actual,
+                span,
             },
-            ret: if method.ast_method.is_async {
-                Ty::Task(Box::new(method.ret))
-            } else {
-                method.ret
-            },
-            args: typed,
-            arg_tys: actual,
-            span,
-        })
+            offset,
+            optional,
+        ))
     }
 
     fn infer_binary(
@@ -6312,43 +6324,33 @@ impl Analyzer {
                 );
                 return None;
             }
-            let supplied = args.len();
-            let completed = self.complete_arguments(args, &sig.declarations, span, "E0230")?;
-            let args = completed.as_slice();
-            if args.len() != sig.params.len() {
-                self.diags.emit(
-                    Diagnostic::error(format!(
-                        "function `{}` expects {} argument(s), but {} were given",
-                        sig.display,
-                        sig.params.len(),
-                        args.len()
-                    ))
-                    .with_code("E0230")
-                    .with_span(span),
-                );
-                return None;
-            }
-            let mut targs = Vec::new();
-            let mut arg_tys = Vec::new();
+            let binding = self.bind_arguments(args, &sig.declarations, span, "E0230")?;
+            let args = binding.values.as_slice();
+            let mut targs = vec![None; sig.params.len()];
             let mut ok = true;
-            for (i, (a, pty)) in args.iter().zip(sig.params.iter()).enumerate() {
+            for &i in &binding.order {
+                let a = &args[i];
+                let pty = &sig.params[i];
                 match self.infer_for_type(a, ctx, pty) {
-                    Some(t) => {
-                        let at = t.ty();
-                        if !self.is_assignable(&at, pty) {
+                    Some(value) => {
+                        if !self.is_assignable(&value.ty(), pty) {
                             self.diags.emit(
                                 Diagnostic::error(format!(
-                                    "argument {} of `{}` expects `{pty}`, found `{at}`",
+                                    "argument {} of `{}` expects `{pty}`, found `{}`",
                                     i + 1,
-                                    sig.display
+                                    sig.display,
+                                    value.ty()
                                 ))
                                 .with_code("E0231")
                                 .with_span(a.span()),
                             );
                             ok = false;
                         }
-                        arg_tys.push(at);
-                        targs.push(t);
+                        targs[i] = Some(if binding.present[i] {
+                            value
+                        } else {
+                            TExpr::Missing(pty.clone())
+                        });
                     }
                     None => ok = false,
                 }
@@ -6356,31 +6358,40 @@ impl Analyzer {
             if !ok {
                 return None;
             }
-            for i in supplied..args.len() {
-                targs[i] = TExpr::Missing(sig.params[i].clone());
-                arg_tys[i] = sig.params[i].clone();
-            }
-            arguments::append_presence(&sig.declarations, supplied, &mut targs, &mut arg_tys);
+            let mut targs: Vec<_> = targs.into_iter().map(Option::unwrap).collect();
+            let mut arg_tys = targs.iter().map(TExpr::ty).collect();
+            binding.append_presence(&sig.declarations, &mut targs, &mut arg_tys);
             let abi_params = sig.abi_params();
-            return Some(TExpr::Call {
-                callee: Callee::User {
-                    mangled: sig.mangled,
-                    name: sig.display,
-                    params: abi_params,
+            let optional = arguments::has_defaults(&sig.declarations);
+            return Some(binding.wrap(
+                TExpr::Call {
+                    callee: Callee::User {
+                        mangled: sig.mangled,
+                        name: sig.display,
+                        params: abi_params,
+                    },
+                    ret: if sig.is_async {
+                        Ty::Task(Box::new(sig.ret))
+                    } else {
+                        sig.ret
+                    },
+                    args: targs,
+                    arg_tys,
+                    span,
                 },
-                ret: if sig.is_async {
-                    Ty::Task(Box::new(sig.ret))
-                } else {
-                    sig.ret
-                },
-                args: targs,
-                arg_tys,
-                span,
-            });
+                0,
+                optional,
+            ));
         }
 
         // Builtin?
         if let Some(kind) = Builtin::from_name(&key) {
+            if args
+                .iter()
+                .any(|a| matches!(a, ast::Expr::NamedArgument { .. }))
+            {
+                return self.infer_named_builtin(kind, callee, callee_span, args, span, ctx);
+            }
             return self.infer_builtin(kind, callee, callee_span, args, span, ctx);
         }
 
@@ -6457,9 +6468,25 @@ impl Analyzer {
         span: Span,
         ctx: &mut FnCtx,
     ) -> Option<TExpr> {
+        self.infer_builtin_order(kind, callee, callee_span, args, span, ctx, None)
+    }
+    fn infer_builtin_order(
+        &mut self,
+        kind: Builtin,
+        callee: &str,
+        callee_span: Span,
+        args: &[ast::Expr],
+        span: Span,
+        ctx: &mut FnCtx,
+        order: Option<&[usize]>,
+    ) -> Option<TExpr> {
         let name = kind.name();
-        let mut targs = Vec::new();
-        for (index, a) in args.iter().enumerate() {
+        let indices: Vec<_> = order
+            .map(|o| o.to_vec())
+            .unwrap_or_else(|| (0..args.len()).collect());
+        let mut targs = vec![None; args.len()];
+        for index in indices {
+            let a = &args[index];
             let value = if let Some(expected) = self
                 .compat
                 .then(|| compat::builtin_parameter(kind, index, args.len()))
@@ -6469,8 +6496,9 @@ impl Analyzer {
             } else {
                 self.infer(a, ctx)?
             };
-            targs.push(value);
+            targs[index] = Some(value);
         }
+        let targs: Vec<_> = targs.into_iter().map(Option::unwrap).collect();
         let atys: Vec<Ty> = targs.iter().map(|t| t.ty()).collect();
         if let Some(task) = atys
             .iter()

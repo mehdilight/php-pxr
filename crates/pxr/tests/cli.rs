@@ -5405,3 +5405,164 @@ echo value()[0], ":", value(["explicit"])[0], ":", (new OptionalUntyped())->valu
         assert_eq!(run.stdout, String::from_utf8_lossy(&php.stdout));
     }
 }
+
+#[test]
+fn named_arguments_preserve_evaluation_order_defaults_and_snapshots() {
+    assert_matches_php(
+        "named_native_order",
+        r#"<?php
+function mark(int $number): int {echo $number; return $number;}
+function pair(int $first=10,int $second=20): string {return $first.":".$second;}
+function snapshot(int $marker,mixed $values): string {return $marker.":".$values[0];}
+class NamedBox {
+    public int $first; public int $second;
+    public function __construct(int $first=10,int $second=20) {$this->first=$first;$this->second=$second;}
+    public function pair(int $first=10,int $second=20): string {return $first.":".$second;}
+    public static function staticPair(int $first=10,int $second=20): string {return $first.":".$second;}
+    public function text(string $string="default"): string {return $string;}
+}
+function receiver(): NamedBox {echo "R"; return new NamedBox();}
+echo "=",pair(second:mark(2),first:mark(1)),"\n";
+echo "=",pair(second:mark(3)),"\n";
+echo "=",receiver()->pair(second:mark(5),first:mark(4)),"\n";
+$box=new NamedBox(second:mark(7),first:mark(6)); echo "=",$box->first,":",$box->second,"\n";
+echo "=",NamedBox::staticPair(second:mark(9),first:mark(8)),"\n";
+$callback=fn(int $first=10,int $second=20): string=>$first.":".$second;
+echo "=",$callback(second:mark(11),first:mark(10)),"\n";
+$values=[7]; echo snapshot(values:$values,marker:($values[0]=99)),":",$values[0],"\n";
+echo pair(second:($assigned=12),first:$assigned),"\n";
+function keyword(int $Default=7): int {return $Default;}
+echo keyword(Default:8),"\n";
+echo "{$box->text(string: "kept")}\n";
+"#,
+    );
+}
+
+#[test]
+fn named_arguments_support_generics_traits_interfaces_and_borrows() {
+    if !have_cc() {
+        return;
+    }
+    let source = r#"<?php
+function choose<T>(T $first,T $second): T {return $first;}
+function appendNamed(&mut array<int> $values,int $extra=7): void {$values[]=$extra;}
+interface NamedContract {public function value(int $first=1,int $second=2): int;}
+trait NamedTrait {public function value(int $first=3,int $second=4): int {return $first+$second;}}
+class NamedImplementation implements NamedContract {use NamedTrait;}
+class NamedGeneric<T> {
+    public function choose<U>(U $first,U $second): U {return $first;}
+    public static function callback() {return static fn(?T $value=null,int $number=9): string=>($value??"empty").":".$number;}
+}
+function dispatch(NamedContract $object): int {return $object->value(second:8);}
+$generic=new NamedGeneric<string>(); $callback=NamedGeneric<string>::callback();
+echo choose(second:2,first:1),":",choose<string>(second:"b",first:"a"),":",$generic->choose(second:4,first:3),":",$callback(number:10),":",dispatch(new NamedImplementation()),"\n";
+$values: owned<array<int>>=[1]; appendNamed(extra:13,values:&mut $values); echo $values[1],"\n"; drop($values);
+"#;
+    let path = temp_php("named_native_generic", source);
+    let run = run_ok(&["run", path.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "1:a:3:empty:10:11\n13\n");
+}
+
+#[test]
+fn named_argument_binding_errors_are_explicit() {
+    for (name,source,diagnostic) in [
+        ("unknown","function f(int $value): int {return $value;} echo f(other:7);","E0312"),
+        ("case","function f(int $value): int {return $value;} echo f(Value:7);","E0312"),
+        ("duplicate","function f(int $value): int {return $value;} echo f(value:1,value:2);","E0312"),
+        ("positional-duplicate","function f(int $value): int {return $value;} echo f(1,value:2);","E0312"),
+        ("positional-after","function f(int $a,int $b): int {return $a;} echo f(a:1,2);","E0100"),
+        ("missing","function f(int $a,int $b=2): int {return $a;} echo f(b:7);","E0230"),
+        ("renamed-override","class A {public function f(int $value): int {return $value;}} class B extends A {public function f(int $other): int {return $other;}} function f(A $a): int {return $a->f(value:7);}","E0312"),
+        ("borrow-escape","function f(array<int> $values,int $extra): void {} $x: owned<array<int>>=[1]; f(extra:7,values:&$x);","E0290"),
+    ] {
+        let path=temp_php(&format!("named_error_{name}"),&format!("<?php {source}"));
+        let run=run_ok(&["check",path.to_str().unwrap()]);
+        assert_ne!(run.code,0,"{name}");
+        assert!(run.stderr.contains(diagnostic),"{name}: {}",run.stderr);
+    }
+}
+
+#[test]
+fn named_builtin_operands_match_php_including_skipped_defaults() {
+    assert_matches_php(
+        "named_builtin_operands",
+        r#"<?php
+function text(string $id,string $value): string {echo $id; return $value;}
+echo "=",str_replace(subject:text("S","aba"),replace:text("R","x"),search:text("Q","a")),"\n";
+echo strlen(string:"bytes"),":",substr(offset:1,string:"abcdef",length:3),":",str_pad(pad_type:0,length:5,string:"x"),"\n";
+$values=[5=>"a",9=>"b",12=>"c"];
+$slice=array_slice(preserve_keys:true,offset:1,array:$values);
+foreach($slice as $key=>$value) {echo $key,"=",$value,";";} echo "\n";
+echo substr_count(length:3,needle:"a",haystack:"ababa"),":",implode(array:["a","b"],separator:"-"),":",is_int(value:7),"\n";
+echo sprintf(format:"plain"),"\n";
+"#,
+    );
+}
+
+#[test]
+fn named_argument_borrows_cannot_cross_later_awaits() {
+    let path = temp_php(
+        "named_borrow_await",
+        r#"<?php
+async function number(): int {return 7;}
+function append(&mut array<int> $values,int $extra): void {$values[]=$extra;}
+async function main(): void {$values: owned<array<int>>=[1]; append(values:&mut $values,extra:await number()); drop($values);}
+"#,
+    );
+    let run = run_ok(&["check", path.to_str().unwrap()]);
+    assert_ne!(run.code, 0);
+    assert!(run.stderr.contains("E0290"), "{}", run.stderr);
+}
+
+#[test]
+fn named_keyword_parameters_keep_case_and_module_source_offsets() {
+    if !have_cc() {
+        return;
+    }
+    let entry = temp_php(
+        "named_keyword_modules",
+        r#"<?php
+require_once __DIR__.'/dependency.php';
+echo Imported\value(Default:8),"\n";
+"#,
+    );
+    std::fs::write(
+        entry.parent().unwrap().join("dependency.php"),
+        r#"<?php
+namespace Imported;
+function value(int $Default=7): int {return $Default+strlen(string:"word");}
+"#,
+    )
+    .unwrap();
+    let run = run_ok(&["run", entry.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "12\n");
+}
+
+#[test]
+fn named_arguments_work_with_checked_compatibility_storage() {
+    if !have_cc() {
+        return;
+    }
+    let source = r#"<?php
+function identity($value) {return $value;}
+function pair(int $first=10,int $second=20): string {return $first.":".$second;}
+$callback=fn($first=10,$second=20)=>$first.":".$second;
+echo pair(second:identity(2),first:identity(1)),":",$callback(second:8),"\n";
+$value=identity("word"); if(is_string(value:$value)) {echo strlen(string:$value),"\n";}
+"#;
+    let path = temp_php("named_compatibility", source);
+    let run = run_ok(&["run", "--compat", path.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "1:2:10:8\n4\n");
+    if have_php() {
+        let php = Command::new("php").arg(path).output().unwrap();
+        assert!(
+            php.status.success(),
+            "{}",
+            String::from_utf8_lossy(&php.stderr)
+        );
+        assert_eq!(run.stdout, String::from_utf8_lossy(&php.stdout));
+    }
+}

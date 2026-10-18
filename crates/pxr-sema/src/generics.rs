@@ -165,6 +165,7 @@ pub(super) fn hex_name(name: &str) -> String {
 }
 
 struct GenericCall {
+    order: Vec<usize>,
     deferred: bool,
     key: (String, Vec<Ty>),
     signature: Signature,
@@ -175,6 +176,7 @@ struct GenericCall {
 impl GenericCall {
     fn deferred(span: Span) -> Self {
         Self {
+            order: Vec::new(),
             deferred: true,
             key: (String::new(), Vec::new()),
             signature: Signature {
@@ -194,21 +196,24 @@ impl GenericCall {
     fn expression(self, span: Span) -> TExpr {
         let abi_params = self.signature.abi_params();
         let arg_tys = self.values.iter().map(TExpr::ty).collect();
-        TExpr::Call {
-            callee: Callee::User {
-                mangled: self.signature.mangled,
-                name: self.signature.display,
-                params: abi_params,
+        arguments::ordered(
+            TExpr::Call {
+                callee: Callee::User {
+                    mangled: self.signature.mangled,
+                    name: self.signature.display,
+                    params: abi_params,
+                },
+                ret: if self.signature.is_async {
+                    Ty::Task(Box::new(self.signature.ret))
+                } else {
+                    self.signature.ret
+                },
+                args: self.values,
+                arg_tys,
+                span,
             },
-            ret: if self.signature.is_async {
-                Ty::Task(Box::new(self.signature.ret))
-            } else {
-                self.signature.ret
-            },
-            args: self.values,
-            arg_tys,
-            span,
-        }
+            self.order,
+        )
     }
 }
 
@@ -374,27 +379,34 @@ impl Analyzer {
                 .unwrap_or_else(|| mangle_method(&method.declaring_class, &member))
         };
         let mut values = prepared.values;
+        let mut order = prepared.order;
         let mut params = prepared.signature.abi_params();
         if let Some(receiver) = receiver {
             params.insert(0, Ty::Named(class.name.clone()));
             values.insert(0, receiver);
+            order = std::iter::once(0)
+                .chain(order.into_iter().map(|i| i + 1))
+                .collect();
         }
         let arg_tys = values.iter().map(TExpr::ty).collect();
-        Some(TExpr::Call {
-            callee: Callee::User {
-                mangled,
-                name: prepared.signature.display,
-                params,
+        Some(arguments::ordered(
+            TExpr::Call {
+                callee: Callee::User {
+                    mangled,
+                    name: prepared.signature.display,
+                    params,
+                },
+                ret: if prepared.signature.is_async {
+                    Ty::Task(Box::new(prepared.signature.ret))
+                } else {
+                    prepared.signature.ret
+                },
+                args: values,
+                arg_tys,
+                span,
             },
-            ret: if prepared.signature.is_async {
-                Ty::Task(Box::new(prepared.signature.ret))
-            } else {
-                prepared.signature.ret
-            },
-            args: values,
-            arg_tys,
-            span,
-        })
+            order,
+        ))
     }
 
     pub(super) fn is_compiled_function(&self, name: &str) -> bool {
@@ -441,22 +453,8 @@ impl Analyzer {
         span: Span,
         ctx: &mut FnCtx,
     ) -> Option<GenericCall> {
-        let supplied = args.len();
-        let completed = self.complete_arguments(args, &declaration.params, span, "E0230")?;
-        let args = completed.as_slice();
-        if args.len() != declaration.params.len() {
-            self.diags.emit(
-                Diagnostic::error(format!(
-                    "function `{}` expects {} argument(s), but {} were given",
-                    declaration.name,
-                    declaration.params.len(),
-                    args.len()
-                ))
-                .with_code("E0230")
-                .with_span(span),
-            );
-            return None;
-        }
+        let binding = self.bind_arguments(args, &declaration.params, span, "E0230")?;
+        let args = binding.values.as_slice();
         if !type_args.is_empty() && type_args.len() != declaration.type_params.len() {
             self.diags.emit(
                 Diagnostic::error(format!(
@@ -488,8 +486,10 @@ impl Analyzer {
             return None;
         }
 
-        let mut values = Vec::new();
-        for (parameter, argument) in declaration.params.iter().zip(args) {
+        let mut values = vec![None; args.len()];
+        for &index in &binding.order {
+            let parameter = &declaration.params[index];
+            let argument = &args[index];
             let pattern = parameter.ty.as_ref()?;
             let value = if pattern_is_bound(pattern, &bindings) {
                 let expected = self.resolve_type_with(pattern, &bindings);
@@ -527,8 +527,9 @@ impl Analyzer {
                     return None;
                 }
             }
-            values.push(value);
+            values[index] = Some(value);
         }
+        let mut values: Vec<_> = values.into_iter().map(Option::unwrap).collect();
         let mut concrete = Vec::new();
         for (name, _) in &declaration.type_params {
             let Some(ty) = bindings.get(name) else {
@@ -623,17 +624,19 @@ impl Analyzer {
                 return None;
             }
         }
-        for i in supplied..values.len() {
-            values[i] = TExpr::Missing(signature.params[i].clone());
+        for (index, present) in binding.present.iter().enumerate() {
+            if !present {
+                values[index] = TExpr::Missing(signature.params[index].clone());
+            }
         }
         let mut actual_types = values.iter().map(TExpr::ty).collect();
-        arguments::append_presence(
-            &declaration.params,
-            supplied,
-            &mut values,
-            &mut actual_types,
-        );
+        binding.append_presence(&declaration.params, &mut values, &mut actual_types);
+        let mut order = binding.order;
+        if arguments::has_defaults(&declaration.params) {
+            order.push(declaration.params.len());
+        }
         Some(GenericCall {
+            order,
             deferred: false,
             key,
             signature,

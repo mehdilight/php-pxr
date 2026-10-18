@@ -610,6 +610,32 @@ impl Lowerer {
 
     fn lower_expr(&mut self, e: &TExpr) -> Value {
         match e {
+            TExpr::Ordered { expr, order } => match expr.as_ref() {
+                TExpr::Call {
+                    callee,
+                    ret,
+                    args,
+                    arg_tys,
+                    ..
+                } => self.lower_call_order(callee, ret, args, arg_tys, Some(order)),
+                TExpr::New {
+                    class_id,
+                    class_name,
+                    num_props,
+                    prop_defaults,
+                    ctor,
+                    ty,
+                } => self.lower_new(
+                    *class_id,
+                    class_name,
+                    *num_props,
+                    prop_defaults,
+                    ctor,
+                    ty,
+                    Some(order),
+                ),
+                _ => unreachable!("only calls and construction carry argument order"),
+            },
             TExpr::Missing(ty) => match ty {
                 Ty::Int => self.emit_const(Literal::Int(0)),
                 Ty::Float => self.emit_const(Literal::Float(0.0)),
@@ -740,46 +766,15 @@ impl Lowerer {
                 prop_defaults,
                 ctor,
                 ty,
-            } => {
-                let cid_val = self.emit_const(Literal::Int(*class_id as i64));
-                let name_val = self.emit_const(Literal::Str(class_name.as_bytes().to_vec()));
-                let num_props_val = self.emit_const(Literal::Int(*num_props as i64));
-                let obj = self.rt_call(
-                    "pxr_object_new",
-                    vec![cid_val, name_val, num_props_val],
-                    ty.clone(),
-                );
-                for (slot_idx, def_expr) in prop_defaults {
-                    let s_idx = self.emit_const(Literal::Int(*slot_idx as i64));
-                    let def_val = self.lower_expr(def_expr);
-                    let def_ty = def_expr.ty();
-                    let vtag = self.emit_const(Literal::Int(Self::tag_of(&def_ty)));
-                    let bits = self.encode_bits(def_val, &def_ty);
-                    self.rt_call(
-                        "pxr_object_set_bits",
-                        vec![obj, s_idx, vtag, bits],
-                        Ty::Void,
-                    );
-                }
-                if let Some((ctor_mangled, ctor_args, _)) = ctor {
-                    let mut args = vec![obj];
-                    for arg in ctor_args {
-                        let value = self.lower_expr(arg);
-                        args.push(if is_pass(arg) {
-                            value
-                        } else {
-                            self.maybe_copy_array(value, &arg.ty())
-                        });
-                    }
-                    self.emit(Inst::Call {
-                        dst: None,
-                        callee: ctor_mangled.clone(),
-                        args,
-                        ret: Ty::Void,
-                    });
-                }
-                obj
-            }
+            } => self.lower_new(
+                *class_id,
+                class_name,
+                *num_props,
+                prop_defaults,
+                ctor,
+                ty,
+                None,
+            ),
             TExpr::Instanceof {
                 expr,
                 target_class_id,
@@ -802,6 +797,64 @@ impl Lowerer {
         let dst = self.fresh();
         self.emit(Inst::Const { dst, lit });
         dst
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_new(
+        &mut self,
+        class_id: u32,
+        class_name: &str,
+        num_props: u32,
+        prop_defaults: &[(u32, TExpr)],
+        ctor: &Option<(String, Vec<TExpr>, Vec<Ty>)>,
+        ty: &Ty,
+        order: Option<&[usize]>,
+    ) -> Value {
+        let cid_val = self.emit_const(Literal::Int(class_id as i64));
+        let name_val = self.emit_const(Literal::Str(class_name.as_bytes().to_vec()));
+        let num_props_val = self.emit_const(Literal::Int(num_props as i64));
+        let obj = self.rt_call(
+            "pxr_object_new",
+            vec![cid_val, name_val, num_props_val],
+            ty.clone(),
+        );
+        for (slot_idx, def_expr) in prop_defaults {
+            let s_idx = self.emit_const(Literal::Int(*slot_idx as i64));
+            let def_val = self.lower_expr(def_expr);
+            let def_ty = def_expr.ty();
+            let vtag = self.emit_const(Literal::Int(Self::tag_of(&def_ty)));
+            let bits = self.encode_bits(def_val, &def_ty);
+            self.rt_call(
+                "pxr_object_set_bits",
+                vec![obj, s_idx, vtag, bits],
+                Ty::Void,
+            );
+        }
+        if let Some((ctor_mangled, ctor_args, _)) = ctor {
+            let indices: Vec<_> = order
+                .map(|o| o.to_vec())
+                .unwrap_or_else(|| (0..ctor_args.len()).collect());
+            let mut values = vec![None; ctor_args.len()];
+            for index in indices {
+                let arg = &ctor_args[index];
+                let value = self.lower_expr(arg);
+                values[index] = Some(if is_pass(arg) {
+                    value
+                } else {
+                    self.maybe_copy_array(value, &arg.ty())
+                });
+            }
+            let args = std::iter::once(obj)
+                .chain(values.into_iter().map(Option::unwrap))
+                .collect();
+            self.emit(Inst::Call {
+                dst: None,
+                callee: ctor_mangled.clone(),
+                args,
+                ret: Ty::Void,
+            });
+        }
+        obj
     }
 
     fn cast(&mut self, v: Value, from: &Ty, to: &Ty) -> Value {
@@ -2347,6 +2400,16 @@ impl Lowerer {
     }
 
     fn lower_call(&mut self, callee: &Callee, ret: &Ty, args: &[TExpr], arg_tys: &[Ty]) -> Value {
+        self.lower_call_order(callee, ret, args, arg_tys, None)
+    }
+    fn lower_call_order(
+        &mut self,
+        callee: &Callee,
+        ret: &Ty,
+        args: &[TExpr],
+        arg_tys: &[Ty],
+        order: Option<&[usize]>,
+    ) -> Value {
         match callee {
             Callee::Parallel { handler } => {
                 let value = self.lower_expr(&args[0]);
@@ -2412,19 +2475,24 @@ impl Lowerer {
                     self.rt_call("pxr_value_drop", vec![tag, bits], Ty::Void);
                     return self.rt_call("pxr_gc_collect", vec![], Ty::Void);
                 }
-                let mut vals = Vec::new();
-                for (i, a) in args.iter().enumerate() {
+                let indices: Vec<_> = order
+                    .map(|o| o.to_vec())
+                    .unwrap_or_else(|| (0..args.len()).collect());
+                let mut vals = vec![None; args.len()];
+                for i in indices {
+                    let a = &args[i];
                     let v = self.lower_expr(a);
                     // Widen `int` arguments to `float` parameters, and copy
                     // arrays (PHP passes arrays by value).
                     let want = params.get(i).cloned().unwrap_or_else(|| arg_tys[i].clone());
                     let v = self.cast(v, &arg_tys[i], &want);
-                    vals.push(if is_pass(a) {
+                    vals[i] = Some(if is_pass(a) {
                         v
                     } else {
                         self.maybe_copy_array(v, &want)
                     });
                 }
+                let vals = vals.into_iter().map(Option::unwrap).collect();
                 if *ret == Ty::Void {
                     self.emit(Inst::Call {
                         dst: None,
@@ -2444,8 +2512,21 @@ impl Lowerer {
                 dst
             }
             Callee::Builtin { kind, arg_tys } => {
-                let vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
-                self.lower_builtin(*kind, arg_tys, &vals, args.len(), ret)
+                let vals: Vec<_> = if let Some(order) = order {
+                    let mut values = vec![None; args.len()];
+                    for &index in order {
+                        let value = self.lower_expr(&args[index]);
+                        values[index] = Some(if is_pass(&args[index]) {
+                            value
+                        } else {
+                            self.maybe_copy_array(value, &arg_tys[index])
+                        });
+                    }
+                    values.into_iter().map(Option::unwrap).collect()
+                } else {
+                    args.iter().map(|a| self.lower_expr(a)).collect()
+                };
+                self.lower_builtin(*kind, arg_tys, &vals, args, ret)
             }
         }
     }
@@ -2471,9 +2552,10 @@ impl Lowerer {
         kind: Builtin,
         arg_tys: &[Ty],
         a: &[Value],
-        argc: usize,
+        expressions: &[TExpr],
         ret: &Ty,
     ) -> Value {
+        let argc = expressions.len();
         use Builtin::*;
         match kind {
             Boolval => self.to_bool(a[0], &arg_tys[0]),
@@ -2668,11 +2750,12 @@ impl Lowerer {
             }
             ArraySlice => {
                 let offset = a[1];
-                let (length, has_length) = if argc >= 3 {
-                    (a[2], 1i64)
-                } else {
-                    (self.emit_const(Literal::Int(0)), 0)
-                };
+                let (length, has_length) =
+                    if argc >= 3 && !matches!(expressions[2], TExpr::Missing(_)) {
+                        (a[2], 1i64)
+                    } else {
+                        (self.emit_const(Literal::Int(0)), 0)
+                    };
                 let has_length = self.emit_const(Literal::Int(has_length));
                 let preserve = if argc >= 4 {
                     self.cast(a[3], &Ty::Bool, &Ty::Int)

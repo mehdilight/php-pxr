@@ -16,6 +16,8 @@ use pxr_lexer::{StrPart, Token, TokenKind};
 use std::collections::HashMap;
 
 pub struct Parser {
+    source: String,
+    source_offset: usize,
     compat: bool,
     toks: Vec<Token>,
     pos: usize,
@@ -68,6 +70,8 @@ pub fn parse_at_with_compat(
         shifted.emit(diag);
     }
     let mut p = Parser {
+        source: src.to_owned(),
+        source_offset: offset,
         compat,
         toks,
         pos: 0,

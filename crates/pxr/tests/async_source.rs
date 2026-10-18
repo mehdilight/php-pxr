@@ -3188,3 +3188,49 @@ async function main(): void {{
         "reply:value\n",
     );
 }
+
+#[test]
+fn named_arguments_preserve_source_order_and_snapshots_across_await() {
+    run_case(
+        "named_async_arguments",
+        r#"<?php
+async function number(int $value): int {echo $value; await sleepAsync(0); return $value;}
+async function pair(int $first=10,int $second=20): string {await sleepAsync(0); return $first.":".$second;}
+async function namedWord(string $value): string {await sleepAsync(0); return $value;}
+class NamedAlive {
+    public array<int> $values=[7];
+    public async function change(): int {await sleepAsync(0); $this->values[0]=99; return 99;}
+    public function pair(int $first=10,int $second=20): string {return $first.":".$second;}
+}
+function receiver(): NamedAlive {echo "R"; return new NamedAlive();}
+function snapshot(int $changed,mixed $values): string {return $changed.":".$values[0];}
+function append(&mut array<int> $values,int $extra): void {$values[]=$extra;}
+async function main(): void {
+    echo "=",await pair(second:await number(2),first:await number(1)),"\n";
+    echo "=",receiver()->pair(second:await number(4),first:await number(3)),"\n";
+    $holder=new NamedAlive(); echo snapshot(values:$holder->values,changed:await $holder->change()),":",$holder->values[0],"\n";
+    $owner: owned<array<int>>=[1]; append(extra:await number(5),values:&mut $owner); echo ":",$owner[1],"\n"; drop($owner);
+    $callback=async fn(int $first=10,int $second=20): string=>$first.":".$second;
+    echo await $callback(second:8),"\n";
+    echo str_replace(subject:await namedWord("aba"),replace:await namedWord("x"),search:await namedWord("a")),"\n";
+}
+"#,
+        "=211:2\n=R433:4\n99:7:99\n5:5\n10:8\nxbx\n",
+    );
+}
+
+#[test]
+fn workers_bind_named_arguments_in_their_isolated_frames() {
+    run_case(
+        "named_worker_arguments",
+        r#"<?php
+async function choose<T>(T $first,T $second): T {await sleepAsync(0); return $first;}
+async function worker(int $number): int {return await choose(second:99,first:$number);}
+async function main(): void {
+    $a=spawn parallelAsync("worker",41); $b=spawn parallelAsync("worker",42);
+    echo await $a,":",await $b,"\n";
+}
+"#,
+        "41:42\n",
+    );
+}
