@@ -610,6 +610,46 @@ impl Lowerer {
 
     fn lower_expr(&mut self, e: &TExpr) -> Value {
         match e {
+            TExpr::DynamicArguments {
+                expr,
+                binding,
+                offset,
+            } => match expr.as_ref() {
+                TExpr::Call {
+                    callee:
+                        Callee::User {
+                            mangled, params, ..
+                        },
+                    ret,
+                    args,
+                    ..
+                } => {
+                    let mut values = Vec::new();
+                    for argument in args.iter().take(*offset) {
+                        values.push(self.lower_expr(argument));
+                    }
+                    values.extend(self.lower_dynamic_values(binding, &params[*offset..]));
+                    self.emit_bound_call(mangled, ret, values)
+                }
+                TExpr::New {
+                    class_id,
+                    class_name,
+                    num_props,
+                    prop_defaults,
+                    ctor,
+                    ty,
+                } => self.lower_new(
+                    *class_id,
+                    class_name,
+                    *num_props,
+                    prop_defaults,
+                    ctor,
+                    ty,
+                    None,
+                    Some(binding),
+                ),
+                _ => unreachable!("dynamic arguments require a native callable"),
+            },
             TExpr::Ordered { expr, order } => match expr.as_ref() {
                 TExpr::Call {
                     callee,
@@ -633,6 +673,7 @@ impl Lowerer {
                     ctor,
                     ty,
                     Some(order),
+                    None,
                 ),
                 _ => unreachable!("only calls and construction carry argument order"),
             },
@@ -776,6 +817,7 @@ impl Lowerer {
                 ctor,
                 ty,
                 None,
+                None,
             ),
             TExpr::Instanceof {
                 expr,
@@ -811,6 +853,7 @@ impl Lowerer {
         ctor: &Option<(String, Vec<TExpr>, Vec<Ty>)>,
         ty: &Ty,
         order: Option<&[pxr_sema::ArgumentIndex]>,
+        dynamic: Option<&pxr_sema::TDynamicArguments>,
     ) -> Value {
         let cid_val = self.emit_const(Literal::Int(class_id as i64));
         let name_val = self.emit_const(Literal::Str(class_name.as_bytes().to_vec()));
@@ -834,7 +877,11 @@ impl Lowerer {
         }
         if let Some((ctor_mangled, ctor_args, _)) = ctor {
             let types: Vec<_> = ctor_args.iter().map(TExpr::ty).collect();
-            let values = self.lower_argument_values(ctor_args, &types, order);
+            let values = if let Some(binding) = dynamic {
+                self.lower_dynamic_values(binding, &types)
+            } else {
+                self.lower_argument_values(ctor_args, &types, order)
+            };
             let args = std::iter::once(obj).chain(values).collect();
             self.emit(Inst::Call {
                 dst: None,
@@ -2388,6 +2435,120 @@ impl Lowerer {
         self.loops.pop();
     }
 
+    fn emit_bound_call(&mut self, name: &str, ret: &Ty, args: Vec<Value>) -> Value {
+        let dst = if *ret == Ty::Void {
+            None
+        } else {
+            Some(self.fresh())
+        };
+        self.emit(Inst::Call {
+            dst,
+            callee: name.to_owned(),
+            args,
+            ret: ret.clone(),
+        });
+        dst.unwrap_or_else(|| self.emit_const(Literal::Int(0)))
+    }
+    fn lower_dynamic_values(
+        &mut self,
+        binding: &pxr_sema::TDynamicArguments,
+        params: &[Ty],
+    ) -> Vec<Value> {
+        let names: Vec<_> = binding
+            .names
+            .iter()
+            .map(|name| (None, TExpr::Str(name.as_bytes().to_vec())))
+            .collect();
+        let names = self.lower_array_lit(&names, &Ty::String);
+        let variadic = self.emit_const(Literal::Int(i64::from(binding.variadic)));
+        let frame = self.rt_call(
+            "pxr_arguments_new",
+            vec![names, variadic],
+            Ty::array(Ty::Mixed),
+        );
+        for argument in &binding.arguments {
+            let value = self.lower_expr(&argument.value);
+            if argument.unpack {
+                let array = self.cast(value, &argument.value.ty(), &Ty::array(Ty::Mixed));
+                self.rt_call("pxr_arguments_unpack", vec![frame, array], Ty::Void);
+            } else {
+                let value = self.cast(value, &argument.value.ty(), &Ty::Mixed);
+                let name = if let Some(name) = &argument.name {
+                    self.emit_const(Literal::Str(name.as_bytes().to_vec()))
+                } else {
+                    self.emit_const(Literal::Null)
+                };
+                self.rt_call("pxr_arguments_put", vec![frame, name, value], Ty::Void);
+            }
+        }
+        let required: Vec<_> = binding
+            .required
+            .iter()
+            .map(|&value| (None, TExpr::Bool(value)))
+            .collect();
+        let required = self.lower_array_lit(&required, &Ty::Bool);
+        self.rt_call("pxr_arguments_finish", vec![frame, required], Ty::Void);
+        let mut values = Vec::new();
+        for (index, ty) in params.iter().take(binding.names.len()).enumerate() {
+            let index = self.emit_const(Literal::Int(index as i64));
+            let present = self.rt_call("pxr_arguments_present", vec![frame, index], Ty::Int);
+            let condition = self.to_bool(present, &Ty::Int);
+            let slot = self.alloc_temp_slot(ty.clone());
+            let supplied = self.fresh_label();
+            let missing = self.fresh_label();
+            let end = self.fresh_label();
+            self.terminator(Inst::Branch {
+                cond: condition,
+                then_label: supplied,
+                else_label: missing,
+            });
+            self.switch_to(supplied);
+            let value = self.rt_call("pxr_arguments_get", vec![frame, index], Ty::Mixed);
+            let descriptor = self.emit_const(Literal::Str(self.type_descriptor(ty).into_bytes()));
+            let value = self.rt_call("pxr_mixed_require", vec![value, descriptor], Ty::Mixed);
+            let value = self.cast(value, &Ty::Mixed, ty);
+            self.emit(Inst::SlotSet {
+                slot,
+                src: value,
+                ty: ty.clone(),
+            });
+            self.terminator(Inst::Jump(end));
+            self.switch_to(missing);
+            let value = self.lower_expr(&TExpr::Missing(ty.clone()));
+            self.emit(Inst::SlotSet {
+                slot,
+                src: value,
+                ty: ty.clone(),
+            });
+            self.terminator(Inst::Jump(end));
+            self.switch_to(end);
+            let value = self.fresh();
+            self.emit(Inst::SlotGet {
+                dst: value,
+                slot,
+                ty: ty.clone(),
+            });
+            values.push(value);
+        }
+        if binding.variadic {
+            let Ty::Array(element) = &params[binding.names.len()] else {
+                unreachable!()
+            };
+            let descriptor =
+                self.emit_const(Literal::Str(self.type_descriptor(element).into_bytes()));
+            let rest = self.rt_call(
+                "pxr_arguments_rest",
+                vec![frame, descriptor],
+                Ty::array(Ty::Mixed),
+            );
+            let boxed = self.cast(rest, &Ty::array(Ty::Mixed), &Ty::Mixed);
+            values.push(self.cast(boxed, &Ty::Mixed, &params[binding.names.len()]));
+        }
+        if params.len() > binding.names.len() + usize::from(binding.variadic) {
+            values.push(self.rt_call("pxr_arguments_presence", vec![frame], Ty::array(Ty::Bool)));
+        }
+        values
+    }
     fn lower_argument_values(
         &mut self,
         args: &[TExpr],
@@ -2564,21 +2725,7 @@ impl Lowerer {
                 dst
             }
             Callee::Builtin { kind, arg_tys } => {
-                let vals: Vec<_> = if let Some(order) = order {
-                    let mut values = vec![None; args.len()];
-                    for step in order {
-                        let index = step.parameter;
-                        let value = self.lower_expr(&args[index]);
-                        values[index] = Some(if is_pass(&args[index]) {
-                            value
-                        } else {
-                            self.maybe_copy_array(value, &arg_tys[index])
-                        });
-                    }
-                    values.into_iter().map(Option::unwrap).collect()
-                } else {
-                    args.iter().map(|a| self.lower_expr(a)).collect()
-                };
+                let vals = self.lower_argument_values(args, arg_tys, order);
                 self.lower_builtin(*kind, arg_tys, &vals, args, ret)
             }
         }

@@ -5644,3 +5644,148 @@ echo decimals(1,2.5),":",is_null(nullable(null,3)),":",invoke(new VariadicImplem
 "#,
     );
 }
+
+#[test]
+fn unpacked_arrays_bind_fixed_optional_variadic_and_named_arguments() {
+    assert_matches_php(
+        "unpacked_array_arguments",
+        r#"<?php
+function pair(int $first=10,int $second=20): string {return $first.":".$second;}
+function show(int $first=10,int ...$rest): string {$text=$first."";foreach($rest as $key=>$value){$text=$text.":".$key."=".$value;}return $text;}
+class UnpackedBox {
+ public int $number;
+ public function __construct(int $number=7) {$this->number=$number;}
+ public function pair(int $first=10,int $second=20): string {return $first.":".$second;}
+ public static function text(string $text="default"): string {return $text;}
+}
+$positional=[1,2];$named=["second"=>4,"first"=>3];
+echo pair(...$positional),"\n",pair(...$named),"\n",pair(...[],second:5),"\n";
+echo pair(...[9=>6],...[42=>7]),"\n";
+echo show(...[1,2,3],extra:4),"\n",show(...["extra"=>8,"first"=>7,"other"=>9]),"\n";
+$box=new UnpackedBox(...["number"=>9]);echo $box->number,":",$box->pair(...$named),":",UnpackedBox::text(...["text"=>"native"]),"\n";
+$f=fn(int $first=10,int ...$rest): int=>$first+count($rest);echo $f(...["extra"=>1,"first"=>3]),"\n";
+function heterogeneous(int $number,string $text): string {return $number.":".$text;}
+echo heterogeneous(...[1,"text"]),"\n";
+function numbers(float ...$values): float {return $values[0]+$values[1];}
+echo numbers(...[1,2.5]),"\n";
+"#,
+    );
+}
+
+#[test]
+fn unpacked_arguments_reject_duplicates_missing_values_and_invalid_storage() {
+    if !have_cc() {
+        return;
+    }
+    for (name, arguments, message) in [
+        ("duplicate", "...[1],first:2", "more than once"),
+        ("unknown", r#"...["absent"=>1]"#, "unknown named"),
+        ("missing", "...[]", "missing required"),
+        (
+            "positional_after_named",
+            r#"...["first"=>1],...[2]"#,
+            "positional argument follows",
+        ),
+        ("wrong_type", r#"...["bad"]"#, "TypeError"),
+        ("not_array", "...1", "E0313"),
+    ] {
+        let path = temp_php(
+            &format!("unpacked_{name}"),
+            &format!("<?php function f(int $first): int {{return $first;}} echo f({arguments});"),
+        );
+        let run = run_ok(&["run", path.to_str().unwrap()]);
+        assert_ne!(run.code, 0, "{name}");
+        assert!(run.stderr.contains(message), "{name}: {}", run.stderr);
+    }
+}
+
+#[test]
+fn unpacked_arguments_support_generic_specializations_and_compatibility_mode() {
+    if !have_cc() {
+        return;
+    }
+    let path = temp_php(
+        "unpacked_generics",
+        r#"<?php
+function last<T>(T ...$values): T {return $values[count($values)-1];}
+function identity<T>(T $value): T {return $value;}
+class UnpackedGeneric {
+ public function pick<T>(T $first,T $second): T {return $first;}
+ public function closure(): int {$callback=fn(int $first=10,int ...$rest): int=>$first+count($rest);return $callback(...["first"=>3,"extra"=>4]);}
+}
+echo last(...[1,2,3]),":",last<string>(...["a","b"]),":",identity(...["value"=>7]),"\n";
+echo (new UnpackedGeneric())->pick<int>(...["second"=>9,"first"=>8]),":",(new UnpackedGeneric())->closure(),"\n";
+function decimals(float $first,float ...$rest): float {return $first+$rest[0];}
+echo decimals(...[1,2.5]),"\n";
+"#,
+    );
+    let run = run_ok(&["run", path.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "3:b:7\n8:4\n3.5\n");
+    let compat = temp_php(
+        "unpacked_compat",
+        r#"<?php function show($first=10,...$rest){return $first.":".$rest["extra"];} $values=["extra"=>8,"first"=>7];echo show(...$values),"\n";"#,
+    );
+    let run = run_ok(&["run", "--compat", compat.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "7:8\n");
+}
+
+#[test]
+fn unpacked_builtin_literals_preserve_named_defaults_and_array_snapshots() {
+    assert_matches_php(
+        "unpacked_builtin_literals",
+        r#"<?php
+function mark(int $value): int {echo $value;return $value;}
+echo substr(...["string"=>"abcdef","offset"=>2]),"\n";
+echo str_replace(...["a","x","aba"]),"\n";
+echo sprintf(...["%d:%s",7,"native"]),"\n";
+$values=[7];$merged=array_merge(...[$values,$values=[99]]);echo $merged[0],":",$merged[1],"\n";
+echo substr(...["offset"=>mark(1),"string"=>"abcdef"],length:mark(2)),"\n";
+"#,
+    );
+}
+
+#[test]
+fn unpacked_arguments_diagnose_ownership_and_unsupported_boundary_forms() {
+    for (name, source, code) in [
+        (
+            "borrowed_signature",
+            r#"function f(&array<int> $value): int {return count($value);} echo f(...[[1]]);"#,
+            "E0290",
+        ),
+        (
+            "owned_signature",
+            r#"function f(owned<array<int>> $value): int {return count($value);} echo f(...[[1]]);"#,
+            "E0290",
+        ),
+        (
+            "after_named",
+            r#"function f(int $first=1): int {return $first;} echo f(first:1,...[]);"#,
+            "E0100",
+        ),
+        (
+            "positional_after",
+            r#"function f(int $first=1,int $second=2): int {return $first;} echo f(...[],1);"#,
+            "E0100",
+        ),
+        (
+            "builtin_dynamic",
+            r#"$arguments=["abc"];echo strlen(...$arguments);"#,
+            "E0313",
+        ),
+        (
+            "builtin_duplicate_keys",
+            r#"echo strlen(...[0=>"old",0=>"new"]);"#,
+            "E0313",
+        ),
+    ] {
+        let path = temp_php(
+            &format!("unpacked_unsupported_{name}"),
+            &format!("<?php {source}"),
+        );
+        let run = run_ok(&["check", path.to_str().unwrap()]);
+        assert_ne!(run.code, 0, "{name}");
+        assert!(run.stderr.contains(code), "{name}: {}", run.stderr);
+    }
+}

@@ -33,6 +33,12 @@ fn argument(e: &TExpr, want: &Ty, d: &mut Diagnostics) {
 }
 fn expression(e: &TExpr, d: &mut Diagnostics) {
     match e {
+        TExpr::DynamicArguments { expr, binding, .. } => {
+            for argument in &binding.arguments {
+                expression(&argument.value, d);
+            }
+            expression(expr, d);
+        }
         TExpr::Effect { statement, .. } => statements(std::slice::from_ref(statement), d),
         TExpr::Ordered { expr, .. }
         | TExpr::Pass { expr, .. }

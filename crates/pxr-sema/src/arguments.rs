@@ -28,6 +28,9 @@ pub(super) fn ordered(expr: TExpr, order: Vec<ArgumentIndex>) -> TExpr {
     }
 }
 pub(super) struct BoundArguments {
+    pub dynamic: Option<Vec<ast::Expr>>,
+    pub declarations: Vec<ast::Param>,
+    pub typed_dynamic: std::cell::RefCell<Option<Vec<TCallArgument>>>,
     pub values: Vec<ast::Expr>,
     pub present: Vec<bool>,
     pub order: Vec<usize>,
@@ -97,6 +100,67 @@ impl BoundArguments {
             .collect();
         TExpr::ArgumentPack { elems, ety }
     }
+    pub fn infer_dynamic(
+        &self,
+        analyzer: &mut Analyzer,
+        ctx: &mut FnCtx,
+    ) -> Option<Vec<TCallArgument>> {
+        if let Some(typed) = self.typed_dynamic.borrow().as_ref() {
+            return Some(typed.clone());
+        }
+        let arguments = self.dynamic.as_ref()?;
+        let mut typed = Vec::new();
+        for argument in arguments {
+            let (name, unpack, value) = match argument {
+                ast::Expr::NamedArgument { name, value, .. } => {
+                    (Some(name.clone()), false, value.as_ref())
+                }
+                ast::Expr::UnpackArgument { value, .. } => (None, true, value.as_ref()),
+                value => (None, false, value),
+            };
+            // Argument lists may contain heterogeneous literal arrays. Their
+            // element contracts are checked after runtime binding.
+            let value = analyzer.infer_for_type(value, ctx, &Ty::Mixed)?;
+            let ty = value.ty();
+            if !compat_value_type(&ty)
+                || ty == Ty::Void
+                || (unpack && !matches!(ty, Ty::Array(_) | Ty::Mixed | Ty::Union(_)))
+            {
+                analyzer.diags.emit(Diagnostic::error("unpacked arguments require arrays; values must use ordinary shareable PHP storage").with_code("E0313").with_span(argument.span()));
+                return None;
+            }
+            typed.push(TCallArgument {
+                name,
+                unpack,
+                value,
+            });
+        }
+        *self.typed_dynamic.borrow_mut() = Some(typed);
+        Some(self.typed_dynamic.borrow().as_ref().unwrap().clone())
+    }
+    pub fn take_dynamic(&self) -> Option<Box<TDynamicArguments>> {
+        self.dynamic.as_ref()?;
+        Some(Box::new(TDynamicArguments {
+            arguments: self
+                .typed_dynamic
+                .borrow_mut()
+                .take()
+                .expect("dynamic arguments inferred before wrapping"),
+            names: self
+                .declarations
+                .iter()
+                .filter(|p| !p.variadic)
+                .map(|p| p.name.clone())
+                .collect(),
+            required: self
+                .declarations
+                .iter()
+                .filter(|p| !p.variadic)
+                .map(|p| p.default.is_none())
+                .collect(),
+            variadic: self.variadic.is_some(),
+        }))
+    }
     pub fn infer_values(
         &self,
         analyzer: &mut Analyzer,
@@ -104,6 +168,18 @@ impl BoundArguments {
         types: &[Ty],
         code: &'static str,
     ) -> Option<Vec<TExpr>> {
+        if let Some(arguments) = &self.dynamic {
+            if types.iter().any(|ty| !compat_value_type(ty)) {
+                analyzer.diags.emit(
+                    Diagnostic::error("argument unpacking requires ordinary shareable PHP values")
+                        .with_code("E0313")
+                        .with_span(arguments[0].span()),
+                );
+                return None;
+            }
+            self.infer_dynamic(analyzer, ctx)?;
+            return Some(types.iter().cloned().map(TExpr::Missing).collect());
+        }
         let mut values = vec![None; self.values.len()];
         let mut elements = Vec::new();
         for (index, argument) in self.steps() {
@@ -146,6 +222,13 @@ impl BoundArguments {
         Some(values.into_iter().map(Option::unwrap).collect())
     }
     pub fn wrap(&self, expr: TExpr, offset: usize, optional: bool) -> TExpr {
+        if let Some(binding) = self.take_dynamic() {
+            return TExpr::DynamicArguments {
+                expr: Box::new(expr),
+                offset,
+                binding,
+            };
+        }
         let order = self.evaluation_order(offset, optional);
         ordered(expr, order)
     }
@@ -160,6 +243,83 @@ impl Signature {
     }
 }
 impl Analyzer {
+    pub(super) fn expand_builtin_literals(
+        &mut self,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> Option<Vec<ast::Expr>> {
+        let mut expanded = Vec::new();
+        let mut named = false;
+        for argument in args {
+            if let ast::Expr::UnpackArgument { value, .. } = argument {
+                let mut value = value.as_ref();
+                while let ast::Expr::Paren(inner, _) = value {
+                    value = inner;
+                }
+                let ast::Expr::ArrayLit { items, .. } = value else {
+                    self.diags.emit(Diagnostic::error("native builtin unpacking currently requires literal arrays with unique constant keys").with_code("E0313").with_span(span));
+                    return None;
+                };
+                let mut keys = std::collections::HashSet::new();
+                let mut next = 0i64;
+                for item in items {
+                    let key = match &item.key {
+                        None => {
+                            let key = Ok(next);
+                            next = next.checked_add(1)?;
+                            key
+                        }
+                        Some(ast::Expr::IntLit(number, _)) => {
+                            next = next.max(number.checked_add(1)?);
+                            Ok(*number)
+                        }
+                        Some(ast::Expr::StrLit(bytes, _)) => {
+                            let text = String::from_utf8(bytes.clone()).ok()?;
+                            if let Ok(number) = text.parse::<i64>() {
+                                if number.to_string() == text {
+                                    next = next.max(number.checked_add(1)?);
+                                    Ok(number)
+                                } else {
+                                    Err(text)
+                                }
+                            } else {
+                                Err(text)
+                            }
+                        }
+                        _ => {
+                            self.diags.emit(Diagnostic::error("native builtin literal unpacking requires constant integer/string keys").with_code("E0313").with_span(item.span));
+                            return None;
+                        }
+                    };
+                    if !keys.insert(key.clone()) {
+                        self.diags.emit(Diagnostic::error("native builtin literal unpacking with repeated array keys is not implemented").with_code("E0313").with_span(item.span));
+                        return None;
+                    }
+                    match key {
+                        Ok(_) => {
+                            if named {
+                                self.diags.emit(Diagnostic::error("positional unpacked arguments cannot follow named arguments").with_code("E0313").with_span(item.span));
+                                return None;
+                            }
+                            expanded.push(item.value.clone());
+                        }
+                        Err(name) => {
+                            named = true;
+                            expanded.push(ast::Expr::NamedArgument {
+                                name,
+                                value: Box::new(item.value.clone()),
+                                span: item.span,
+                            });
+                        }
+                    }
+                }
+            } else {
+                named |= matches!(argument, ast::Expr::NamedArgument { .. });
+                expanded.push(argument.clone());
+            }
+        }
+        Some(expanded)
+    }
     pub(super) fn check_named_dispatch(
         &mut self,
         class: &ClassInfo,
@@ -167,10 +327,12 @@ impl Analyzer {
         args: &[ast::Expr],
         span: Span,
     ) -> bool {
-        if !args
-            .iter()
-            .any(|a| matches!(a, ast::Expr::NamedArgument { .. }))
-        {
+        if !args.iter().any(|a| {
+            matches!(
+                a,
+                ast::Expr::NamedArgument { .. } | ast::Expr::UnpackArgument { .. }
+            )
+        }) {
             return true;
         }
         let different = self
@@ -221,6 +383,21 @@ impl Analyzer {
         span: Span,
         arity_code: &'static str,
     ) -> Option<BoundArguments> {
+        if args
+            .iter()
+            .any(|a| matches!(a, ast::Expr::UnpackArgument { .. }))
+        {
+            return Some(BoundArguments {
+                values: params.iter().map(|p| ast::Expr::NullLit(p.span)).collect(),
+                present: vec![true; params.len()],
+                order: vec![],
+                evaluation: vec![],
+                variadic: params.iter().position(|p| p.variadic),
+                dynamic: Some(args.to_vec()),
+                declarations: params.to_vec(),
+                typed_dynamic: std::cell::RefCell::new(None),
+            });
+        }
         let mut values: Vec<Option<ast::Expr>> = vec![None; params.len()];
         let mut order = Vec::new();
         let mut positional = 0;
@@ -333,6 +510,9 @@ impl Analyzer {
             }
         }
         Some(BoundArguments {
+            dynamic: None,
+            declarations: params.to_vec(),
+            typed_dynamic: std::cell::RefCell::new(None),
             values: values.into_iter().map(Option::unwrap).collect(),
             present,
             order,

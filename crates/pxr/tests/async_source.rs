@@ -3267,3 +3267,41 @@ async function main(): void {$a=spawn parallelAsync("worker",41);$b=spawn parall
         "41:42\n",
     );
 }
+
+#[test]
+fn unpacked_arguments_retain_snapshots_receivers_and_frames_across_await() {
+    run_case(
+        "unpacked_async_arguments",
+        r#"<?php
+async function later(int $value): int {echo $value;await sleepAsync(0);return $value;}
+async function pair(int $first=10,int $second=20): string {await sleepAsync(0);return $first.":".$second;}
+class UnpackedAlive {
+ public array<int> $values=[7];
+ public async function change(): int {await sleepAsync(0);$this->values[0]=99;return 99;}
+ public function show(mixed $early,int $changed=0): string {return $early[0].":".$changed;}
+}
+function receiver(): UnpackedAlive {echo "R";return new UnpackedAlive();}
+function snapshot(int $fixed=10,mixed ...$rest): string {return $rest["early"][0].":".$fixed;}
+async function main(): void {
+ echo await pair(...["second"=>await later(2)],first:await later(1)),"\n";
+ echo receiver()->show(...[[7]],changed:await later(3)),"\n";
+ $box=new UnpackedAlive();echo snapshot(...["early"=>$box->values],fixed:await $box->change()),":",$box->values[0],"\n";
+ $f=async fn(string ...$values): string=>implode(",",$values);echo await $f(...["first","second"]),"\n";
+}
+"#,
+        "211:2\nR37:3\n7:99:99\nfirst,second\n",
+    );
+}
+
+#[test]
+fn unpacked_generic_calls_use_isolated_worker_heaps() {
+    run_case(
+        "unpacked_worker_arguments",
+        r#"<?php
+async function choose<T>(T $first,T $second): T {await sleepAsync(0);return $first;}
+async function worker(int $value): int {return await choose<int>(...["second"=>99,"first"=>$value]);}
+async function main(): void {$a=spawn parallelAsync("worker",41);$b=spawn parallelAsync("worker",42);echo await $a,":",await $b,"\n";}
+"#,
+        "41:42\n",
+    );
+}

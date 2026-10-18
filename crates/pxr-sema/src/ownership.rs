@@ -1403,6 +1403,13 @@ impl Checker {
         stringify: bool,
     ) -> BTreeMap<String, TypeRef> {
         let base = self.loans.len();
+        if args
+            .iter()
+            .any(|a| matches!(a, Expr::UnpackArgument { .. }))
+            && signature.is_some_and(|s| s.params.iter().any(|p| mode(p.as_ref()) != Mode::Shared))
+        {
+            self.error(span,"argument unpacking currently requires shared parameter storage; affine/borrowed contracts must be called explicitly");
+        }
         let mut bindings = BTreeMap::new();
         for (position, original) in args.iter().enumerate() {
             let (i, arg) = if let Expr::NamedArgument { name, value, .. } = original {
@@ -1677,7 +1684,9 @@ impl Checker {
                 ..Value::plain(Some(TypeRef::Mixed))
             },
             Expr::Var(n, sp) => self.read(n, *sp),
-            Expr::NamedArgument { value: e, .. } | Expr::Paren(e, _) => self.expr(e),
+            Expr::UnpackArgument { value: e, .. }
+            | Expr::NamedArgument { value: e, .. }
+            | Expr::Paren(e, _) => self.expr(e),
             Expr::Call {
                 callee,
                 fallback,
@@ -2553,7 +2562,8 @@ fn erase_expr(e: &mut Expr) {
                 erase_expr(a);
             }
         }
-        Expr::NamedArgument { value: expr, .. }
+        Expr::UnpackArgument { value: expr, .. }
+        | Expr::NamedArgument { value: expr, .. }
         | Expr::Unary { expr, .. }
         | Expr::Paren(expr, _)
         | Expr::Instanceof { expr, .. } => erase_expr(expr),

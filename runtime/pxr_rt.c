@@ -2469,6 +2469,90 @@ void *pxr_array_to_mixed(void *p) {
     return copy;
 }
 
+/* Dynamic call binding uses ordinary traced arrays so every retained argument,
+ * name, variadic value and presence bit remains visible to GC across awaits.
+ * Frame fields: names, slots, rest, presence, next-position, saw-name, has-rest. */
+static pxr_array *pxr_arguments_field(pxr_array *frame, size_t field) {
+    return (pxr_array *)(intptr_t)frame->ents[field].bits;
+}
+static void pxr_arguments_error(const char *message) {
+    fprintf(stderr, "Fatal error: Uncaught ArgumentCountError: %s\n", message);
+    exit(255);
+}
+void *pxr_arguments_new(void *parameter_names, long long variadic) {
+    pxr_array *names = parameter_names;
+    pxr_array *frame = pxr_array_new();
+    pxr_array_push(frame,PXR_TAG_ARR,(intptr_t)names);
+    pxr_array_push(frame,PXR_TAG_ARR,(intptr_t)pxr_array_new());
+    pxr_array_push(frame,PXR_TAG_ARR,(intptr_t)pxr_array_new());
+    pxr_array *presence = pxr_array_new();
+    for (size_t i=0;i<names->len;i++) pxr_array_push(presence,PXR_TAG_BOOL,0);
+    if (variadic) pxr_array_push(presence,PXR_TAG_BOOL,1);
+    pxr_array_push(frame,PXR_TAG_ARR,(intptr_t)presence);
+    pxr_array_push(frame,PXR_TAG_INT,0);
+    pxr_array_push(frame,PXR_TAG_BOOL,0);
+    pxr_array_push(frame,PXR_TAG_BOOL,variadic != 0);
+    return frame;
+}
+void pxr_arguments_put(void *storage, const pxr_str *name, void *value) {
+    pxr_array *frame=storage, *names=pxr_arguments_field(frame,0);
+    size_t index=names->len;
+    if (name) {
+        frame->ents[5].bits=1;
+        for (size_t i=0;i<names->len;i++) {
+            const pxr_str *candidate=(const pxr_str *)(intptr_t)names->ents[i].bits;
+            if (candidate->len==name->len && !memcmp(candidate->data,name->data,name->len)) {index=i;break;}
+        }
+    } else {
+        if (frame->ents[5].bits) pxr_arguments_error("positional argument follows a named argument during unpacking");
+        index=(size_t)frame->ents[4].bits++;
+    }
+    pxr_array *presence=pxr_arguments_field(frame,3);
+    if (index<names->len) {
+        if (presence->ents[index].bits) pxr_arguments_error("argument was supplied more than once during unpacking");
+        presence->ents[index].bits=1;
+        pxr_array_set(pxr_arguments_field(frame,1),PXR_TAG_INT,(long long)index,NULL,PXR_TAG_MIXED,(intptr_t)pxr_mixed_copy(value));
+    } else {
+        if (!frame->ents[6].bits) pxr_arguments_error(name ? "unknown named argument during unpacking" : "too many positional arguments during unpacking");
+        pxr_array *rest=pxr_arguments_field(frame,2);
+        if (name) {
+            if (pxr_array_has(rest,PXR_TAG_STR,0,name)) pxr_arguments_error("variadic named argument was supplied more than once during unpacking");
+            pxr_array_set(rest,PXR_TAG_STR,0,name,PXR_TAG_MIXED,(intptr_t)pxr_mixed_copy(value));
+        } else pxr_array_push(rest,PXR_TAG_MIXED,(intptr_t)pxr_mixed_copy(value));
+    }
+}
+void pxr_arguments_unpack(void *frame, void *source) {
+    const pxr_array *array=source;
+    for (size_t i=0;i<array->len;i++) {
+        const pxr_ent *entry=&array->ents[i];
+        void *value=entry->vt==PXR_TAG_MIXED ? (void *)(intptr_t)entry->bits : pxr_mixed_box(entry->vt,entry->bits);
+        pxr_arguments_put(frame,entry->ks,value);
+    }
+}
+void pxr_arguments_finish(void *storage, void *requirements) {
+    const pxr_array *required=requirements;
+    pxr_array *presence=pxr_arguments_field(storage,3);
+    for (size_t i=0;i<required->len;i++) {
+        if (required->ents[i].bits && !presence->ents[i].bits) pxr_arguments_error("missing required argument after unpacking");
+    }
+}
+long long pxr_arguments_present(void *storage, long long index) {
+    pxr_array *presence=pxr_arguments_field(storage,3);
+    return presence->ents[(size_t)index].bits;
+}
+void *pxr_arguments_get(void *storage, long long index) {
+    return (void *)(intptr_t)pxr_array_get_bits(pxr_arguments_field(storage,1),PXR_TAG_INT,index,NULL);
+}
+void *pxr_mixed_require(void *p, const pxr_str *descriptor);
+void *pxr_arguments_rest(void *storage, const pxr_str *element_type) {
+    pxr_array *rest=pxr_arguments_field(storage,2);
+    for (size_t i=0;i<rest->len;i++) {
+        rest->ents[i].bits=(intptr_t)pxr_mixed_require((void *)(intptr_t)rest->ents[i].bits,element_type);
+    }
+    return rest;
+}
+void *pxr_arguments_presence(void *storage) {return pxr_arguments_field(storage,3);}
+
 /* A missing intermediate is not published until the completed write-back. */
 void *pxr_mixed_array_or_new(void *p) {
     const pxr_mixed *value = pxr_mixed_checked(p);

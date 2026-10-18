@@ -5,8 +5,22 @@ impl Parser {
     pub(super) fn parse_call_arguments(&mut self) -> Result<(Vec<Expr>, Token), ()> {
         let mut args = Vec::new();
         let mut named = false;
+        let mut unpacked = false;
         while !self.at(&TokenKind::RParen) {
-            if self.peek_at(1).kind == TokenKind::Colon {
+            if self.eat(&TokenKind::Ellipsis) {
+                let start = self.toks[self.pos - 1].span;
+                if named {
+                    self.error(start, "argument unpacking cannot follow named arguments");
+                    return Err(());
+                }
+                let value = self.parse_expr()?;
+                let span = start.merge(value.span());
+                args.push(Expr::UnpackArgument {
+                    value: Box::new(value),
+                    span,
+                });
+                unpacked = true;
+            } else if self.peek_at(1).kind == TokenKind::Colon {
                 let token = self.advance();
                 let name = match &token.kind {
                     TokenKind::Ident(name) => name.clone(),
@@ -33,10 +47,10 @@ impl Parser {
                 });
                 named = true;
             } else {
-                if named {
+                if named || unpacked {
                     self.error(
                         self.peek().span,
-                        "positional arguments cannot follow named arguments",
+                        "positional arguments cannot follow named arguments or unpacking",
                     );
                     return Err(());
                 }

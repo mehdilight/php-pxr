@@ -71,7 +71,24 @@ The variadic parameter must be last and cannot have a default. An optional fixed
 prefix is allowed. Affine/borrowed element storage is rejected by the ordinary
 container ownership checks; required owned/borrowed fixed prefixes remain usable.
 Strict mode requires an element annotation; compatibility mode uses mixed for an
-untyped variadic declaration. Argument unpacking remains unfinished and rejected.
+untyped variadic declaration. Array argument unpacking supports native functions, methods, constructors,
+closures and generic/async calls: `pair(...$values)` and
+`collect(...$values, extra: 7)`. Integer keys supply positional values in insertion
+order; string keys select fixed names or become variadic keys. Multiple unpacked
+arrays are allowed. Positional arguments cannot follow unpacking; explicit named
+arguments can follow it. A later numeric entry after a named entry, duplicate
+supplied names, missing required values and wrong runtime types produce errors.
+Defaults still execute inside the effective implementation. Unpacked elements
+snapshot before later expressions, including awaits. Generic inference uses
+homogeneous array evidence; supply explicit type arguments when evidence is
+ambiguous or unavailable.
+
+Unpacking currently requires shared parameter storage. Signatures containing
+owned/borrowed parameters retain explicit E0290 diagnostics for unpacked calls.
+Native builtin unpacking currently accepts literal arrays with unique constant
+keys; dynamic builtin arrays and repeated literal keys produce E0313. Native
+I/O/task intrinsics and PHP interpreter boundaries retain their explicit
+unpacking restriction. Traversable/generator unpacking remains outstanding.
 See [the named-argument example](../examples/named_arguments.php).
 See [M10 status](M10.md) and [the runnable example](../examples/optional_arguments.php).
 

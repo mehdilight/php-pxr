@@ -165,6 +165,7 @@ pub(super) fn hex_name(name: &str) -> String {
 }
 
 struct GenericCall {
+    dynamic: Option<Box<TDynamicArguments>>,
     order: Vec<ArgumentIndex>,
     deferred: bool,
     key: (String, Vec<Ty>),
@@ -176,6 +177,7 @@ struct GenericCall {
 impl GenericCall {
     fn deferred(span: Span) -> Self {
         Self {
+            dynamic: None,
             order: Vec::new(),
             deferred: true,
             key: (String::new(), Vec::new()),
@@ -196,24 +198,30 @@ impl GenericCall {
     fn expression(self, span: Span) -> TExpr {
         let abi_params = self.signature.abi_params();
         let arg_tys = self.values.iter().map(TExpr::ty).collect();
-        arguments::ordered(
-            TExpr::Call {
-                callee: Callee::User {
-                    mangled: self.signature.mangled,
-                    name: self.signature.display,
-                    params: abi_params,
-                },
-                ret: if self.signature.is_async {
-                    Ty::Task(Box::new(self.signature.ret))
-                } else {
-                    self.signature.ret
-                },
-                args: self.values,
-                arg_tys,
-                span,
+        let expression = TExpr::Call {
+            callee: Callee::User {
+                mangled: self.signature.mangled,
+                name: self.signature.display,
+                params: abi_params,
             },
-            self.order,
-        )
+            ret: if self.signature.is_async {
+                Ty::Task(Box::new(self.signature.ret))
+            } else {
+                self.signature.ret
+            },
+            args: self.values,
+            arg_tys,
+            span,
+        };
+        if let Some(binding) = self.dynamic {
+            TExpr::DynamicArguments {
+                expr: Box::new(expression),
+                binding,
+                offset: 0,
+            }
+        } else {
+            arguments::ordered(expression, self.order)
+        }
     }
 }
 
@@ -378,6 +386,7 @@ impl Analyzer {
                 .map(|method| method.mangled.clone())
                 .unwrap_or_else(|| mangle_method(&method.declaring_class, &member))
         };
+        let offset = usize::from(receiver.is_some());
         let mut values = prepared.values;
         let mut order = prepared.order;
         let mut params = prepared.signature.abi_params();
@@ -389,24 +398,30 @@ impl Analyzer {
                 .collect();
         }
         let arg_tys = values.iter().map(TExpr::ty).collect();
-        Some(arguments::ordered(
-            TExpr::Call {
-                callee: Callee::User {
-                    mangled,
-                    name: prepared.signature.display,
-                    params,
-                },
-                ret: if prepared.signature.is_async {
-                    Ty::Task(Box::new(prepared.signature.ret))
-                } else {
-                    prepared.signature.ret
-                },
-                args: values,
-                arg_tys,
-                span,
+        let expression = TExpr::Call {
+            callee: Callee::User {
+                mangled,
+                name: prepared.signature.display,
+                params,
             },
-            order,
-        ))
+            ret: if prepared.signature.is_async {
+                Ty::Task(Box::new(prepared.signature.ret))
+            } else {
+                prepared.signature.ret
+            },
+            args: values,
+            arg_tys,
+            span,
+        };
+        Some(if let Some(binding) = prepared.dynamic {
+            TExpr::DynamicArguments {
+                expr: Box::new(expression),
+                binding,
+                offset,
+            }
+        } else {
+            arguments::ordered(expression, order)
+        })
     }
 
     pub(super) fn is_compiled_function(&self, name: &str) -> bool {
@@ -486,6 +501,76 @@ impl Analyzer {
             return None;
         }
 
+        if binding.dynamic.is_some() {
+            let actuals = binding.infer_dynamic(self, ctx)?;
+            if type_args.is_empty() {
+                let mut positional = 0;
+                for argument in &actuals {
+                    let evidence = if argument.unpack {
+                        let Ty::Array(mut element) = argument.value.ty() else {
+                            continue;
+                        };
+                        if let TExpr::ArrayLit { elems, .. } = &argument.value {
+                            if elems.is_empty() {
+                                continue;
+                            }
+                            // Preserve homogeneous evidence even when the argument
+                            // container itself uses checked mixed entry storage.
+                            if let Some((_, first)) = elems.first() {
+                                if elems.iter().all(|(_, value)| value.ty() == first.ty()) {
+                                    element = Box::new(first.ty());
+                                }
+                            }
+                        }
+                        if *element == Ty::Null {
+                            continue;
+                        }
+                        *element
+                    } else {
+                        argument.value.ty()
+                    };
+                    let candidates: Vec<_> = if argument.unpack {
+                        declaration.params.iter().collect()
+                    } else if let Some(name) = &argument.name {
+                        declaration
+                            .params
+                            .iter()
+                            .find(|p| p.name == *name && !p.variadic)
+                            .or_else(|| declaration.params.iter().find(|p| p.variadic))
+                            .into_iter()
+                            .collect()
+                    } else {
+                        let parameter = declaration
+                            .params
+                            .get(positional)
+                            .or_else(|| declaration.params.iter().find(|p| p.variadic));
+                        positional += 1;
+                        parameter.into_iter().collect()
+                    };
+                    for parameter in candidates {
+                        let pattern = parameter.ty.as_ref()?;
+                        let pattern = if parameter.variadic {
+                            let ast::TypeRef::Array(element) = pattern else {
+                                unreachable!()
+                            };
+                            element.as_ref()
+                        } else {
+                            pattern
+                        };
+                        if let Err(message) = infer_bindings(
+                            pattern,
+                            &evidence,
+                            &mut bindings,
+                            &self.class_expander,
+                            &self.classes,
+                        ) {
+                            self.diags.emit(Diagnostic::error(format!("cannot infer unpacked generic arguments: {message}; provide explicit type arguments")).with_code("E0281").with_span(span));
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
         let mut values = vec![None; args.len()];
         let mut elements = Vec::new();
         for (step, argument) in binding.steps() {
@@ -622,7 +707,7 @@ impl Analyzer {
                 span: declaration.span,
             }
         };
-        if let Some(index) = binding.variadic {
+        if let Some(index) = binding.variadic.filter(|_| binding.dynamic.is_none()) {
             let Ty::Array(element) = &signature.params[index] else {
                 unreachable!()
             };
@@ -644,7 +729,11 @@ impl Analyzer {
                 element.as_ref().clone(),
             ));
         }
-        let mut values: Vec<_> = values.into_iter().map(Option::unwrap).collect();
+        let mut values: Vec<_> = if binding.dynamic.is_some() {
+            binding.infer_values(self, ctx, &signature.params, "E0231")?
+        } else {
+            values.into_iter().map(Option::unwrap).collect()
+        };
         for ((argument, value), expected) in args.iter().zip(&values).zip(&signature.params) {
             if !self.is_assignable(&value.ty(), expected) {
                 self.diags.emit(
@@ -668,6 +757,7 @@ impl Analyzer {
         binding.append_presence(&declaration.params, &mut values, &mut actual_types);
         let order = binding.evaluation_order(0, arguments::has_defaults(&declaration.params));
         Some(GenericCall {
+            dynamic: binding.take_dynamic(),
             order,
             deferred: false,
             key,

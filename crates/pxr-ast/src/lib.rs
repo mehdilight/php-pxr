@@ -519,6 +519,10 @@ impl BinOp {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
+    UnpackArgument {
+        value: Box<Expr>,
+        span: Span,
+    },
     NamedArgument {
         name: String,
         value: Box<Expr>,
@@ -655,7 +659,8 @@ impl Expr {
     pub fn children(&self) -> Vec<&Expr> {
         match self {
             Self::Effect { statement, .. } => statement.expressions(),
-            Self::NamedArgument { value: expr, .. }
+            Self::UnpackArgument { value: expr, .. }
+            | Self::NamedArgument { value: expr, .. }
             | Self::Unary { expr, .. }
             | Self::Instanceof { expr, .. }
             | Self::Paren(expr, _) => {
@@ -708,7 +713,8 @@ impl Expr {
 
     pub fn span(&self) -> Span {
         match self {
-            Expr::NamedArgument { span: s, .. }
+            Expr::UnpackArgument { span: s, .. }
+            | Expr::NamedArgument { span: s, .. }
             | Expr::IntLit(_, s)
             | Expr::FloatLit(_, s)
             | Expr::StrLit(_, s)

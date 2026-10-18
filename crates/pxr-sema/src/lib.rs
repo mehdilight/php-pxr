@@ -286,7 +286,25 @@ impl ArgumentIndex {
     }
 }
 #[derive(Clone, Debug, PartialEq)]
+pub struct TCallArgument {
+    pub name: Option<String>,
+    pub unpack: bool,
+    pub value: TExpr,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct TDynamicArguments {
+    pub arguments: Vec<TCallArgument>,
+    pub names: Vec<String>,
+    pub required: Vec<bool>,
+    pub variadic: bool,
+}
+#[derive(Clone, Debug, PartialEq)]
 pub enum TExpr {
+    DynamicArguments {
+        expr: Box<TExpr>,
+        binding: Box<TDynamicArguments>,
+        offset: usize,
+    },
     /// Values occupy ABI parameter positions; evaluate them in source order.
     Ordered {
         expr: Box<TExpr>,
@@ -414,7 +432,7 @@ impl TExpr {
             TExpr::Effect { ty, .. } => ty.clone(),
             TExpr::Deferred => Ty::Infer,
             TExpr::Pass { expr, .. } => expr.ty(),
-            TExpr::Ordered { expr, .. } => expr.ty(),
+            TExpr::Ordered { expr, .. } | TExpr::DynamicArguments { expr, .. } => expr.ty(),
             TExpr::Coerce { ty, .. } | TExpr::Missing(ty) => ty.clone(),
             TExpr::Int(_) => Ty::Int,
             TExpr::Float(_) => Ty::Float,
@@ -4108,6 +4126,14 @@ impl Analyzer {
                     ty,
                 })
             }
+            ast::Expr::UnpackArgument { span, .. } => {
+                self.diags.emit(
+                    Diagnostic::error("argument unpacking is not supported by this callable yet")
+                        .with_code("E0313")
+                        .with_span(*span),
+                );
+                None
+            }
             ast::Expr::NamedArgument { span, .. } => {
                 self.diags.emit(
                     Diagnostic::error("named arguments are not supported by this callable yet")
@@ -6319,6 +6345,18 @@ impl Analyzer {
 
         // Builtin?
         if let Some(kind) = Builtin::from_name(&key) {
+            if args
+                .iter()
+                .any(|arg| matches!(arg, ast::Expr::UnpackArgument { .. }))
+            {
+                let before = self.diags.items().len();
+                let expanded = self.expand_builtin_literals(args, span);
+                if expanded.is_none() && self.diags.items().len() == before {
+                    self.diags.emit(Diagnostic::error("native builtin literal unpacking cannot represent these array keys yet").with_code("E0313").with_span(span));
+                }
+                let expanded = expanded?;
+                return self.infer_call(callee, callee_span, type_args, &expanded, span, ctx);
+            }
             if args
                 .iter()
                 .any(|a| matches!(a, ast::Expr::NamedArgument { .. }))

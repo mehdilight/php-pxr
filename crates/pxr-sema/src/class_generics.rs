@@ -805,7 +805,8 @@ impl ClassExpander {
         use ast::Expr as E;
         match expression {
             E::Effect { statement, .. } => self.statement(statement, bindings),
-            E::NamedArgument { value: expr, .. }
+            E::UnpackArgument { value: expr, .. }
+            | E::NamedArgument { value: expr, .. }
             | E::Unary { expr, .. }
             | E::Paren(expr, _)
             | E::Property { base: expr, .. } => self.expression(expr, bindings),
