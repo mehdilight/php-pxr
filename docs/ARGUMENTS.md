@@ -58,7 +58,20 @@ added by named binding. Unknown named variadic operands of `sprintf`/`printf` an
 `array_merge` are rejected, as in PHP. PXR async/I/O/task intrinsics and explicit
 PHP interpreter boundaries retain their positional-call contract for now.
 
-Variadic parameters and argument unpacking remain unfinished and explicit errors.
+Variadic declarations use PHP syntax: `function collect(int ...$values): int`.
+Inside the function, `$values` is an `array<int>`; the annotation describes each
+supplied element. Empty packs work, and unknown named arguments retain their
+string keys in the variadic array. A label matching the variadic parameter name
+also becomes a string key. Fixed and variadic named values can interleave;
+evaluation, initialization checks, array snapshots and awaited values follow
+source order. This applies to native methods, constructors, closures, generic
+specializations and async calls. Overrides preserve the variadic contract.
+
+The variadic parameter must be last and cannot have a default. An optional fixed
+prefix is allowed. Affine/borrowed element storage is rejected by the ordinary
+container ownership checks; required owned/borrowed fixed prefixes remain usable.
+Strict mode requires an element annotation; compatibility mode uses mixed for an
+untyped variadic declaration. Argument unpacking remains unfinished and rejected.
 See [the named-argument example](../examples/named_arguments.php).
 See [M10 status](M10.md) and [the runnable example](../examples/optional_arguments.php).
 

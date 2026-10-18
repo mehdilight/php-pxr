@@ -3234,3 +3234,36 @@ async function main(): void {
         "41:42\n",
     );
 }
+
+#[test]
+fn variadic_arguments_preserve_interleaved_order_and_roots_across_await() {
+    run_case(
+        "variadic_async_arguments",
+        r#"<?php
+async function number(int $value): int {echo $value;await sleepAsync(0);return $value;}
+async function collect(int $fixed=10,int ...$rest): string {await sleepAsync(0);$text="=".$fixed;foreach($rest as $key=>$value){$text=$text.":".$key."=".$value;}return $text;}
+function snapshots(int $fixed,mixed ...$rest): int {return intval($rest["early"][0]);}
+class VariadicAlive {public array<int> $values=[7];public async function change(): int {await sleepAsync(0);$this->values[0]=99;return 99;}}
+async function main(): void {
+ echo await collect(early:await number(1),fixed:await number(2),late:await number(3)),"\n";
+ $object=new VariadicAlive();echo snapshots(early:$object->values,fixed:await $object->change()),":",$object->values[0],"\n";
+ $f=async fn(string ...$values): string=>implode(",",$values);echo await $f("first","second"),"\n";
+ echo await collect(),"\n";
+}
+"#,
+        "123=2:early=1:late=3\n7:99\nfirst,second\n=10\n",
+    );
+}
+
+#[test]
+fn variadic_generic_calls_run_in_isolated_workers() {
+    run_case(
+        "variadic_worker_arguments",
+        r#"<?php
+function last<T>(T ...$values): T {return $values[count($values)-1];}
+async function worker(int $value): int {await sleepAsync(0);return last(1,2,$value);}
+async function main(): void {$a=spawn parallelAsync("worker",41);$b=spawn parallelAsync("worker",42);echo await $a,":",await $b,"\n";}
+"#,
+        "41:42\n",
+    );
+}

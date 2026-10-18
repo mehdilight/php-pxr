@@ -731,7 +731,9 @@ impl Lowerer {
                 arms,
                 ty,
             } => self.lower_match(subject, subject_ty, arms, ty),
-            TExpr::ArrayLit { elems, ety } => self.lower_array_lit(elems, ety),
+            TExpr::ArrayLit { elems, ety } | TExpr::ArgumentPack { elems, ety } => {
+                self.lower_array_lit(elems, ety)
+            }
             TExpr::Index {
                 base,
                 index,
@@ -808,7 +810,7 @@ impl Lowerer {
         prop_defaults: &[(u32, TExpr)],
         ctor: &Option<(String, Vec<TExpr>, Vec<Ty>)>,
         ty: &Ty,
-        order: Option<&[usize]>,
+        order: Option<&[pxr_sema::ArgumentIndex]>,
     ) -> Value {
         let cid_val = self.emit_const(Literal::Int(class_id as i64));
         let name_val = self.emit_const(Literal::Str(class_name.as_bytes().to_vec()));
@@ -831,22 +833,9 @@ impl Lowerer {
             );
         }
         if let Some((ctor_mangled, ctor_args, _)) = ctor {
-            let indices: Vec<_> = order
-                .map(|o| o.to_vec())
-                .unwrap_or_else(|| (0..ctor_args.len()).collect());
-            let mut values = vec![None; ctor_args.len()];
-            for index in indices {
-                let arg = &ctor_args[index];
-                let value = self.lower_expr(arg);
-                values[index] = Some(if is_pass(arg) {
-                    value
-                } else {
-                    self.maybe_copy_array(value, &arg.ty())
-                });
-            }
-            let args = std::iter::once(obj)
-                .chain(values.into_iter().map(Option::unwrap))
-                .collect();
+            let types: Vec<_> = ctor_args.iter().map(TExpr::ty).collect();
+            let values = self.lower_argument_values(ctor_args, &types, order);
+            let args = std::iter::once(obj).chain(values).collect();
             self.emit(Inst::Call {
                 dst: None,
                 callee: ctor_mangled.clone(),
@@ -2399,6 +2388,86 @@ impl Lowerer {
         self.loops.pop();
     }
 
+    fn lower_argument_values(
+        &mut self,
+        args: &[TExpr],
+        params: &[Ty],
+        order: Option<&[pxr_sema::ArgumentIndex]>,
+    ) -> Vec<Value> {
+        let natural: Vec<_> = args
+            .iter()
+            .enumerate()
+            .flat_map(|(parameter, arg)| {
+                if let TExpr::ArgumentPack { elems, .. } = arg {
+                    (0..elems.len())
+                        .map(|element| pxr_sema::ArgumentIndex {
+                            parameter,
+                            element: Some(element),
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![pxr_sema::ArgumentIndex::value(parameter)]
+                }
+            })
+            .collect();
+        let mut values = vec![None; args.len()];
+        let mut packs: Vec<Vec<Option<Value>>> = args
+            .iter()
+            .map(|arg| {
+                if let TExpr::ArgumentPack { elems, .. } = arg {
+                    vec![None; elems.len()]
+                } else {
+                    vec![]
+                }
+            })
+            .collect();
+        for step in order.unwrap_or(&natural) {
+            let index = step.parameter;
+            let (expression, want) = if let Some(element) = step.element {
+                let TExpr::ArgumentPack { elems, ety } = &args[index] else {
+                    unreachable!()
+                };
+                (&elems[element].1, ety.clone())
+            } else {
+                (
+                    &args[index],
+                    params
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| args[index].ty()),
+                )
+            };
+            let value = self.lower_expr(expression);
+            let value = self.cast(value, &expression.ty(), &want);
+            let value = if is_pass(expression) {
+                value
+            } else {
+                self.maybe_copy_array(value, &want)
+            };
+            if let Some(element) = step.element {
+                packs[index][element] = Some(value);
+            } else {
+                values[index] = Some(value);
+            }
+        }
+        for (index, arg) in args.iter().enumerate() {
+            if let TExpr::ArgumentPack { elems, ety } = arg {
+                let array = self.array_new();
+                let tag = self.emit_const(Literal::Int(Self::tag_of(ety)));
+                for ((key, _), value) in elems.iter().zip(&packs[index]) {
+                    let bits = self.encode_bits(value.unwrap(), ety);
+                    if let Some(key) = key {
+                        let (ktag, kint, kstr) = self.lower_key(key, &key.ty());
+                        self.array_set(array, ktag, kint, kstr, tag, bits);
+                    } else {
+                        self.array_push(array, tag, bits);
+                    }
+                }
+                values[index] = Some(array);
+            }
+        }
+        values.into_iter().map(Option::unwrap).collect()
+    }
     fn lower_call(&mut self, callee: &Callee, ret: &Ty, args: &[TExpr], arg_tys: &[Ty]) -> Value {
         self.lower_call_order(callee, ret, args, arg_tys, None)
     }
@@ -2408,7 +2477,7 @@ impl Lowerer {
         ret: &Ty,
         args: &[TExpr],
         arg_tys: &[Ty],
-        order: Option<&[usize]>,
+        order: Option<&[pxr_sema::ArgumentIndex]>,
     ) -> Value {
         match callee {
             Callee::Parallel { handler } => {
@@ -2475,24 +2544,7 @@ impl Lowerer {
                     self.rt_call("pxr_value_drop", vec![tag, bits], Ty::Void);
                     return self.rt_call("pxr_gc_collect", vec![], Ty::Void);
                 }
-                let indices: Vec<_> = order
-                    .map(|o| o.to_vec())
-                    .unwrap_or_else(|| (0..args.len()).collect());
-                let mut vals = vec![None; args.len()];
-                for i in indices {
-                    let a = &args[i];
-                    let v = self.lower_expr(a);
-                    // Widen `int` arguments to `float` parameters, and copy
-                    // arrays (PHP passes arrays by value).
-                    let want = params.get(i).cloned().unwrap_or_else(|| arg_tys[i].clone());
-                    let v = self.cast(v, &arg_tys[i], &want);
-                    vals[i] = Some(if is_pass(a) {
-                        v
-                    } else {
-                        self.maybe_copy_array(v, &want)
-                    });
-                }
-                let vals = vals.into_iter().map(Option::unwrap).collect();
+                let vals = self.lower_argument_values(args, params, order);
                 if *ret == Ty::Void {
                     self.emit(Inst::Call {
                         dst: None,
@@ -2514,7 +2566,8 @@ impl Lowerer {
             Callee::Builtin { kind, arg_tys } => {
                 let vals: Vec<_> = if let Some(order) = order {
                     let mut values = vec![None; args.len()];
-                    for &index in order {
+                    for step in order {
+                        let index = step.parameter;
                         let value = self.lower_expr(&args[index]);
                         values[index] = Some(if is_pass(&args[index]) {
                             value

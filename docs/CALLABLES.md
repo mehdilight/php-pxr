@@ -142,7 +142,7 @@ See [callback_objects.php](../examples/callback_objects.php) and
   method generics. Async closures use compiler-generated invocation methods.
 - Optional and named parameters work on closures and invokable methods; see
   [ARGUMENTS.md](ARGUMENTS.md). `--compat` permits untyped parameters through mixed
-  storage. Variadic arguments and unpacking remain unfinished; closures
+  storage. Variadic parameters work; argument unpacking remains unfinished. Closures
   retain the same argument and ownership checks as other native calls.
 
 Behavioral references: [PHP anonymous functions](https://www.php.net/manual/en/functions.anonymous.php)

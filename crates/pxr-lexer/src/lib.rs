@@ -120,6 +120,7 @@ pub enum TokenKind {
     Slash,
     Percent,
     Dot,
+    Ellipsis,
     PlusPlus,
     MinusMinus,
     EqEq,
@@ -250,6 +251,7 @@ impl TokenKind {
             TokenKind::Slash => "/",
             TokenKind::Percent => "%",
             TokenKind::Dot => ".",
+            TokenKind::Ellipsis => "...",
             TokenKind::PlusPlus => "++",
             TokenKind::MinusMinus => "--",
             TokenKind::EqEq => "==",
@@ -561,7 +563,10 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 b'.' => {
-                    if self.peek() == Some(b'=') {
+                    if self.src.get(self.pos..self.pos + 2) == Some(b"..") {
+                        self.pos += 2;
+                        TokenKind::Ellipsis
+                    } else if self.peek() == Some(b'=') {
                         self.pos += 1;
                         TokenKind::DotEq
                     } else {

@@ -5566,3 +5566,81 @@ $value=identity("word"); if(is_string(value:$value)) {echo strlen(string:$value)
         assert_eq!(run.stdout, String::from_utf8_lossy(&php.stdout));
     }
 }
+
+#[test]
+fn variadic_parameters_match_php_for_functions_methods_and_closures() {
+    assert_matches_php(
+        "variadic_parameters",
+        r#"<?php
+function show(string $prefix="default", int ...$values): string { $result=$prefix; foreach($values as $key=>$value) {$result=$result.":".$key."=".$value;} return $result; }
+class VariadicBox {
+ public string $text;
+ public function __construct(int ...$values) {$this->text="";foreach($values as $value){$this->text=$this->text.$value;}}
+ public function method(string ...$values): string {return implode(",",$values);}
+ public static function staticMethod(int ...$values): int {return count($values);}
+ public function closure(): int {$callback=fn(int $fixed=10,int ...$values): int=>$fixed+count($values);return $callback(extra:1,fixed:1,other:2);}
+}
+echo show(),"\n",show("numbers",1,2,3),"\n",show(extra:7,other:8),"\n";
+$box=new VariadicBox(3,4); echo $box->text,":",$box->method("a","b"),":",VariadicBox::staticMethod(),"\n";
+$f=fn(int ...$values): int=>count($values); echo $f(),":",$f(1,2),":",$box->closure(),"\n";
+"#,
+    );
+}
+
+#[test]
+fn variadic_parameters_support_generics_and_borrowed_prefixes() {
+    if !have_cc() {
+        return;
+    }
+    let path = temp_php(
+        "variadic_generics",
+        r#"<?php
+function last<T>(T ...$values): T {return $values[count($values)-1];}
+function change(&mut array<int> $target,int ...$values): int {$target[0]=$target[0]+count($values);return $target[0];}
+echo last(1,2,3),":",last("a","b"),"\n";
+function named<T>(int $fixed=10,T ...$rest): T {return $rest["early"];}
+echo named<int>(early:4,fixed:10,late:5),"\n";
+$value: owned<array<int>>=[7];echo change(&mut $value,1,2),":",$value[0],"\n";
+"#,
+    );
+    let run = run_ok(&["run", path.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "3:b\n4\n9:9\n");
+}
+
+#[test]
+fn variadic_parameter_contract_errors_are_explicit() {
+    for (name,source,code) in [
+ ("not_last","function f(int ...$a,int $b): int {return $b;}","E0313"),
+ ("default","function f(int ...$a=[]): int {return count($a);}","E0313"),
+ ("wrong_element","function f(int ...$a): int {return count($a);} echo f(1,'bad');","E0231"),
+ ("owned_element","function f(owned<int> ...$a): int {return count($a);}","E0290"),
+ ("borrow_element","function f(&int ...$a): int {return count($a);}","E0290"),
+ ("override","class A {public function f(int ...$a): int {return count($a);}} class B extends A {public function f(array<int> $a): int {return count($a);}}","E0313"),
+ ] {
+ let path=temp_php(&format!("variadic_{name}"),&format!("<?php {source}"));let run=run_ok(&["check",path.to_str().unwrap()]);assert_ne!(run.code,0,"{name}");assert!(run.stderr.contains(code),"{name}: {}",run.stderr);
+ }
+}
+
+#[test]
+fn variadic_named_values_keep_source_order_keys_and_snapshots() {
+    assert_matches_php(
+        "variadic_named_order",
+        r#"<?php
+function mark(int $value): int {echo $value;return $value;}
+function show(int $fixed=10,int ...$rest): string {$text="=".$fixed;foreach($rest as $key=>$value){$text=$text.":".$key."=".$value;}return $text;}
+function snapshot(int $fixed,mixed ...$rest): int {return intval($rest[0][0]);}
+class VariadicOrder {public function method(int $fixed=10,int ...$rest): string {return $fixed.":".count($rest);}}
+echo show(extra:mark(1),fixed:mark(2),other:mark(3)),"\n";
+echo (new VariadicOrder())->method(extra:mark(4),fixed:mark(5),other:mark(6)),"\n";
+$values=[7];echo snapshot(0,$values,$values=[99]),":",$values[0],"\n";
+echo show(rest:8),"\n";
+function decimals(float ...$values): float {return $values[0]+$values[1];}
+function nullable(?int ...$values): mixed {return $values[0];}
+interface VariadicContract {public function total(int ...$values): int;}
+class VariadicImplementation implements VariadicContract {public function total(int ...$values): int {return count($values);}}
+function invoke(VariadicContract $target): int {return $target->total(1,2,extra:3);}
+echo decimals(1,2.5),":",is_null(nullable(null,3)),":",invoke(new VariadicImplementation()),"\n";
+"#,
+    );
+}

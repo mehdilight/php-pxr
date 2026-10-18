@@ -653,6 +653,12 @@ impl Parser {
                     None
                 };
                 let ty = ty.or_else(|| self.compat.then_some(TypeRef::Mixed));
+                let variadic = self.eat(&TokenKind::Ellipsis);
+                let ty = if variadic {
+                    ty.map(|t| TypeRef::Array(Box::new(t)))
+                } else {
+                    ty
+                };
                 let vt = self.expect_variable("parameter name")?;
                 let pname = match vt.kind {
                     TokenKind::Variable(n) => n,
@@ -664,6 +670,7 @@ impl Parser {
                     None
                 };
                 params.push(Param {
+                    variadic,
                     default,
                     name: pname,
                     name_span: vt.span,
@@ -891,6 +898,12 @@ impl Parser {
 
         let untyped = ty.is_none();
         let ty = ty.or_else(|| self.compat.then_some(TypeRef::Mixed));
+        let variadic = self.eat(&TokenKind::Ellipsis);
+        let ty = if variadic {
+            ty.map(|t| TypeRef::Array(Box::new(t)))
+        } else {
+            ty
+        };
         let vt = self.expect_variable("property name")?;
         let name = match vt.kind {
             TokenKind::Variable(n) => n,
@@ -961,6 +974,12 @@ impl Parser {
                     None
                 };
                 let ty = ty.or_else(|| self.compat.then_some(TypeRef::Mixed));
+                let variadic = self.eat(&TokenKind::Ellipsis);
+                let ty = if variadic {
+                    ty.map(|t| TypeRef::Array(Box::new(t)))
+                } else {
+                    ty
+                };
                 let vt = self.expect_variable("parameter name")?;
                 let pname = match vt.kind {
                     TokenKind::Variable(n) => n,
@@ -972,6 +991,7 @@ impl Parser {
                     None
                 };
                 params.push(Param {
+                    variadic,
                     default,
                     name: pname,
                     name_span: vt.span,

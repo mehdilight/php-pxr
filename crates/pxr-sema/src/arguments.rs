@@ -13,8 +13,12 @@ pub(super) fn flags(total: usize, supplied: usize) -> TExpr {
         ety: Ty::Bool,
     }
 }
-pub(super) fn ordered(expr: TExpr, order: Vec<usize>) -> TExpr {
-    if order.iter().copied().eq(0..order.len()) {
+pub(super) fn ordered(expr: TExpr, order: Vec<ArgumentIndex>) -> TExpr {
+    if order
+        .iter()
+        .copied()
+        .eq((0..order.len()).map(ArgumentIndex::value))
+    {
         expr
     } else {
         TExpr::Ordered {
@@ -27,6 +31,8 @@ pub(super) struct BoundArguments {
     pub values: Vec<ast::Expr>,
     pub present: Vec<bool>,
     pub order: Vec<usize>,
+    pub evaluation: Vec<ArgumentIndex>,
+    pub variadic: Option<usize>,
 }
 impl BoundArguments {
     pub fn append_presence(
@@ -47,12 +53,100 @@ impl BoundArguments {
             types.push(Ty::array(Ty::Bool));
         }
     }
-    pub fn wrap(&self, expr: TExpr, offset: usize, optional: bool) -> TExpr {
-        let mut order: Vec<_> = (0..offset).collect();
-        order.extend(self.order.iter().map(|i| i + offset));
+    pub fn evaluation_order(&self, offset: usize, optional: bool) -> Vec<ArgumentIndex> {
+        let mut order: Vec<_> = (0..offset).map(ArgumentIndex::value).collect();
+        order.extend(self.evaluation.iter().map(|i| i.shifted(offset)));
         if optional {
-            order.push(offset + self.values.len());
+            order.push(ArgumentIndex::value(offset + self.values.len()));
         }
+        order
+    }
+    pub fn steps(&self) -> Vec<(ArgumentIndex, &ast::Expr)> {
+        self.evaluation
+            .iter()
+            .map(|&index| {
+                let expr = &self.values[index.parameter];
+                let expr = if let Some(element) = index.element {
+                    let ast::Expr::ArrayLit { items, .. } = expr else {
+                        unreachable!()
+                    };
+                    &items[element].value
+                } else {
+                    expr
+                };
+                (index, expr)
+            })
+            .collect()
+    }
+    pub fn pack(&self, values: Vec<TExpr>, ety: Ty) -> TExpr {
+        let ast::Expr::ArrayLit { items, .. } = &self.values[self.variadic.unwrap()] else {
+            unreachable!()
+        };
+        let elems = items
+            .iter()
+            .zip(values)
+            .map(|(item, value)| {
+                let key = item.key.as_ref().map(|key| {
+                    let ast::Expr::StrLit(value, _) = key else {
+                        unreachable!()
+                    };
+                    TExpr::Str(value.clone())
+                });
+                (key, value)
+            })
+            .collect();
+        TExpr::ArgumentPack { elems, ety }
+    }
+    pub fn infer_values(
+        &self,
+        analyzer: &mut Analyzer,
+        ctx: &mut FnCtx,
+        types: &[Ty],
+        code: &'static str,
+    ) -> Option<Vec<TExpr>> {
+        let mut values = vec![None; self.values.len()];
+        let mut elements = Vec::new();
+        for (index, argument) in self.steps() {
+            let expected = if index.element.is_some() {
+                let Ty::Array(element) = &types[index.parameter] else {
+                    unreachable!()
+                };
+                element.as_ref()
+            } else {
+                &types[index.parameter]
+            };
+            let value = analyzer.infer_for_type(argument, ctx, expected)?;
+            if !analyzer.is_assignable(&value.ty(), expected) {
+                analyzer.diags.emit(
+                    Diagnostic::error(format!(
+                        "argument expects `{expected}`, found `{}`",
+                        value.ty()
+                    ))
+                    .with_code(code)
+                    .with_span(argument.span()),
+                );
+                return None;
+            }
+            if index.element.is_some() {
+                elements.push(value);
+            } else {
+                values[index.parameter] = Some(if self.present[index.parameter] {
+                    value
+                } else {
+                    TExpr::Missing(expected.clone())
+                });
+            }
+        }
+        if let Some(index) = self.variadic {
+            let Ty::Array(element) = &types[index] else {
+                unreachable!()
+            };
+            values[index] = Some(self.pack(elements, element.as_ref().clone()));
+        }
+        Some(values.into_iter().map(Option::unwrap).collect())
+    }
+    pub fn wrap(&self, expr: TExpr, offset: usize, optional: bool) -> TExpr {
+        let order = self.evaluation_order(offset, optional);
         ordered(expr, order)
     }
 }
@@ -100,6 +194,17 @@ impl Analyzer {
         if child
             .iter()
             .zip(parent)
+            .any(|(c, p)| c.variadic != p.variadic)
+        {
+            self.diags.emit(
+                Diagnostic::error("overrides must preserve the variadic parameter contract")
+                    .with_code("E0313")
+                    .with_span(span),
+            );
+        }
+        if child
+            .iter()
+            .zip(parent)
             .any(|(c, p)| p.default.is_some() && c.default.is_none())
         {
             self.diags.emit(
@@ -119,9 +224,34 @@ impl Analyzer {
         let mut values: Vec<Option<ast::Expr>> = vec![None; params.len()];
         let mut order = Vec::new();
         let mut positional = 0;
+        let rest = params.iter().position(|p| p.variadic);
+        let mut rest_items = Vec::new();
+        let mut rest_started = false;
+        let mut evaluation = Vec::new();
         for argument in args {
             let (index, value) = if let ast::Expr::NamedArgument { name, value, span } = argument {
-                let Some(index) = params.iter().position(|p| p.name == *name) else {
+                let index = params.iter().position(|p| p.name == *name && !p.variadic);
+                if index.is_none() && rest.is_some() {
+                    if rest_items.iter().any(|item: &ast::ArrayItem| matches!(&item.key,Some(ast::Expr::StrLit(key,_)) if key == name.as_bytes())) {
+                        self.diags.emit(Diagnostic::error(format!("argument `{name}` was supplied more than once")).with_code("E0312").with_span(*span));
+                        return None;
+                    }
+                    if !rest_started {
+                        order.push(rest.unwrap());
+                        rest_started = true;
+                    }
+                    evaluation.push(ArgumentIndex {
+                        parameter: rest.unwrap(),
+                        element: Some(rest_items.len()),
+                    });
+                    rest_items.push(ast::ArrayItem {
+                        key: Some(ast::Expr::StrLit(name.as_bytes().to_vec(), *span)),
+                        value: value.as_ref().clone(),
+                        span: *span,
+                    });
+                    continue;
+                }
+                let Some(index) = index else {
                     self.diags.emit(
                         Diagnostic::error(format!("unknown named argument `{name}`"))
                             .with_code("E0312")
@@ -135,6 +265,22 @@ impl Analyzer {
                 positional += 1;
                 (index, argument)
             };
+            if rest.is_some_and(|r| index >= r) {
+                if !rest_started {
+                    order.push(rest.unwrap());
+                    rest_started = true;
+                }
+                evaluation.push(ArgumentIndex {
+                    parameter: rest.unwrap(),
+                    element: Some(rest_items.len()),
+                });
+                rest_items.push(ast::ArrayItem {
+                    key: None,
+                    value: value.clone(),
+                    span: value.span(),
+                });
+                continue;
+            }
             if index >= values.len() {
                 self.diags.emit(
                     Diagnostic::error("too many positional arguments")
@@ -156,6 +302,16 @@ impl Analyzer {
             }
             values[index] = Some(value.clone());
             order.push(index);
+            evaluation.push(ArgumentIndex::value(index));
+        }
+        if let Some(index) = rest {
+            values[index] = Some(ast::Expr::ArrayLit {
+                items: rest_items,
+                span,
+            });
+            if !rest_started {
+                order.push(index);
+            }
         }
         let present = values.iter().map(Option::is_some).collect();
         for (index, parameter) in params.iter().enumerate() {
@@ -173,12 +329,15 @@ impl Analyzer {
                 };
                 values[index] = Some(default.clone());
                 order.push(index);
+                evaluation.push(ArgumentIndex::value(index));
             }
         }
         Some(BoundArguments {
             values: values.into_iter().map(Option::unwrap).collect(),
             present,
             order,
+            evaluation,
+            variadic: rest,
         })
     }
     pub(super) fn validate_defaults(
@@ -188,7 +347,19 @@ impl Analyzer {
         bindings: &HashMap<String, Ty>,
     ) {
         let mut optional = false;
-        for (p, ty) in params.iter().zip(types) {
+        for (index, (p, ty)) in params.iter().zip(types).enumerate() {
+            if p.variadic {
+                if index + 1 != params.len() || p.default.is_some() {
+                    self.diags.emit(
+                        Diagnostic::error(
+                            "a variadic parameter must be last and cannot have a default",
+                        )
+                        .with_code("E0313")
+                        .with_span(p.span),
+                    );
+                }
+                continue;
+            }
             let Some(default) = &p.default else {
                 if optional {
                     self.diags.emit(
@@ -389,6 +560,7 @@ impl Analyzer {
             .take(last)
             .enumerate()
             .map(|(index, name)| ast::Param {
+                variadic: false,
                 name: (*name).into(),
                 name_span: span,
                 span,

@@ -165,7 +165,7 @@ pub(super) fn hex_name(name: &str) -> String {
 }
 
 struct GenericCall {
-    order: Vec<usize>,
+    order: Vec<ArgumentIndex>,
     deferred: bool,
     key: (String, Vec<Ty>),
     signature: Signature,
@@ -384,8 +384,8 @@ impl Analyzer {
         if let Some(receiver) = receiver {
             params.insert(0, Ty::Named(class.name.clone()));
             values.insert(0, receiver);
-            order = std::iter::once(0)
-                .chain(order.into_iter().map(|i| i + 1))
+            order = std::iter::once(ArgumentIndex::value(0))
+                .chain(order.into_iter().map(|i| i.shifted(1)))
                 .collect();
         }
         let arg_tys = values.iter().map(TExpr::ty).collect();
@@ -487,10 +487,19 @@ impl Analyzer {
         }
 
         let mut values = vec![None; args.len()];
-        for &index in &binding.order {
+        let mut elements = Vec::new();
+        for (step, argument) in binding.steps() {
+            let index = step.parameter;
             let parameter = &declaration.params[index];
-            let argument = &args[index];
             let pattern = parameter.ty.as_ref()?;
+            let pattern = if step.element.is_some() {
+                let ast::TypeRef::Array(element) = pattern else {
+                    unreachable!()
+                };
+                element.as_ref()
+            } else {
+                pattern
+            };
             let value = if pattern_is_bound(pattern, &bindings) {
                 let expected = self.resolve_type_with(pattern, &bindings);
                 self.infer_for_type(argument, ctx, &expected)?
@@ -527,9 +536,12 @@ impl Analyzer {
                     return None;
                 }
             }
-            values[index] = Some(value);
+            if step.element.is_some() {
+                elements.push((argument.span(), value));
+            } else {
+                values[index] = Some(value);
+            }
         }
-        let mut values: Vec<_> = values.into_iter().map(Option::unwrap).collect();
         let mut concrete = Vec::new();
         for (name, _) in &declaration.type_params {
             let Some(ty) = bindings.get(name) else {
@@ -610,6 +622,29 @@ impl Analyzer {
                 span: declaration.span,
             }
         };
+        if let Some(index) = binding.variadic {
+            let Ty::Array(element) = &signature.params[index] else {
+                unreachable!()
+            };
+            for (span, value) in &elements {
+                if !self.is_assignable(&value.ty(), element) {
+                    self.diags.emit(
+                        Diagnostic::error(format!(
+                            "variadic element expects `{element}`, found `{}`",
+                            value.ty()
+                        ))
+                        .with_code("E0231")
+                        .with_span(*span),
+                    );
+                    return None;
+                }
+            }
+            values[index] = Some(binding.pack(
+                elements.into_iter().map(|(_, value)| value).collect(),
+                element.as_ref().clone(),
+            ));
+        }
+        let mut values: Vec<_> = values.into_iter().map(Option::unwrap).collect();
         for ((argument, value), expected) in args.iter().zip(&values).zip(&signature.params) {
             if !self.is_assignable(&value.ty(), expected) {
                 self.diags.emit(
@@ -631,10 +666,7 @@ impl Analyzer {
         }
         let mut actual_types = values.iter().map(TExpr::ty).collect();
         binding.append_presence(&declaration.params, &mut values, &mut actual_types);
-        let mut order = binding.order;
-        if arguments::has_defaults(&declaration.params) {
-            order.push(declaration.params.len());
-        }
+        let order = binding.evaluation_order(0, arguments::has_defaults(&declaration.params));
         Some(GenericCall {
             order,
             deferred: false,

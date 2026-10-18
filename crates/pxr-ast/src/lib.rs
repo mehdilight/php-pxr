@@ -340,6 +340,8 @@ pub struct FnDecl {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Param {
+    /// Variadic declarations store their body type as an array of elements.
+    pub variadic: bool,
     pub default: Option<Expr>,
     pub name: String,
     pub name_span: Span,

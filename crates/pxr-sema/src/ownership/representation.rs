@@ -64,7 +64,7 @@ fn expression(e: &TExpr, d: &mut Diagnostics) {
                 expression(&a.result, d);
             }
         }
-        TExpr::ArrayLit { elems, .. } => {
+        TExpr::ArrayLit { elems, .. } | TExpr::ArgumentPack { elems, .. } => {
             for (key, value) in elems {
                 if let Some(e) = key {
                     expression(e, d);

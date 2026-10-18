@@ -32,6 +32,7 @@ fn field(name: &str, span: Span) -> Expr {
 }
 fn parameter(name: &str, ty: TypeRef, span: Span) -> Param {
     Param {
+        variadic: false,
         default: None,
         name: name.into(),
         name_span: span,
@@ -243,6 +244,12 @@ impl Parser {
                 None
             };
             let ty = ty.or_else(|| self.compat.then_some(TypeRef::Mixed));
+            let variadic = self.eat(&TokenKind::Ellipsis);
+            let ty = if variadic {
+                ty.map(|t| TypeRef::Array(Box::new(t)))
+            } else {
+                ty
+            };
             let t = self.expect_variable("closure parameter")?;
             let TokenKind::Variable(name) = t.kind else {
                 unreachable!()
@@ -253,6 +260,7 @@ impl Parser {
                 None
             };
             params.push(Param {
+                variadic,
                 default,
                 name,
                 name_span: t.span,
@@ -416,7 +424,13 @@ impl Parser {
                 .iter()
                 .map(|(name, span)| TypeRef::Param(name.clone(), *span))
                 .collect();
-            bridge_params.extend(params.clone());
+            bridge_params.extend(params.iter().cloned().map(|mut p| {
+                if params.iter().any(|parameter| parameter.variadic) {
+                    p.default = None;
+                }
+                p.variadic = false;
+                p
+            }));
             self.closure_class
                 .as_mut()
                 .unwrap()

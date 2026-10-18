@@ -94,6 +94,7 @@ fn copy_safe(t: Option<&TypeRef>) -> bool {
 }
 #[derive(Clone, PartialEq)]
 struct Signature {
+    variadic: Option<usize>,
     param_names: Vec<String>,
     is_static: bool,
     is_async: bool,
@@ -233,6 +234,7 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
                 c.signatures.insert(
                     f.name.to_ascii_lowercase(),
                     Signature {
+                        variadic: f.params.iter().position(|p| p.variadic),
                         param_names: f.params.iter().map(|p| p.name.clone()).collect(),
                         is_static: true,
                         is_async: f.is_async,
@@ -259,6 +261,7 @@ pub fn check_and_erase(program: &a::Program) -> (a::Program, Diagnostics) {
                         m.name.to_ascii_lowercase()
                     ),
                     Signature {
+                        variadic: m.params.iter().position(|p| p.variadic),
                         param_names: m.params.iter().map(|p| p.name.clone()).collect(),
                         is_static: m.is_static,
                         is_async: m.is_async,
@@ -1416,9 +1419,17 @@ impl Checker {
             self.borrow_argument = Some(unparen(arg).span());
             let v = self.expr(arg);
             self.borrow_argument = allowed;
-            let expected = signature
-                .and_then(|s| s.params.get(i))
-                .and_then(Option::as_ref);
+            let expected = signature.and_then(|s| {
+                if let Some(rest) = s.variadic {
+                    if i >= rest {
+                        return match s.params.get(rest)?.as_ref()? {
+                            TypeRef::Array(element) => Some(element.as_ref()),
+                            _ => None,
+                        };
+                    }
+                }
+                s.params.get(i).and_then(Option::as_ref)
+            });
             if let (Some(expected), Some(actual)) = (expected, v.ty.as_ref()) {
                 let pattern = inner(expected);
                 let actual = if let Some(target) = nominal(Some(&pattern)) {
