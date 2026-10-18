@@ -889,6 +889,8 @@ impl Lowerer {
                 args,
                 ret: Ty::Void,
             });
+        } else if let Some(binding) = dynamic {
+            self.lower_dynamic_values(binding, &[]);
         }
         obj
     }
@@ -2460,7 +2462,16 @@ impl Lowerer {
             .map(|name| (None, TExpr::Str(name.as_bytes().to_vec())))
             .collect();
         let names = self.lower_array_lit(&names, &Ty::String);
-        let variadic = self.emit_const(Literal::Int(i64::from(binding.variadic)));
+        let rest_mode = if binding.variadic {
+            if binding.allow_named_variadic {
+                1
+            } else {
+                2
+            }
+        } else {
+            0
+        };
+        let variadic = self.emit_const(Literal::Int(rest_mode));
         let frame = self.rt_call(
             "pxr_arguments_new",
             vec![names, variadic],

@@ -5664,6 +5664,12 @@ echo pair(...[9=>6],...[42=>7]),"\n";
 echo show(...[1,2,3],extra:4),"\n",show(...["extra"=>8,"first"=>7,"other"=>9]),"\n";
 $box=new UnpackedBox(...["number"=>9]);echo $box->number,":",$box->pair(...$named),":",UnpackedBox::text(...["text"=>"native"]),"\n";
 $f=fn(int $first=10,int ...$rest): int=>$first+count($rest);echo $f(...["extra"=>1,"first"=>3]),"\n";
+class UnpackedNoConstructor {public int $value=7;}
+echo (new UnpackedNoConstructor(...[]))->value,"\n";
+interface UnpackedContract {public function pair(int $first=10,int $second=20): string;}
+class UnpackedImplementation implements UnpackedContract {public function pair(int $first=30,int $second=40): string {return $first.":".$second;}}
+function invokeUnpacked(UnpackedContract $object,mixed $arguments): string {return $object->pair(...$arguments);}
+echo invokeUnpacked(new UnpackedImplementation(),["second"=>8]),"\n";
 function heterogeneous(int $number,string $text): string {return $number.":".$text;}
 echo heterogeneous(...[1,"text"]),"\n";
 function numbers(float ...$values): float {return $values[0]+$values[1];}
@@ -5769,16 +5775,6 @@ fn unpacked_arguments_diagnose_ownership_and_unsupported_boundary_forms() {
             r#"function f(int $first=1,int $second=2): int {return $first;} echo f(...[],1);"#,
             "E0100",
         ),
-        (
-            "builtin_dynamic",
-            r#"$arguments=["abc"];echo strlen(...$arguments);"#,
-            "E0313",
-        ),
-        (
-            "builtin_duplicate_keys",
-            r#"echo strlen(...[0=>"old",0=>"new"]);"#,
-            "E0313",
-        ),
     ] {
         let path = temp_php(
             &format!("unpacked_unsupported_{name}"),
@@ -5787,5 +5783,88 @@ fn unpacked_arguments_diagnose_ownership_and_unsupported_boundary_forms() {
         let run = run_ok(&["check", path.to_str().unwrap()]);
         assert_ne!(run.code, 0, "{name}");
         assert!(run.stderr.contains(code), "{name}: {}", run.stderr);
+    }
+}
+
+#[test]
+fn dynamic_builtin_unpacking_preserves_defaults_checks_and_keyed_storage() {
+    assert_matches_php(
+        "dynamic_builtin_unpacking",
+        r#"<?php
+function hold(mixed $value): mixed {return $value;}
+$arguments=hold(["abcdef",2]);echo substr(...$arguments),"\n";
+$arguments=["length"=>2,"string"=>"abcdef","offset"=>1];echo substr(...$arguments),"\n";
+$arguments=["native"];echo strlen(...$arguments),":",strtoupper(...$arguments),"\n";
+$arguments=["  native  "];echo trim(...$arguments),"\n";
+$arguments=["abcabc","b"];echo substr_count(...$arguments),"\n";
+$arguments=["haystack"=>"abcabc","needle"=>"b","length"=>3];echo substr_count(...$arguments),"\n";
+$values=["first"=>1,"second"=>2,"third"=>3];$arguments=["array"=>$values,"offset"=>1,"preserve_keys"=>true];
+$slice=array_slice(...$arguments);foreach($slice as $key=>$value){echo $key,":",$value,";";}echo "\n";
+$arguments=["array"=>$values];$reverse=array_reverse(...$arguments);foreach($reverse as $key=>$value){echo $key,":",$value,";";}echo "\n";
+$arguments=["a","x","aba"];echo str_replace(...$arguments),"\n";
+$arguments=["value"=>$values];echo count(...$arguments),"\n";
+$arguments=[7];echo intval(...$arguments),":",is_int(...$arguments),"\n";
+$arguments=[0=>"old",0=>"new"];echo strlen(...$arguments),"\n";
+$arguments=["%d:%s",7,"native"];echo sprintf(...$arguments),"\n";
+$arguments=["%d:%s",7,"native"];echo printf(...$arguments),"\n";
+$arguments=["-",[1,true,"native"]];echo implode(...$arguments),"\n";
+$arguments=[[1,2]];echo implode(...$arguments),"\n";
+$arguments=[[1,2],[3,4]];$merged=array_merge(...$arguments);foreach($merged as $value){echo $value,";";}echo "\n";
+$arguments=[];echo count(array_merge(...$arguments)),"\n";
+$arguments=[-7];echo abs(...$arguments),"\n";
+$arguments=[-2.5];echo abs(...$arguments),"\n";
+"#,
+    );
+}
+
+#[test]
+fn dynamic_builtin_unpacking_rejects_unknown_names_and_non_scalar_formatting() {
+    if !have_cc() {
+        return;
+    }
+    for (name, source, message) in [
+        (
+            "format_named",
+            r#"$arguments=["format"=>"%s","values"=>"x"];echo sprintf(...$arguments);"#,
+            "unknown named",
+        ),
+        (
+            "merge_named",
+            r#"$arguments=["arrays"=>[1]];echo count(array_merge(...$arguments));"#,
+            "unknown named",
+        ),
+        (
+            "format_array",
+            r#"echo sprintf(...["%s",[1]]);"#,
+            "TypeError",
+        ),
+        (
+            "join_object",
+            r#"class O {} echo implode(...[[new O()]]);"#,
+            "TypeError",
+        ),
+        (
+            "wrong_argument",
+            r#"$arguments=[7];echo strlen(...$arguments);"#,
+            "TypeError",
+        ),
+        (
+            "missing_argument",
+            r#"$arguments=[];echo str_replace(...$arguments);"#,
+            "missing required",
+        ),
+        (
+            "duplicate_name",
+            r#"$arguments=["abcdef"];echo substr(...$arguments,string:"again",offset:1);"#,
+            "more than once",
+        ),
+    ] {
+        let path = temp_php(
+            &format!("dynamic_builtin_{name}"),
+            &format!("<?php {source}"),
+        );
+        let run = run_ok(&["run", path.to_str().unwrap()]);
+        assert_ne!(run.code, 0, "{name}");
+        assert!(run.stderr.contains(message), "{name}: {}", run.stderr);
     }
 }

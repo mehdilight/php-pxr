@@ -293,6 +293,7 @@ pub struct TCallArgument {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct TDynamicArguments {
+    pub allow_named_variadic: bool,
     pub arguments: Vec<TCallArgument>,
     pub names: Vec<String>,
     pub required: Vec<bool>,
@@ -4710,7 +4711,14 @@ impl Analyzer {
                     constructor_binding = Some(binding);
                     Some((ctor.mangled.clone(), typed_args, actual_tys))
                 } else {
-                    if !args.is_empty() {
+                    if args
+                        .iter()
+                        .any(|argument| matches!(argument, ast::Expr::UnpackArgument { .. }))
+                    {
+                        let binding = self.bind_arguments(args, &[], *span, "E0207")?;
+                        binding.infer_values(self, ctx, &[], "E0208")?;
+                        constructor_binding = Some(binding);
+                    } else if !args.is_empty() {
                         self.diags.emit(
                             Diagnostic::error(format!(
                                 "class `{}` has no constructor and accepts 0 arguments, found {}",
@@ -6349,13 +6357,7 @@ impl Analyzer {
                 .iter()
                 .any(|arg| matches!(arg, ast::Expr::UnpackArgument { .. }))
             {
-                let before = self.diags.items().len();
-                let expanded = self.expand_builtin_literals(args, span);
-                if expanded.is_none() && self.diags.items().len() == before {
-                    self.diags.emit(Diagnostic::error("native builtin literal unpacking cannot represent these array keys yet").with_code("E0313").with_span(span));
-                }
-                let expanded = expanded?;
-                return self.infer_call(callee, callee_span, type_args, &expanded, span, ctx);
+                return self.infer_dynamic_builtin(kind, args, span, ctx);
             }
             if args
                 .iter()

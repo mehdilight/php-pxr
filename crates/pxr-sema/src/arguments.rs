@@ -141,6 +141,7 @@ impl BoundArguments {
     pub fn take_dynamic(&self) -> Option<Box<TDynamicArguments>> {
         self.dynamic.as_ref()?;
         Some(Box::new(TDynamicArguments {
+            allow_named_variadic: true,
             arguments: self
                 .typed_dynamic
                 .borrow_mut()
@@ -243,82 +244,214 @@ impl Signature {
     }
 }
 impl Analyzer {
-    pub(super) fn expand_builtin_literals(
+    pub(super) fn infer_dynamic_builtin(
         &mut self,
+        kind: Builtin,
         args: &[ast::Expr],
         span: Span,
-    ) -> Option<Vec<ast::Expr>> {
-        let mut expanded = Vec::new();
-        let mut named = false;
-        for argument in args {
-            if let ast::Expr::UnpackArgument { value, .. } = argument {
-                let mut value = value.as_ref();
-                while let ast::Expr::Paren(inner, _) = value {
-                    value = inner;
-                }
-                let ast::Expr::ArrayLit { items, .. } = value else {
-                    self.diags.emit(Diagnostic::error("native builtin unpacking currently requires literal arrays with unique constant keys").with_code("E0313").with_span(span));
-                    return None;
-                };
-                let mut keys = std::collections::HashSet::new();
-                let mut next = 0i64;
-                for item in items {
-                    let key = match &item.key {
-                        None => {
-                            let key = Ok(next);
-                            next = next.checked_add(1)?;
-                            key
-                        }
-                        Some(ast::Expr::IntLit(number, _)) => {
-                            next = next.max(number.checked_add(1)?);
-                            Ok(*number)
-                        }
-                        Some(ast::Expr::StrLit(bytes, _)) => {
-                            let text = String::from_utf8(bytes.clone()).ok()?;
-                            if let Ok(number) = text.parse::<i64>() {
-                                if number.to_string() == text {
-                                    next = next.max(number.checked_add(1)?);
-                                    Ok(number)
-                                } else {
-                                    Err(text)
-                                }
-                            } else {
-                                Err(text)
-                            }
-                        }
-                        _ => {
-                            self.diags.emit(Diagnostic::error("native builtin literal unpacking requires constant integer/string keys").with_code("E0313").with_span(item.span));
-                            return None;
-                        }
+        ctx: &mut FnCtx,
+    ) -> Option<TExpr> {
+        let bridge = format!("$builtin_unpack${}", kind.name());
+        if matches!(
+            kind,
+            Builtin::Abs
+                | Builtin::Implode
+                | Builtin::Sprintf
+                | Builtin::Printf
+                | Builtin::ArrayMerge
+        ) {
+            if !self.funcs.contains_key(&bridge) {
+                let number = Ty::union(vec![
+                    pxr_types::UnionMember::Value(Ty::Int),
+                    pxr_types::UnionMember::Value(Ty::Float),
+                ]);
+                let (names, types, ret, runtime, variadic): (Vec<&str>, Vec<Ty>, Ty, &str, bool) =
+                    match kind {
+                        Builtin::Abs => (
+                            vec!["num"],
+                            vec![number.clone()],
+                            number,
+                            "pxr_abs_mixed",
+                            false,
+                        ),
+                        Builtin::Implode => (
+                            vec!["separator", "array"],
+                            vec![Ty::Mixed, Ty::Mixed],
+                            Ty::String,
+                            "pxr_implode_dynamic",
+                            false,
+                        ),
+                        Builtin::Sprintf => (
+                            vec!["format", "values"],
+                            vec![Ty::String, Ty::array(Ty::Mixed)],
+                            Ty::String,
+                            "pxr_sprintf_dynamic",
+                            true,
+                        ),
+                        Builtin::Printf => (
+                            vec!["format", "values"],
+                            vec![Ty::String, Ty::array(Ty::Mixed)],
+                            Ty::Int,
+                            "pxr_printf_dynamic",
+                            true,
+                        ),
+                        Builtin::ArrayMerge => (
+                            vec!["arrays"],
+                            vec![Ty::array(Ty::array(Ty::Mixed))],
+                            Ty::array(Ty::Mixed),
+                            "pxr_array_merge_many",
+                            true,
+                        ),
+                        _ => unreachable!(),
                     };
-                    if !keys.insert(key.clone()) {
-                        self.diags.emit(Diagnostic::error("native builtin literal unpacking with repeated array keys is not implemented").with_code("E0313").with_span(item.span));
-                        return None;
-                    }
-                    match key {
-                        Ok(_) => {
-                            if named {
-                                self.diags.emit(Diagnostic::error("positional unpacked arguments cannot follow named arguments").with_code("E0313").with_span(item.span));
-                                return None;
-                            }
-                            expanded.push(item.value.clone());
-                        }
-                        Err(name) => {
-                            named = true;
-                            expanded.push(ast::Expr::NamedArgument {
-                                name,
-                                value: Box::new(item.value.clone()),
-                                span: item.span,
-                            });
-                        }
-                    }
-                }
-            } else {
-                named |= matches!(argument, ast::Expr::NamedArgument { .. });
-                expanded.push(argument.clone());
+                let declarations = names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| ast::Param {
+                        variadic: variadic && index + 1 == names.len(),
+                        name: (*name).to_owned(),
+                        name_span: span,
+                        span,
+                        ty: Some(class_generics::type_ref(&types[index])),
+                        default: if kind == Builtin::Implode && index == 1 {
+                            Some(ast::Expr::NullLit(span))
+                        } else {
+                            None
+                        },
+                    })
+                    .collect();
+                self.funcs.insert(
+                    bridge.clone(),
+                    Signature {
+                        declarations,
+                        is_async: false,
+                        mangled: runtime.into(),
+                        display: format!("unpacked {}", kind.name()),
+                        params: types,
+                        param_names: names.iter().map(|name| (*name).to_owned()).collect(),
+                        ret,
+                        span,
+                    },
+                );
             }
+            let mut expression = self.infer_call(&bridge, span, &[], args, span, ctx)?;
+            if matches!(
+                kind,
+                Builtin::Sprintf | Builtin::Printf | Builtin::ArrayMerge
+            ) {
+                if let TExpr::DynamicArguments { binding, .. } = &mut expression {
+                    binding.allow_named_variadic = false;
+                }
+            }
+            return Some(expression);
         }
-        Some(expanded)
+        if !self.funcs.contains_key(&bridge) {
+            let names = kind.parameter_names();
+            let types: Vec<_> = names
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    compat::builtin_parameter(kind, index, names.len()).unwrap_or(Ty::Mixed)
+                })
+                .collect();
+            let declarations: Vec<_> = names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| ast::Param {
+                    variadic: false,
+                    name: (*name).to_owned(),
+                    name_span: span,
+                    span,
+                    ty: Some(class_generics::type_ref(&types[index])),
+                    default: kind.parameter_default(index, span),
+                })
+                .collect();
+            let vars: Vec<_> = names
+                .iter()
+                .map(|name| ast::Expr::Var((*name).to_owned(), span))
+                .collect();
+            let call = |arguments: Vec<ast::Expr>| ast::Expr::Call {
+                fallback: None,
+                callee: kind.name().to_owned(),
+                callee_span: span,
+                type_args: vec![],
+                args: arguments,
+                span,
+            };
+            let returned =
+                |arguments: Vec<ast::Expr>| vec![ast::Stmt::Return(Some(call(arguments)), span)];
+            let supplied = |index: usize| ast::Expr::Index {
+                base: Box::new(ast::Expr::Var(PROVIDED.into(), span)),
+                index: Some(Box::new(ast::Expr::IntLit(index as i64, span))),
+                span,
+            };
+            let branch =
+                |index: usize, then_branch: Vec<ast::Stmt>, else_branch: Vec<ast::Stmt>| {
+                    vec![ast::Stmt::If {
+                        cond: supplied(index),
+                        then_branch,
+                        elifs: vec![],
+                        else_branch: Some(else_branch),
+                        span,
+                    }]
+                };
+            let body = match kind {
+                Builtin::Substr => branch(2, returned(vars.clone()), returned(vars[..2].to_vec())),
+                Builtin::SubstrCount => branch(
+                    3,
+                    returned(vars.clone()),
+                    branch(
+                        2,
+                        returned(vars[..3].to_vec()),
+                        returned(vars[..2].to_vec()),
+                    ),
+                ),
+                Builtin::ArraySlice => {
+                    let arguments = [0usize, 1, 3]
+                        .iter()
+                        .map(|&index| ast::Expr::NamedArgument {
+                            name: names[index].to_owned(),
+                            value: Box::new(vars[index].clone()),
+                            span,
+                        })
+                        .collect();
+                    branch(2, returned(vars.clone()), returned(arguments))
+                }
+                _ => returned(vars.clone()),
+            };
+            let mut probe = FnCtx::new(Ty::Void, false);
+            for (name, ty) in names.iter().zip(&types) {
+                probe.declare(name, ty.clone());
+            }
+            let ret = self
+                .infer_builtin(kind, kind.name(), span, &vars, span, &mut probe)?
+                .ty();
+            let declaration = ast::FnDecl {
+                is_async: false,
+                type_params: vec![],
+                bounds: vec![],
+                name: bridge.clone(),
+                name_span: span,
+                params: declarations.clone(),
+                ret: Some(class_generics::type_ref(&ret)),
+                body,
+                span,
+            };
+            let signature = Signature {
+                declarations,
+                is_async: false,
+                mangled: bridge.clone(),
+                display: format!("unpacked {}", kind.name()),
+                params: types,
+                param_names: names.iter().map(|name| (*name).to_owned()).collect(),
+                ret,
+                span,
+            };
+            self.funcs.insert(bridge.clone(), signature.clone());
+            self.pending_specializations
+                .push_back((declaration, signature, HashMap::new()));
+        }
+        self.infer_call(&bridge, span, &[], args, span, ctx)
     }
     pub(super) fn check_named_dispatch(
         &mut self,

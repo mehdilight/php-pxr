@@ -2476,7 +2476,7 @@ static pxr_array *pxr_arguments_field(pxr_array *frame, size_t field) {
     return (pxr_array *)(intptr_t)frame->ents[field].bits;
 }
 static void pxr_arguments_error(const char *message) {
-    fprintf(stderr, "Fatal error: Uncaught ArgumentCountError: %s\n", message);
+    fprintf(stderr, "Fatal error: Uncaught Error: %s\n", message);
     exit(255);
 }
 void *pxr_arguments_new(void *parameter_names, long long variadic) {
@@ -2491,7 +2491,7 @@ void *pxr_arguments_new(void *parameter_names, long long variadic) {
     pxr_array_push(frame,PXR_TAG_ARR,(intptr_t)presence);
     pxr_array_push(frame,PXR_TAG_INT,0);
     pxr_array_push(frame,PXR_TAG_BOOL,0);
-    pxr_array_push(frame,PXR_TAG_BOOL,variadic != 0);
+    pxr_array_push(frame,PXR_TAG_INT,variadic);
     return frame;
 }
 void pxr_arguments_put(void *storage, const pxr_str *name, void *value) {
@@ -2513,7 +2513,11 @@ void pxr_arguments_put(void *storage, const pxr_str *name, void *value) {
         presence->ents[index].bits=1;
         pxr_array_set(pxr_arguments_field(frame,1),PXR_TAG_INT,(long long)index,NULL,PXR_TAG_MIXED,(intptr_t)pxr_mixed_copy(value));
     } else {
-        if (!frame->ents[6].bits) pxr_arguments_error(name ? "unknown named argument during unpacking" : "too many positional arguments during unpacking");
+        if (!frame->ents[6].bits) {
+            if (name) pxr_arguments_error("unknown named argument during unpacking");
+            fputs("Fatal error: Uncaught ArgumentCountError: too many positional arguments during unpacking\n",stderr);exit(255);
+        }
+        if (name && frame->ents[6].bits==2) pxr_arguments_error("unknown named variadic argument for a native builtin");
         pxr_array *rest=pxr_arguments_field(frame,2);
         if (name) {
             if (pxr_array_has(rest,PXR_TAG_STR,0,name)) pxr_arguments_error("variadic named argument was supplied more than once during unpacking");
@@ -2533,7 +2537,9 @@ void pxr_arguments_finish(void *storage, void *requirements) {
     const pxr_array *required=requirements;
     pxr_array *presence=pxr_arguments_field(storage,3);
     for (size_t i=0;i<required->len;i++) {
-        if (required->ents[i].bits && !presence->ents[i].bits) pxr_arguments_error("missing required argument after unpacking");
+        if (required->ents[i].bits && !presence->ents[i].bits) {
+            fputs("Fatal error: Uncaught ArgumentCountError: missing required argument after unpacking\n",stderr);exit(255);
+        }
     }
 }
 long long pxr_arguments_present(void *storage, long long index) {
@@ -2552,6 +2558,67 @@ void *pxr_arguments_rest(void *storage, const pxr_str *element_type) {
     return rest;
 }
 void *pxr_arguments_presence(void *storage) {return pxr_arguments_field(storage,3);}
+
+/* Overloaded/variadic builtin bridges validate tags before entering the
+ * existing unboxed scalar helpers. No mixed pointer is reinterpreted as text. */
+static pxr_array *pxr_arguments_scalar_values(void *source, int reject_names) {
+    const pxr_array *array=source;
+    pxr_array *values=pxr_array_new();
+    for (size_t i=0;i<array->len;i++) {
+        const pxr_ent *entry=&array->ents[i];
+        if (reject_names && entry->ks) pxr_arguments_error("unknown named variadic argument for a native builtin");
+        const pxr_mixed *value=entry->vt==PXR_TAG_MIXED ? pxr_mixed_checked((void *)(intptr_t)entry->bits) : NULL;
+        long long tag=value ? value->tag : entry->vt, bits=value ? value->bits : entry->bits;
+        if (tag<PXR_TAG_INT || tag>PXR_TAG_STR) {
+            fputs("Fatal error: Uncaught TypeError: native formatting/joining requires scalar elements\n",stderr);exit(255);
+        }
+        pxr_array_push(values,tag,bits);
+    }
+    return values;
+}
+void *pxr_sprintf_dynamic(const pxr_str *format, void *values) {
+    return pxr_sprintf(format,pxr_arguments_scalar_values(values,1));
+}
+long long pxr_printf_dynamic(const pxr_str *format, void *values) {
+    return pxr_printf(format,pxr_arguments_scalar_values(values,1));
+}
+void *pxr_array_merge_many(void *storage) {
+    const pxr_array *arrays=storage;
+    void *result=pxr_array_new();
+    for (size_t i=0;i<arrays->len;i++) {
+        const pxr_ent *entry=&arrays->ents[i];
+        if (entry->ks) pxr_arguments_error("unknown named variadic argument for array_merge");
+        if (entry->vt!=PXR_TAG_ARR) abort();
+        result=pxr_array_merge_pair(result,(void *)(intptr_t)entry->bits);
+    }
+    return result;
+}
+void *pxr_implode_dynamic(void *separator, void *array, void *provided) {
+    const pxr_array *presence=provided;
+    const pxr_mixed *first=pxr_mixed_checked(separator),*pieces=NULL;
+    const pxr_str *glue;
+    if (presence->ents[1].bits) {
+        pieces=pxr_mixed_checked(array);
+        if (first->tag!=PXR_TAG_STR || pieces->tag!=PXR_TAG_ARR) {
+            fputs("Fatal error: Uncaught TypeError: implode requires a string separator and an array\n",stderr);exit(255);
+        }
+        glue=(const pxr_str *)(intptr_t)first->bits;
+    } else {
+        if (first->tag!=PXR_TAG_ARR) {fputs("Fatal error: Uncaught TypeError: implode requires an array\n",stderr);exit(255);}
+        pieces=first;glue=pxr_str_alloc(0);
+    }
+    return pxr_implode(glue,pxr_arguments_scalar_values((void *)(intptr_t)pieces->bits,0));
+}
+void *pxr_abs_mixed(void *storage) {
+    const pxr_mixed *value=pxr_mixed_checked(storage);
+    long long tag=value->tag,bits=value->bits;
+    if (tag==PXR_TAG_INT) {
+        if (bits==INT64_MIN) {double number=-(double)bits;memcpy(&bits,&number,sizeof(bits));tag=PXR_TAG_FLOAT;}
+        else bits=pxr_abs_i64(bits);
+    } else if (tag==PXR_TAG_FLOAT) bits=(long long)((uint64_t)bits & UINT64_C(0x7fffffffffffffff));
+    else {fputs("Fatal error: Uncaught TypeError: abs requires an int or float\n",stderr);exit(255);}
+    return pxr_mixed_box(tag,bits);
+}
 
 /* A missing intermediate is not published until the completed write-back. */
 void *pxr_mixed_array_or_new(void *p) {

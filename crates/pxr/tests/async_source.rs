@@ -3305,3 +3305,24 @@ async function main(): void {$a=spawn parallelAsync("worker",41);$b=spawn parall
         "41:42\n",
     );
 }
+
+#[test]
+fn dynamic_builtin_unpacking_keeps_argument_frames_and_scalar_bridges_rooted() {
+    run_case(
+        "dynamic_builtin_unpacking",
+        r#"<?php
+async function arguments(): mixed {await sleepAsync(0);return ["offset"=>2,"string"=>"abcdef"];}
+async function length(): int {await sleepAsync(0);return 3;}
+async function formatting(): mixed {await sleepAsync(0);return ["%d:%s",7,"native"];}
+async function joining(): mixed {await sleepAsync(0);return ["-",[1,true,"native"]];}
+async function main(): void {
+ echo substr(...await arguments(),length:await length()),"\n";
+ echo sprintf(...await formatting()),"\n",implode(...await joining()),"\n";
+ $arguments: mixed=[[-7],[-2.5]];
+ echo abs(...$arguments[0]),":",abs(...$arguments[1]),"\n";
+ $merged=array_merge(...[[1],[2]]);await sleepAsync(0);echo $merged[0],":",$merged[1],"\n";
+}
+"#,
+        "cde\n7:native\n1-1-native\n7:2.5\n1:2\n",
+    );
+}

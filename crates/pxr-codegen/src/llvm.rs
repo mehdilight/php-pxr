@@ -21,6 +21,11 @@ pub struct LlvmOptions {
 
 /// Runtime entry points and their C signatures.
 const RUNTIME_DECLS: &[(&str, &str, &[&str])] = &[
+    ("pxr_abs_mixed", "ptr", &["ptr"]),
+    ("pxr_implode_dynamic", "ptr", &["ptr", "ptr", "ptr"]),
+    ("pxr_sprintf_dynamic", "ptr", &["ptr", "ptr"]),
+    ("pxr_printf_dynamic", "i64", &["ptr", "ptr"]),
+    ("pxr_array_merge_many", "ptr", &["ptr"]),
     ("pxr_arguments_new", "ptr", &["ptr", "i64"]),
     ("pxr_arguments_put", "void", &["ptr", "ptr", "ptr"]),
     ("pxr_arguments_unpack", "void", &["ptr", "ptr"]),

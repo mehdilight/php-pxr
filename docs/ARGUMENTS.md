@@ -71,7 +71,9 @@ The variadic parameter must be last and cannot have a default. An optional fixed
 prefix is allowed. Affine/borrowed element storage is rejected by the ordinary
 container ownership checks; required owned/borrowed fixed prefixes remain usable.
 Strict mode requires an element annotation; compatibility mode uses mixed for an
-untyped variadic declaration. Array argument unpacking supports native functions, methods, constructors,
+untyped variadic declaration.
+
+Array argument unpacking supports native functions, methods, constructors,
 closures and generic/async calls: `pair(...$values)` and
 `collect(...$values, extra: 7)`. Integer keys supply positional values in insertion
 order; string keys select fixed names or become variadic keys. Multiple unpacked
@@ -85,10 +87,15 @@ ambiguous or unavailable.
 
 Unpacking currently requires shared parameter storage. Signatures containing
 owned/borrowed parameters retain explicit E0290 diagnostics for unpacked calls.
-Native builtin unpacking currently accepts literal arrays with unique constant
-keys; dynamic builtin arrays and repeated literal keys produce E0313. Native
-I/O/task intrinsics and PHP interpreter boundaries retain their explicit
-unpacking restriction. Traversable/generator unpacking remains outstanding.
+Native builtins accept dynamic unpacked arrays through checked bridges for their
+implemented signatures. Optional lengths retain omitted-length behavior;
+`sprintf`/`printf` and `array_merge` reject unknown named variadic entries.
+`implode` retains its one-array and separator-plus-array forms. Formatting and
+joining retain the native scalar-element contract, and dynamic `abs` returns a
+checked `int|float` value. Dynamic array results use mixed element storage.
+Unsupported builtin options remain errors. Native I/O/task intrinsics and PHP
+interpreter boundaries retain their explicit unpacking restriction.
+Traversable/generator unpacking remains outstanding.
 See [the named-argument example](../examples/named_arguments.php).
 See [M10 status](M10.md) and [the runnable example](../examples/optional_arguments.php).
 
