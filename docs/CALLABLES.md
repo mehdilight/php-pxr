@@ -133,7 +133,7 @@ See [callback_objects.php](../examples/callback_objects.php) and
   owned receiver because they do not capture it.
 - `parent` annotations require a parent on the declaring/consuming class.
   `static` return annotations and `static::` late binding remain unsupported.
-- Callable strings/arrays, first-class callable references,
+- Callable strings/arrays, async/affine first-class reference adapters,
   `callable`/`Closure` annotations and Closure reflection/binding APIs are not
   implemented. Late static binding (`static::`) retains its existing restriction.
 - Native callbacks are not implicitly exported across the legacy PHP boundary;
@@ -148,3 +148,26 @@ See [callback_objects.php](../examples/callback_objects.php) and
 Behavioral references: [PHP anonymous functions](https://www.php.net/manual/en/functions.anonymous.php)
 and [PHP arrow functions](https://www.php.net/manual/en/functions.arrow.php), and
 [PHP traits](https://www.php.net/manual/en/language.oop5.traits.php).
+
+First-class synchronous references use PHP's placeholder syntax:
+
+```php
+$length = strlen(...);
+echo $length("native");
+$method = $object->method(...);
+$static = Example::method(...);
+```
+
+References reuse native closure environments. A receiver expression evaluates
+once when the reference is created, remains shared and survives later suspension.
+Invocation forwards positional/named arguments through checked array binding,
+so implementation defaults and variadic keys retain their ordinary behavior.
+Lexical private/protected access, trait scope and inferred void results are
+preserved. Explicit and enclosing generic type arguments remain available.
+Invokable objects and existing closures can also be referenced with `$callback(...)`.
+
+This slice requires synchronous targets and shared parameter storage. Async
+reference adapters and affine/borrowed target signatures remain outstanding and
+produce explicit diagnostics. `new Class(...)` is not constructor-reference
+syntax. General callable strings/arrays, callable annotations and reference
+captures remain outside this slice.

@@ -207,6 +207,49 @@ fn forward_argument(parameter: &Param, span: Span) -> Expr {
 impl Parser {
     pub(super) fn parse_closure(&mut self, is_static: bool, is_async: bool) -> Result<Expr, ()> {
         let token = self.advance();
+        self.parse_closure_inner(is_static, is_async, token, None)
+    }
+    pub(super) fn make_callable_reference(&mut self, mut target: Expr) -> Result<Expr, ()> {
+        let span = target.span();
+        let mut receiver = None;
+        if let Expr::MethodCall { base, .. } = &mut target {
+            receiver = Some(base.as_ref().clone());
+            *base = Box::new(variable("$reference_receiver", span));
+        }
+        // Free functions need no implicit receiver; method references retain
+        // their explicit receiver through the factory capture instead.
+        let is_static = matches!(target, Expr::Call { .. } | Expr::MethodCall { .. });
+        let expression = self.parse_closure_inner(
+            is_static,
+            false,
+            Token {
+                kind: TokenKind::Fn,
+                span,
+            },
+            Some(target),
+        )?;
+        let mut expression = expression;
+        if let Some(receiver) = receiver {
+            let args = match &mut expression {
+                Expr::Call { args, .. } | Expr::StaticCall { args, .. } => args,
+                _ => unreachable!(),
+            };
+            for argument in args {
+                if matches!(argument,Expr::Var(name,_) if name=="$reference_receiver") {
+                    *argument = receiver.clone();
+                }
+            }
+        }
+        Ok(expression)
+    }
+    fn parse_closure_inner(
+        &mut self,
+        is_static: bool,
+        is_async: bool,
+        token: Token,
+        mut reference: Option<Expr>,
+    ) -> Result<Expr, ()> {
+        let is_reference = reference.is_some();
         let arrow = token.kind == TokenKind::Fn;
         let span = token.span;
         let scope = if self.in_method {
@@ -235,43 +278,54 @@ impl Parser {
             vec![]
         };
         let bound = scope.is_some() && !is_static && !self.method_static;
-        self.expect(&TokenKind::LParen, "`(` after anonymous function keyword")?;
         let mut params = Vec::new();
-        while !self.at(&TokenKind::RParen) {
-            let ty = if self.is_type_start() {
-                Some(self.parse_type()?)
-            } else {
-                None
-            };
-            let ty = ty.or_else(|| self.compat.then_some(TypeRef::Mixed));
-            let variadic = self.eat(&TokenKind::Ellipsis);
-            let ty = if variadic {
-                ty.map(|t| TypeRef::Array(Box::new(t)))
-            } else {
-                ty
-            };
-            let t = self.expect_variable("closure parameter")?;
-            let TokenKind::Variable(name) = t.kind else {
-                unreachable!()
-            };
-            let default = if self.eat(&TokenKind::Assign) {
-                Some(self.parse_expr()?)
-            } else {
-                None
-            };
+        if is_reference {
             params.push(Param {
-                variadic,
-                default,
-                name,
-                name_span: t.span,
-                ty,
-                span: t.span,
+                variadic: true,
+                default: None,
+                name: "$reference_arguments".into(),
+                name_span: span,
+                ty: Some(TypeRef::Array(Box::new(TypeRef::Mixed))),
+                span,
             });
-            if !self.eat(&TokenKind::Comma) || self.at(&TokenKind::RParen) {
-                break;
+        } else {
+            self.expect(&TokenKind::LParen, "`(` after anonymous function keyword")?;
+            while !self.at(&TokenKind::RParen) {
+                let ty = if self.is_type_start() {
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                let ty = ty.or_else(|| self.compat.then_some(TypeRef::Mixed));
+                let variadic = self.eat(&TokenKind::Ellipsis);
+                let ty = if variadic {
+                    ty.map(|t| TypeRef::Array(Box::new(t)))
+                } else {
+                    ty
+                };
+                let t = self.expect_variable("closure parameter")?;
+                let TokenKind::Variable(name) = t.kind else {
+                    unreachable!()
+                };
+                let default = if self.eat(&TokenKind::Assign) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                params.push(Param {
+                    variadic,
+                    default,
+                    name,
+                    name_span: t.span,
+                    ty,
+                    span: t.span,
+                });
+                if !self.eat(&TokenKind::Comma) || self.at(&TokenKind::RParen) {
+                    break;
+                }
             }
+            self.expect(&TokenKind::RParen, "`)` after closure parameters")?;
         }
-        self.expect(&TokenKind::RParen, "`)` after closure parameters")?;
         let mut captures = Vec::new();
         if !arrow && self.eat(&TokenKind::Use) {
             self.expect(&TokenKind::LParen, "`(` after closure use")?;
@@ -306,7 +360,7 @@ impl Parser {
             }
             self.expect(&TokenKind::RParen, "`)` after closure captures")?;
         }
-        let mut ret = if self.eat(&TokenKind::Colon) {
+        let mut ret = if !is_reference && self.eat(&TokenKind::Colon) {
             Some(self.parse_type()?)
         } else {
             None
@@ -346,7 +400,21 @@ impl Parser {
         let previous_static = self.method_static;
         self.method_static |= is_static;
         let body_result = (|| {
-            if arrow {
+            if let Some(mut target) = reference.take() {
+                let args = match &mut target {
+                    Expr::Call { args, .. }
+                    | Expr::MethodCall { args, .. }
+                    | Expr::StaticCall { args, .. }
+                    | Expr::ParentMethodCall { args, .. } => args,
+                    _ => unreachable!(),
+                };
+                args.push(Expr::UnpackArgument {
+                    value: Box::new(variable("$reference_arguments", span)),
+                    span,
+                });
+                free_variables(&target, &params, &mut captures);
+                Ok(vec![Stmt::ForwardReturn(target, span)])
+            } else if arrow {
                 self.expect(&TokenKind::DoubleArrow, "`=>` in arrow function")?;
                 let expression = self.parse_expr()?;
                 free_variables(&expression, &params, &mut captures);
@@ -357,7 +425,7 @@ impl Parser {
         })();
         self.method_static = previous_static;
         let mut body = body_result?;
-        if self.compat && ret.is_none() {
+        if self.compat && ret.is_none() && !is_reference {
             ret = Some(TypeRef::Mixed);
             super::compat::complete_returns(&mut body, span);
         }

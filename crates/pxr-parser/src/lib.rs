@@ -1769,7 +1769,7 @@ impl Parser {
         loop {
             if self.eat(&TokenKind::LParen) {
                 let name_span = base.span();
-                let (args, close) = self.parse_call_arguments()?;
+                let (args, close, reference) = self.parse_call_arguments()?;
                 let span = base.span().merge(close.span);
                 // Invokable objects share ordinary checked method dispatch,
                 // receiver evaluation, ownership and GC handling.
@@ -1781,6 +1781,9 @@ impl Parser {
                     args,
                     span,
                 };
+                if reference {
+                    base = self.make_callable_reference(base)?;
+                }
             } else if self.at(&TokenKind::LBracket) {
                 self.advance();
                 let index = if self.at(&TokenKind::RBracket) {
@@ -1809,7 +1812,7 @@ impl Parser {
                     Vec::new()
                 };
                 if self.eat(&TokenKind::LParen) {
-                    let (args, close) = self.parse_call_arguments()?;
+                    let (args, close, reference) = self.parse_call_arguments()?;
                     let span = base.span().merge(close.span);
                     base = Expr::MethodCall {
                         base: Box::new(base),
@@ -1819,6 +1822,9 @@ impl Parser {
                         args,
                         span,
                     };
+                    if reference {
+                        base = self.make_callable_reference(base)?;
+                    }
                 } else {
                     if !type_args.is_empty() {
                         self.error(name_span, "type arguments require a method call");
@@ -1885,25 +1891,30 @@ impl Parser {
         };
         let method_type_args = self.parse_type_arguments()?;
         self.expect(&TokenKind::LParen, "`(` after method name")?;
-        let (args, close) = self.parse_call_arguments()?;
+        let (args, close, reference) = self.parse_call_arguments()?;
         // Keep the existing AST shape for parent calls for downstream consumers.
-        if class_name == "parent" {
-            Ok(Expr::ParentMethodCall {
+        let expression = if class_name == "parent" {
+            Expr::ParentMethodCall {
                 method,
                 type_args: method_type_args,
                 method_span: token.span,
                 args,
                 span: start.merge(close.span),
-            })
+            }
         } else {
-            Ok(Expr::StaticCall {
+            Expr::StaticCall {
                 class_name,
                 type_args,
                 method,
                 method_type_args,
                 args,
                 span: start.merge(close.span),
-            })
+            }
+        };
+        if reference {
+            self.make_callable_reference(expression)
+        } else {
+            Ok(expression)
         }
     }
 
@@ -1979,7 +1990,14 @@ impl Parser {
                 let class_name = self.resolve_name(&raw_name, false).0;
                 let type_args = self.parse_type_arguments()?;
                 let (args, end_span) = if self.eat(&TokenKind::LParen) {
-                    let (args, close) = self.parse_call_arguments()?;
+                    let (args, close, reference) = self.parse_call_arguments()?;
+                    if reference {
+                        self.error(
+                            close.span,
+                            "first-class constructor references do not use new syntax",
+                        );
+                        return Err(());
+                    }
                     (args, close.span)
                 } else {
                     (Vec::new(), class_span)
@@ -2022,21 +2040,26 @@ impl Parser {
                 }
                 if self.at(&TokenKind::LParen) {
                     self.advance();
-                    let (args, close) = self.parse_call_arguments()?;
+                    let (args, close, reference) = self.parse_call_arguments()?;
                     let (callee, fallback) =
                         if name.eq_ignore_ascii_case("move") || name.eq_ignore_ascii_case("drop") {
                             (format!("$pxr_{}", name.to_ascii_lowercase()), None)
                         } else {
                             self.resolve_name(&name, true)
                         };
-                    Ok(Expr::Call {
+                    let expression = Expr::Call {
                         fallback,
                         callee,
                         callee_span: span,
                         type_args,
                         args,
                         span: span.merge(close.span),
-                    })
+                    };
+                    if reference {
+                        self.make_callable_reference(expression)
+                    } else {
+                        Ok(expression)
+                    }
                 } else {
                     self.error(
                         span,

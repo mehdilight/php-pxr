@@ -3326,3 +3326,34 @@ async function main(): void {
         "cde\n7:native\n1-1-native\n7:2.5\n1:2\n",
     );
 }
+
+#[test]
+fn first_class_callable_environments_and_argument_snapshots_survive_awaits() {
+    run_case(
+        "first_class_reference_roots",
+        r#"<?php
+class ReferenceAlive {public string $text="native";public function text(string $suffix="!"): string {return $this->text.$suffix;}}
+function referenceFactory() {return (new ReferenceAlive())->text(...);}
+async function word(): string {await sleepAsync(0);return "?";}
+async function main(): void {
+ $reference=referenceFactory();await sleepAsync(0);echo $reference(),":",$reference(suffix:await word()),"\n";
+ $length=strlen(...);await sleepAsync(0);echo $length(await word()),"\n";
+ $object=new ReferenceAlive();$bound=$object->text(...);$object->text="changed";await sleepAsync(0);echo $bound(),"\n";
+}
+"#,
+        "native!:native?\n1\nchanged!\n",
+    );
+}
+
+#[test]
+fn workers_create_first_class_callable_environments_in_their_own_heap() {
+    run_case(
+        "first_class_reference_workers",
+        r#"<?php
+function value(int $first=7,int $second=8): int {return $first+$second;}
+async function worker(int $number): int {$reference=value(...);await sleepAsync(0);return $reference(second:$number);}
+async function main(): void {$a=spawn parallelAsync("worker",41);$b=spawn parallelAsync("worker",42);echo await $a,":",await $b,"\n";}
+"#,
+        "48:49\n",
+    );
+}

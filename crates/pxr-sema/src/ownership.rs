@@ -899,6 +899,12 @@ impl Checker {
                 let want = mode(self.ret.as_ref());
                 if let Some(e) = value {
                     let v = self.expr(e);
+                    if self.env.contains_key("$reference_arguments")
+                        && task_result(v.ty.as_ref()).is_some()
+                    {
+                        self.error(*span,"async first-class callable targets require an async reference adapter, which is not implemented yet");
+                        return false;
+                    }
                     self.return_types.push(v.ty.clone());
                     if let (Some(expected), Some(actual)) = (self.ret.as_ref(), v.ty.as_ref()) {
                         if !result_ownership_compatible(expected, actual) {

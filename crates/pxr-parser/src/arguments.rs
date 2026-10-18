@@ -2,7 +2,12 @@
 use super::*;
 impl Parser {
     // The opening parenthesis has already been consumed.
-    pub(super) fn parse_call_arguments(&mut self) -> Result<(Vec<Expr>, Token), ()> {
+    pub(super) fn parse_call_arguments(&mut self) -> Result<(Vec<Expr>, Token, bool), ()> {
+        if self.at(&TokenKind::Ellipsis) && self.peek_at(1).kind == TokenKind::RParen {
+            self.advance();
+            let close = self.advance();
+            return Ok((vec![], close, true));
+        }
         let mut args = Vec::new();
         let mut named = false;
         let mut unpacked = false;
@@ -61,6 +66,6 @@ impl Parser {
             }
         }
         let close = self.expect(&TokenKind::RParen, "`)` after arguments")?;
-        Ok((args, close))
+        Ok((args, close, false))
     }
 }

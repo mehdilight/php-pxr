@@ -5868,3 +5868,103 @@ fn dynamic_builtin_unpacking_rejects_unknown_names_and_non_scalar_formatting() {
         assert!(run.stderr.contains(message), "{name}: {}", run.stderr);
     }
 }
+
+#[test]
+fn first_class_callable_references_preserve_defaults_receivers_and_void() {
+    assert_matches_php(
+        "first_class_references",
+        r#"<?php
+function pair(int $first=10,int $second=20): string {return $first.":".$second;}
+function note(string $text): void {echo $text;}
+class ReferenceBox {
+ public int $value=7;
+ public function pair(int $first=10,int $second=20): string {return $this->value.":".$first.":".$second;}
+ private function hidden(string $text): string {return "private:".$text;}
+ public function expose() {return $this->hidden(...);}
+ public static function text(string $text): string {return "static:".$text;}
+}
+function receiver(): ReferenceBox {echo "R";return new ReferenceBox();}
+$reference=pair(...);echo $reference(),":",$reference(second:8),"\n";
+$length=strlen(...);echo $length("native"),"\n";
+$object=receiver();$method=$object->pair(...);$object->value=9;echo $method(second:8),"\n";
+$temporary=receiver()->pair(...);echo $temporary(1,2),":",$temporary(3,4),"\n";
+$static=ReferenceBox::text(...);echo $static("native"),"\n";
+$private=(new ReferenceBox())->expose();echo $private("native"),"\n";
+$callback=fn(int $value): int=>$value+1;$copy=$callback(...);echo $copy(7),"\n";
+$void=note(...);$void("void\n");
+"#,
+    );
+}
+
+#[test]
+fn first_class_references_preserve_explicit_and_lexical_generic_types() {
+    if !have_cc() {
+        return;
+    }
+    let path = temp_php(
+        "first_class_generic",
+        r#"<?php
+function identity<T>(T $value): T {return $value;}
+function make<T>() {return identity<T>(...);}
+class GenericReference {public function first<T>(T $first,T $second): T {return $first;}}
+$direct=identity<int>(...);echo $direct(7),"\n";
+$lexical=make<string>();echo $lexical("native"),"\n";
+$method=(new GenericReference())->first<int>(...);echo $method(second:9,first:8),"\n";
+class OwnedReferenceFactory {public function callback() {return strlen(...);}}
+$owner: owned<OwnedReferenceFactory>=new OwnedReferenceFactory();$callback=$owner->callback();drop($owner);echo $callback("native"),"\n";
+"#,
+    );
+    let run = run_ok(&["run", path.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "7\nnative\n8\n6\n");
+}
+
+#[test]
+fn first_class_references_keep_lexical_trait_scope_and_visibility() {
+    assert_matches_php(
+        "first_class_scope",
+        r#"<?php
+class ReferenceParent {protected function label(string $text): string {return "parent:".$text;}}
+trait ReferenceTrait {
+ private static function text(string $text): string {return "trait:".$text;}
+ public function staticReference() {return self::text(...);}
+ public function parentReference() {return parent::label(...);}
+}
+class ReferenceChild extends ReferenceParent {use ReferenceTrait;}
+$object=new ReferenceChild();$static=$object->staticReference();$parent=$object->parentReference();echo $static("native"),":",$parent("native"),"\n";
+echo (strlen(...))("direct"),"\n";
+"#,
+    );
+}
+
+#[test]
+fn first_class_references_reject_unavailable_targets_and_unimplemented_contracts() {
+    for (name, source, code) in [
+        ("unknown", r#"$reference=absentFunction(...);"#, "E0232"),
+        (
+            "private",
+            r#"class Hidden {private function text(): int {return 7;}} $reference=(new Hidden())->text(...);"#,
+            "E0265",
+        ),
+        (
+            "constructor",
+            r#"class C {} $reference=new C(...);"#,
+            "E0100",
+        ),
+        (
+            "async",
+            r#"async function value(): int {return 7;} $reference=value(...);"#,
+            "E0290",
+        ),
+        (
+            "borrowed",
+            r#"function value(&array<int> $value): int {return count($value);} $reference=value(...);"#,
+            "E0290",
+        ),
+    ] {
+        let path = temp_php(&format!("first_class_{name}"), &format!("<?php {source}"));
+        let run = run_ok(&["check", path.to_str().unwrap()]);
+        assert_ne!(run.code, 0, "{name}");
+        assert!(run.stderr.contains(code), "{name}: {}", run.stderr);
+    }
+}
